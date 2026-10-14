@@ -1,0 +1,6 @@
+node_modules/
+dist/
+cardboard-data/
+.env
+.env.*
+*.key
