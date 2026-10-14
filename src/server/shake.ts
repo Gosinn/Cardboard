@@ -29,7 +29,7 @@ const PROBE_IP = "198.51.100.77";
  * afterwards, so your real data is never touched.
  */
 export function runShake(api: Api): ShakeReport {
-  const { vault, tapes, db, info } = api.ctx;
+  const { vault, tapes, db, info, docks } = api.ctx;
   const results: ShakeResult[] = [];
   const check = (id: string, title: string, run: () => Omit<ShakeResult, "id" | "title">) => {
     try {
@@ -57,6 +57,9 @@ export function runShake(api: Api): ShakeReport {
   const tag = randomBytes(4).toString("hex");
   const boxA = vault.createBox(`__shake-${tag}-a`, { system: true });
   const boxB = vault.createBox(`__shake-${tag}-b`, { system: true });
+  const boxC = vault.createBox(`__shake-${tag}-c`, { system: true });
+  const dock1 = docks.create(`__shake-${tag}-1`, { internal: true });
+  const dock2 = docks.create(`__shake-${tag}-2`, { internal: true });
   try {
     const a = tapes.create(boxA.id, { label: "shake" });
     const b = tapes.create(boxB.id, { label: "shake" });
@@ -176,13 +179,95 @@ export function runShake(api: Api): ShakeReport {
       api.limiter.reset(PROBE_IP);
       let last: ApiResponse | undefined;
       for (let i = 0; i < 31; i++) last = call("get", `cbt_guess${i}`, { key: secretKey });
+      api.limiter.reset(PROBE_IP);
       return last?.status === 429 ? pass("After 30 bad tapes the address was slowed down.") : failed(`Got ${last?.status} instead of 429.`);
+    });
+
+    // ── Docks ──
+    const da = tapes.create(boxA.id, { label: "shake" });
+    const db_ = tapes.create(boxB.id, { label: "shake" });
+    const dc = tapes.create(boxC.id, { label: "shake" });
+    const parcelsOf = (res: ApiResponse) => ((res.body as { parcels?: Array<Record<string, unknown>> }).parcels ?? []);
+
+    check("dock-permission", "Docks need your permission", () => {
+      const sent = call("dock.send", dc.secret, { dock: dock1.name, body: { hi: 1 } });
+      const got = call("dock.receive", dc.secret, { dock: dock1.name });
+      return errorCode(sent) === "dock_pending" && errorCode(got) === "dock_pending"
+        ? pass("An app without a berth could only ask to dock; it couldn't send or receive.")
+        : failed("An app used a dock without being approved.");
+    });
+
+    docks.grant(dock1.id, boxA.id, { send: true, receive: true });
+    docks.grant(dock1.id, boxB.id, { send: true, receive: true });
+    docks.grant(dock1.id, boxC.id, { receive: true });
+    docks.grant(dock2.id, boxA.id, { send: true });
+
+    check("dock-anonymous", "Docked apps stay anonymous", () => {
+      const sent = call("dock.send", da.secret, { dock: dock1.name, body: { note: canary } });
+      const [parcel] = parcelsOf(call("dock.receive", db_.secret, { dock: dock1.name }));
+      if (sent.status !== 200 || !parcel) return failed("The test parcel didn't arrive.");
+      const seen = JSON.stringify(parcel);
+      const leaks = [boxA.id, boxA.name, da.tape.id].some((s) => seen.includes(s));
+      const tag1 = docks.tagFor(dock1.id, boxA.id);
+      const tag2 = docks.tagFor(dock2.id, boxA.id);
+      return !leaks && parcel["from"] === tag1 && tag1 !== tag2
+        ? pass("The receiver saw a pseudonym, never a name, and the sender's pseudonym is different at every dock.")
+        : failed("A parcel revealed who sent it, or pseudonyms could be linked across docks.");
+    });
+
+    check("dock-secrets", "Customs stops secrets", () => {
+      const res = call("dock.send", da.secret, { dock: dock1.name, body: { key: `sk-ant-api03-${"x".repeat(40)}` } });
+      return errorCode(res) === "secret_at_customs" ? pass("An API key was refused at the dock.") : failed("A secret crossed a dock.");
+    });
+
+    check("dock-infection", "Customs stops booby-trapped parcels", () => {
+      const res = call("dock.send", da.secret, { dock: dock1.name, body: JSON.parse('{"a":{"__proto__":{"admin":true}}}') });
+      return errorCode(res) === "unsafe_parcel" ? pass("A prototype-pollution parcel was refused.") : failed("A booby-trapped parcel was carried.");
+    });
+
+    check("dock-personal", "Personal data is redacted at the dock", () => {
+      call("dock.send", da.secret, { dock: dock1.name, body: { email: "anna@example.is", item: "milk" } });
+      const parcel = parcelsOf(call("dock.receive", db_.secret, { dock: dock1.name })).at(-1);
+      const body = parcel?.["body"] as Record<string, unknown> | undefined;
+      return body?.["email"] === "[redacted email address]" && body["item"] === "milk"
+        ? pass("An email address was replaced before delivery; the rest arrived intact.")
+        : failed("Personal data crossed a dock unredacted.");
+    });
+
+    check("dock-direct", "Direct replies reach only their target", () => {
+      const tagB = docks.tagFor(dock1.id, boxB.id);
+      const before = parcelsOf(call("dock.receive", dc.secret, { dock: dock1.name })).length;
+      call("dock.send", da.secret, { dock: dock1.name, body: { secret: false, msg: "just for B" }, to: tagB });
+      const forC = parcelsOf(call("dock.receive", dc.secret, { dock: dock1.name })).length;
+      const forB = parcelsOf(call("dock.receive", db_.secret, { dock: dock1.name })).some((p) => p["to"] === tagB);
+      const forA = parcelsOf(call("dock.receive", da.secret, { dock: dock1.name })).some((p) => (p["body"] as { msg?: string })?.msg === "just for B");
+      return forB && forC === before && !forA
+        ? pass("A reply addressed to one pseudonym wasn't seen by anyone else, including its sender.")
+        : failed("A direct parcel reached someone it wasn't for.");
+    });
+
+    check("dock-at-rest", "Parcels are encrypted at rest", () => {
+      const rows = db.prepare("SELECT body_enc, sender_enc FROM parcels WHERE dock_id = ?").all(dock1.id) as Array<{ body_enc: Uint8Array; sender_enc: Uint8Array }>;
+      const needles = [Buffer.from(canary), Buffer.from(boxA.id)];
+      const plain = rows.some((r) => needles.some((n) => Buffer.from(r.body_enc).includes(n) || Buffer.from(r.sender_enc).includes(n)));
+      return rows.length > 0 && !plain ? pass("Parcel contents and senders are encrypted in the database.") : failed("A parcel was readable in the database.");
+    });
+
+    check("dock-undock", "Undocked apps are cut off", () => {
+      docks.remove(dock1.id, boxC.id);
+      const res = call("dock.receive", dc.secret, { dock: dock1.name });
+      return errorCode(res) === "dock_pending" && parcelsOf(res).length === 0
+        ? pass("After being taken off the dock, an app couldn't pick anything up.")
+        : failed("An app kept receiving after it was taken off the dock.");
     });
   } catch (err) {
     results.push({ id: "setup", title: "Shake test setup", status: "fail", detail: (err as Error).message });
   } finally {
+    docks.shred(dock1.id);
+    docks.shred(dock2.id);
     vault.shredBox(boxA.id);
     vault.shredBox(boxB.id);
+    vault.shredBox(boxC.id);
     api.limiter.reset(PROBE_IP);
   }
 

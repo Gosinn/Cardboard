@@ -117,6 +117,21 @@ export class Audit {
     return row.at;
   }
 
+  /** Denied entries for a box since `since`, optionally only (or never) for one action. */
+  deniedSince(boxId: string, since: number, filter: { action?: string; excludeAction?: string } = {}): number {
+    let sql = "SELECT COUNT(*) AS n FROM log WHERE box_id = ? AND at >= ? AND outcome = 'denied'";
+    const params: Array<string | number> = [boxId, since];
+    if (filter.action) {
+      sql += " AND action = ?";
+      params.push(filter.action);
+    }
+    if (filter.excludeAction) {
+      sql += " AND action != ?";
+      params.push(filter.excludeAction);
+    }
+    return (this.db.prepare(sql).get(...params) as { n: number }).n;
+  }
+
   counts(boxId: string, since: number): { ok: number; denied: number } {
     const rows = this.db
       .prepare("SELECT outcome, COUNT(*) AS n FROM log WHERE box_id = ? AND at >= ? GROUP BY outcome")
@@ -148,6 +163,8 @@ function describe(who: string, action: string, outcome: Outcome, d: LogDetail, b
   const key = d.key ? `“${d.key}”` : "";
   const where = d.prefix ? `under “${d.prefix}”` : `in ${box ?? "the box"}`;
   const count = (n: number | undefined, word: string) => `${n ?? 0} ${word}${n === 1 ? "" : "s"}`;
+  const dock = d.name ? `dock “${d.name}”` : "a dock";
+  if (outcome === "denied" && action === "dock.customs") return `Customs stopped a parcel from ${who} on ${dock}: ${d.note ?? ""}`.trim();
   if (outcome === "denied") {
     return `${who} was blocked${action !== "auth" ? ` (${action}${key ? ` ${key}` : ""})` : ""}: ${d.note ?? "not allowed"}`;
   }
@@ -201,6 +218,34 @@ function describe(who: string, action: string, outcome: Outcome, d: LogDetail, b
       return `${who} revoked the tape “${d.label ?? ""}”`;
     case "search":
       return `${who} searched every box`;
+    case "introduce":
+      return `${who} introduced itself as “${d.name ?? ""}”`;
+    case "dock.request":
+      return `${who} asked to ${d.note ?? "dock"} on ${dock}`;
+    case "dock.send":
+      return `${who} sent a parcel on ${dock} (to ${count(d.count, "app")})`;
+    case "dock.receive":
+      return `${who} picked up ${count(d.count, "parcel")} from ${dock}`;
+    case "dock.watch":
+      return `${who} started listening on ${dock}`;
+    case "dock.create":
+      return `${who} opened ${dock}`;
+    case "dock.grant":
+      return `${who} let ${box ?? "an app"} ${d.note ?? "dock"} on ${dock}`;
+    case "dock.approve":
+      return `${who} approved ${box ?? "an app"} to ${d.note ?? "dock"} on ${dock}`;
+    case "dock.deny":
+      return `${who} refused ${box ?? "an app"} on ${dock}`;
+    case "dock.remove":
+      return `${who} took ${box ?? "an app"} off ${dock}`;
+    case "dock.settings":
+      return `${who} changed the settings of ${dock}`;
+    case "dock.peek":
+      return `${who} looked inside ${dock}`;
+    case "dock.shred":
+      return `${who} shredded ${dock}`;
+    case "backup":
+      return `${who} made an encrypted backup`;
     default:
       return `${who}: ${action}${key ? ` ${key}` : ""}`;
   }

@@ -46,6 +46,15 @@ export interface Box {
   settings: BoxSettings;
   createdAt: number;
   system: boolean;
+  profile: AppProfile;
+}
+
+/** What an app has told Cardboard about itself, so you recognise it on the shelf. */
+export interface AppProfile {
+  title?: string;
+  description?: string;
+  url?: string;
+  version?: string;
 }
 
 export interface Entry {
@@ -115,6 +124,7 @@ interface BoxRow {
   settings: string;
   created_at: number;
   system: number;
+  profile: string;
 }
 
 interface HistoryRow {
@@ -195,7 +205,7 @@ export class Vault {
     this.db
       .prepare("INSERT INTO boxes (id, name, wrapped_key, settings, created_at, system) VALUES (?, ?, ?, '{}', ?, ?)")
       .run(id, name, wrapped, createdAt, options.system ? 1 : 0);
-    return { id, name, settings: { ...DEFAULT_SETTINGS }, createdAt, system: Boolean(options.system) };
+    return { id, name, settings: { ...DEFAULT_SETTINGS }, createdAt, system: Boolean(options.system), profile: {} };
   }
 
   findBox(name: string): Box | undefined {
@@ -232,6 +242,38 @@ export class Vault {
     const next: BoxSettings = { ...box.settings, ...validateSettings(patch) };
     this.db.prepare("UPDATE boxes SET settings = ? WHERE id = ?").run(JSON.stringify(next), boxId);
     return { ...box, settings: next };
+  }
+
+  updateProfile(boxId: string, patch: Record<string, unknown>): Box {
+    const box = this.requireBoxById(boxId);
+    const limits: Record<keyof AppProfile, number> = { title: 60, description: 200, url: 200, version: 40 };
+    const next: AppProfile = { ...box.profile };
+    for (const [field, value] of Object.entries(patch)) {
+      if (!(field in limits)) {
+        throw fail("bad_profile", 400, `Unknown profile field "${field}". Use title, description, url and version.`);
+      }
+      const key = field as keyof AppProfile;
+      if (value === null || value === "") {
+        delete next[key];
+        continue;
+      }
+      if (typeof value !== "string" || value.length > limits[key]) {
+        throw fail("bad_profile", 400, `\`${field}\` must be text of at most ${limits[key]} characters.`);
+      }
+      if (key === "url" && !/^https?:\/\//.test(value)) throw fail("bad_profile", 400, "`url` must start with http:// or https://.");
+      next[key] = value;
+    }
+    this.db.prepare("UPDATE boxes SET profile = ? WHERE id = ?").run(JSON.stringify(next), boxId);
+    return { ...box, profile: next };
+  }
+
+  /** Wraps a key with the master key, e.g. for docks. Bound to `context`. */
+  wrap(key: Buffer, context: string): Buffer {
+    return seal(this.wrapKey, key, context);
+  }
+
+  unwrap(sealed: Uint8Array, context: string): Buffer {
+    return unseal(this.wrapKey, sealed, context);
   }
 
   /**
@@ -846,6 +888,7 @@ function toBox(row: BoxRow): Box {
     settings: { ...DEFAULT_SETTINGS, ...(JSON.parse(row.settings) as Partial<BoxSettings>) },
     createdAt: row.created_at,
     system: row.system === 1,
+    profile: JSON.parse(row.profile || "{}") as AppProfile,
   };
 }
 

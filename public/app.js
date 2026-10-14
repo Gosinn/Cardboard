@@ -265,12 +265,13 @@ async function renderShelf() {
     ? h("a", { href: "#/shake", class: `chip ${shake.ok ? "ok" : "danger"}` }, `${shake.ok ? "✓" : "✗"} Shake test: ${shake.summary}`)
     : h("a", { href: "#/shake", class: "chip" }, "Run the shake test");
 
-  const insights = data.insights.length
+  const shelfInsights = data.insights.filter((i) => !(i.fix || "").startsWith("cardboard dock approve"));
+  const insights = shelfInsights.length
     ? h(
         "section",
         { class: "card" },
         h("h2", {}, "Worth a look"),
-        data.insights.map((i) =>
+        shelfInsights.map((i) =>
           h("div", { class: `insight ${i.level}` }, h("div", { class: "title" }, i.title), h("div", { class: "detail" }, i.detail), fixLine(i.fix)),
         ),
       )
@@ -281,7 +282,9 @@ async function renderShelf() {
       "a",
       { class: "boxcard", href: `#/box/${encodeURIComponent(b.name)}` },
       h("h3", {}, b.name),
+      b.profile.description ? h("div", { class: "muted small" }, b.profile.description, b.profile.version ? ` · v${b.profile.version}` : "") : null,
       h("div", {}, b.summary),
+      b.docks.length ? h("div", { class: "row" }, b.docks.map((d) => h("span", { class: `chip ${d.waiting ? "warn" : ""}` }, `⚓ ${d.dock}`))) : null,
       h("div", { class: "row" }, sensitiveChips(b.sensitive)),
       h("div", { class: "stats" }, `${plural(b.items, "item")} · ${bytes(b.bytes)} · ${plural(b.tapes, "tape")} · ${b.lastActivity ? `active ${ago(b.lastActivity)}` : "never used"}`),
     ),
@@ -296,6 +299,7 @@ async function renderShelf() {
     ),
     search,
     results,
+    pendingCard(data.pendingDocks),
     insights,
     h("div", { class: "grid" }, cards, newBoxCard()),
   );
@@ -657,6 +661,213 @@ function dangerZone(boxName) {
   );
 }
 
+function direction(p) {
+  return p.send && p.receive ? "send and receive" : p.send ? "send" : "receive";
+}
+
+/** Docking requests with one-tap answers. Returns null when nothing is waiting. */
+function pendingCard(pending) {
+  if (!pending || pending.length === 0) return null;
+  return h(
+    "section",
+    { class: "card stack" },
+    h("h2", {}, `Docking request${pending.length === 1 ? "" : "s"}`),
+    h("p", { class: "muted small" }, "Apps asking to swap data. Approve and they connect straight away; they still won't learn each other's names."),
+    h(
+      "ul",
+      { class: "list" },
+      pending.map((p) => {
+        const approve = h("button", { type: "button", class: "tiny" }, "Approve");
+        const deny = h("button", { type: "button", class: "secondary tiny" }, "Deny");
+        approve.addEventListener("click", () => withBusy(approve, async () => {
+          await api("dock.approve", { dock: p.dock, box: p.box });
+          render();
+        }));
+        deny.addEventListener("click", () => withBusy(deny, async () => {
+          await api("dock.deny", { dock: p.dock, box: p.box });
+          render();
+        }));
+        return h(
+          "li",
+          { class: "row spread" },
+          h("div", {}, h("strong", { class: "mono" }, p.box), ` wants to ${direction(p)} on `, h("strong", { class: "mono" }, p.dock)),
+          h("div", { class: "row" }, approve, deny),
+        );
+      }),
+    ),
+  );
+}
+
+async function renderDocks() {
+  const [{ docks, pending }, { boxes }] = await Promise.all([api("docks"), api("boxes")]);
+  app.replaceChildren(
+    h(
+      "div",
+      { class: "page-head" },
+      h(
+        "div",
+        {},
+        h("h1", {}, "Docks"),
+        h("div", { class: "muted" }, "Meeting points where your apps swap data. Each app only ever sees a pseudonym, and every parcel goes through customs."),
+      ),
+    ),
+    pendingCard(pending) || h("span"),
+    h("div", { class: "grid wide" }, docks.map((d) => dockCard(d)), newDockCard(boxes)),
+  );
+}
+
+function dockCard(d) {
+  const berths = h(
+    "ul",
+    { class: "list" },
+    d.berths.length === 0 ? h("li", { class: "muted small" }, "No apps yet. Apps that use this dock will ask to join.") : null,
+    d.berths.map((b) => {
+      const role = b.denied ? h("span", { class: "chip danger" }, "refused")
+        : !b.send && !b.receive ? h("span", { class: "chip warn" }, `asking to ${direction(b.waiting)}`)
+        : h("span", { class: "chip ok" }, b.send && b.receive ? "sends + receives" : b.send ? "sends" : "receives");
+      const remove = h("button", { type: "button", class: "secondary tiny" }, "Remove");
+      remove.addEventListener("click", () => withBusy(remove, async () => {
+        if (!confirm(`Take ${b.box} off ${d.name}? Its live connection closes immediately.`)) return;
+        await api("dock.remove", { dock: d.name, box: b.box });
+        render();
+      }));
+      return h(
+        "li",
+        { class: "row spread" },
+        h("div", { class: "stack" }, h("div", { class: "row" }, h("strong", { class: "mono" }, b.box), role), h("div", { class: "muted small mono" }, `known there as ${b.tag}`)),
+        remove,
+      );
+    }),
+  );
+
+  const peek = h("button", { type: "button", class: "secondary tiny" }, "Look inside");
+  peek.addEventListener("click", () => withBusy(peek, async () => {
+    const { parcels } = await api("dock.peek", { dock: d.name });
+    openModal(
+      null,
+      h("h2", {}, `In flight on ${d.name}`),
+      h("p", { class: "muted small" }, "Only you see real names here. Apps only ever see pseudonyms."),
+      parcels.length === 0 ? h("p", {}, "Nothing in flight.") : null,
+      parcels.map((p) =>
+        h(
+          "div",
+          { class: "stack" },
+          h("div", { class: "small" }, h("strong", {}, p.sender), p.to ? ` → ${p.to}` : " → everyone", h("span", { class: "muted" }, ` · ${ago(p.sentAt)}`)),
+          h("pre", {}, JSON.stringify(p.body, null, 2)),
+          p.redacted.length ? h("div", { class: "muted small" }, `Redacted: ${p.redacted.join(", ")}`) : null,
+        ),
+      ),
+      h("div", { class: "row" }, h("button", { type: "button", onclick: () => closeModal() }, "Close")),
+    );
+  }));
+
+  return h(
+    "section",
+    { class: "card stack" },
+    h("div", { class: "row spread" }, h("h2", { class: "mono" }, `⚓ ${d.name}`), peek),
+    h("div", { class: "muted small" }, d.inFlight.count ? `${d.inFlight.count} parcel${d.inFlight.count === 1 ? "" : "s"} in flight (${bytes(d.inFlight.bytes)})` : "Nothing in flight"),
+    berths,
+    h("details", {}, h("summary", { class: "small" }, "Customs & settings"), dockSettings(d)),
+  );
+}
+
+function dockSettings(d) {
+  const s = d.settings;
+  const personal = h(
+    "select",
+    {},
+    h("option", { value: "redact", selected: s.personal === "redact" }, "Redact it (replace with a label)"),
+    h("option", { value: "block", selected: s.personal === "block" }, "Refuse the parcel"),
+    h("option", { value: "allow", selected: s.personal === "allow" }, "Let it through"),
+  );
+  const secrets = h(
+    "select",
+    {},
+    h("option", { value: "block", selected: s.secrets === "block" }, "Refuse the parcel"),
+    h("option", { value: "allow", selected: s.secrets === "allow" }, "Let it through (not recommended)"),
+  );
+  const shape = h("textarea", { rows: 3, placeholder: '{"item": "string", "qty": "number?"}' });
+  shape.value = s.shape ? JSON.stringify(s.shape) : "";
+  const ttl = h("input", { value: `${Math.round(s.ttlMs / 86400000)}d` });
+  const rate = h("input", { type: "number", min: 1, value: s.ratePerMinute });
+  const status = h("div");
+  const confirmName = h("input", { placeholder: d.name, "aria-label": "Type the dock name to confirm" });
+  const shred = h("button", { type: "button", class: "danger tiny" }, "Shred dock");
+  shred.addEventListener("click", () => withBusy(shred, async () => {
+    try {
+      await api("dock.shred", { dock: d.name, confirm: confirmName.value.trim() });
+      render();
+    } catch (err) {
+      status.replaceChildren(errorBox(err));
+    }
+  }));
+  const form = h(
+    "form",
+    { class: "stack" },
+    h("label", { class: "field" }, "Personal data (emails, phones, kennitölur, cards…)", personal),
+    h("label", { class: "field" }, "Secrets (API keys, passwords, private keys)", secrets),
+    h("label", { class: "field" }, "Manifest: only these fields may cross (optional)", shape),
+    h("div", { class: "two" }, h("label", { class: "field" }, "Parcels expire after", ttl), h("label", { class: "field" }, "Max parcels per app per minute", rate)),
+    h("button", { type: "submit" }, "Save"),
+    status,
+    h("div", { class: "row" }, confirmName, shred),
+  );
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    try {
+      await api("dock.settings", {
+        dock: d.name,
+        settings: { personal: personal.value, secrets: secrets.value, shape: shape.value.trim() || null, ttl: ttl.value.trim(), ratePerMinute: Number(rate.value) },
+      });
+      status.replaceChildren(h("span", { class: "chip ok" }, "Saved"));
+    } catch (err) {
+      status.replaceChildren(errorBox(err));
+    }
+  });
+  return form;
+}
+
+function newDockCard(boxes) {
+  const name = h("input", { placeholder: "shopping-list", pattern: "[a-z0-9][a-z0-9\\-]*", required: true, "aria-label": "Dock name" });
+  const picks = boxes.map((b) => ({ box: b.name, send: h("input", { type: "checkbox" }), receive: h("input", { type: "checkbox" }) }));
+  const status = h("div");
+  const form = h(
+    "form",
+    { class: "card stack" },
+    h("h2", {}, "New dock"),
+    h("label", { class: "field" }, "Name", name),
+    picks.length
+      ? h(
+          "div",
+          { class: "table-wrap" },
+          h(
+            "table",
+            {},
+            h("thead", {}, h("tr", {}, h("th", {}, "App"), h("th", {}, "Sends"), h("th", {}, "Receives"))),
+            h("tbody", {}, picks.map((p) => h("tr", {}, h("td", { class: "mono" }, p.box), h("td", {}, p.send), h("td", {}, p.receive)))),
+          ),
+        )
+      : h("p", { class: "muted small" }, "No apps yet."),
+    h("p", { class: "muted small" }, "You can also skip this: apps that use a dock ask to join, and you approve them here."),
+    h("button", { type: "submit" }, "Open dock"),
+    status,
+  );
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    try {
+      await api("dock.create", {
+        name: name.value.trim(),
+        send: picks.filter((p) => p.send.checked).map((p) => p.box),
+        receive: picks.filter((p) => p.receive.checked).map((p) => p.box),
+      });
+      render();
+    } catch (err) {
+      status.replaceChildren(errorBox(err));
+    }
+  });
+  return form;
+}
+
 async function renderActivity() {
   const { boxes } = await api("boxes");
   const select = h("select", { "aria-label": "Box" }, h("option", { value: "" }, "All boxes"), boxes.map((b) => h("option", { value: b.name }, b.name)));
@@ -720,6 +931,7 @@ async function render() {
   try {
     if (page === "box" && arg) await renderBox(decodeURIComponent(arg), key ? decodeURIComponent(key) : undefined);
     else if (page === "activity") await renderActivity();
+    else if (page === "docks") await renderDocks();
     else if (page === "shake") await renderShake();
     else await renderShelf();
   } catch (err) {

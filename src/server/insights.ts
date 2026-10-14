@@ -34,6 +34,7 @@ export interface BoxFacts {
   inventory: Inventory;
   tapes: Array<{ tape: Tape; state: string }>;
   denied24h: number;
+  customs24h: number;
 }
 
 export interface InsightInput {
@@ -43,6 +44,8 @@ export interface InsightInput {
   anonymousDenied24h: number;
   lastBackupAt: number | null;
   shake: ShakeReport | null;
+  pendingDocks: Array<{ dock: string; box: string; send: boolean; receive: boolean }>;
+  docks: Array<{ name: string; count: number; unclaimed: number }>;
 }
 
 const DAY = 24 * 60 * 60 * 1000;
@@ -86,8 +89,40 @@ export function insights(input: InsightInput): Insight[] {
     });
   }
 
+  for (const p of input.pendingDocks) {
+    const what = p.send && p.receive ? "send and receive" : p.send ? "send" : "receive";
+    out.push({
+      level: "warn",
+      box: p.box,
+      title: `${p.box} wants to ${what} on dock “${p.dock}”`,
+      detail: "Approve it and the apps are connected straight away (they still won't learn each other's names). Deny it and it stops asking.",
+      fix: `cardboard dock approve ${p.dock} ${p.box}`,
+    });
+  }
+
+  for (const d of input.docks) {
+    if (d.unclaimed > 0) {
+      out.push({
+        level: "tip",
+        title: `${d.unclaimed} parcel${d.unclaimed === 1 ? "" : "s"} on “${d.name}” ${d.unclaimed === 1 ? "has" : "have"} nobody to receive ${d.unclaimed === 1 ? "it" : "them"}`,
+        detail: "They wait until they expire, so an app that docks later still gets them. Add a receiving app to the dock, or let them expire.",
+        fix: `cardboard dock add ${d.name} <app> --as receive`,
+      });
+    }
+  }
+
   for (const facts of input.boxes) {
     const { box, inventory } = facts;
+
+    if (facts.customs24h > 0) {
+      out.push({
+        level: "warn",
+        box: box.name,
+        title: `Customs stopped ${facts.customs24h} parcel${facts.customs24h === 1 ? "" : "s"} from ${box.name} in the last day`,
+        detail: "It tried to send secrets, personal data or something malformed across a dock. Nothing got through. The log says what.",
+        fix: `cardboard log ${box.name}`,
+      });
+    }
 
     if (facts.denied24h > 0) {
       out.push({

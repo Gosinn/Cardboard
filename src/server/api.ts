@@ -6,6 +6,7 @@ import type { Audit, LogDetail, Outcome } from "./audit.ts";
 import { blastRadius } from "./blast.ts";
 import { sameBytes, sha256 } from "./crypto.ts";
 import { getMeta, setMeta, type DB } from "./db.ts";
+import type { Berth, Dock, Docks } from "./docks.ts";
 import type { Hub } from "./hub.ts";
 import { insights, type BoxFacts, type ServerInfo } from "./insights.ts";
 import { inventory, type Inventory } from "./labels.ts";
@@ -38,6 +39,7 @@ export interface Context {
   tapes: Tapes;
   audit: Audit;
   hub: Hub;
+  docks: Docks;
   info: ServerInfo;
 }
 
@@ -98,10 +100,11 @@ export class Api {
 
   constructor(ctx: Context) {
     this.ctx = ctx;
-    ctx.vault.onChange((change) => {
-      this.forgetInventory(change.boxId);
-      ctx.hub.publish(change);
+    ctx.vault.onChange(({ boxId, ...change }) => {
+      this.forgetInventory(boxId);
+      ctx.hub.publish(`box:${boxId}`, change);
     });
+    ctx.docks.onParcel(({ dockId, parcel }) => ctx.hub.publish(`dock:${dockId}`, parcel));
     this.appOps = this.buildAppOps();
     this.adminOps = this.buildAdminOps();
   }
@@ -214,15 +217,15 @@ export class Api {
     const auth = this.authenticateApp(req);
     const handler = this.appOps[req.op];
     try {
-      if (req.op === "watch") {
-        throw fail("use_stream", 400, "watch streams changes, so it can't be called like other operations.", "Use box.watch() from the SDK.");
+      if (req.op === "watch" || req.op === "dock.watch") {
+        throw fail("use_stream", 400, `${req.op} streams events, so it can't be called like other operations.`, "Use watch() or dock().on() from the SDK.");
       }
       if (!handler) {
         throw fail("unknown_op", 404, `Cardboard has no "${req.op}" operation.`, `Try: ${Object.keys(this.appOps).join(", ")}.`);
       }
       return { status: 200, headers: auth.cors, body: handler(auth, asBody(req.body), req) };
     } catch (err) {
-      if (err instanceof CardboardError && err.status === 403) {
+      if (err instanceof CardboardError && err.status === 403 && err.code !== "dock_pending") {
         const body = isPlainObject(req.body) ? req.body : {};
         this.log(req, auth.box.id, auth.actor, req.op, "denied", {
           note: err.reason,
@@ -252,8 +255,45 @@ export class Api {
     }
   }
 
+  /**
+   * Finds the app's berth at a dock. If it isn't allowed to do `want` yet, this
+   * files a request for the owner (once) and refuses with a friendly "waiting".
+   */
+  private dockAccess(a: AppAuth, body: Body, want: "send" | "receive", req: ApiRequest): { dock: Dock; berth: Berth } {
+    const { docks } = this.ctx;
+    if (a.tape.prefix) {
+      throw fail("prefix_tape_no_docks", 403, "This tape is limited to a prefix, so it can't use docks.", "Use the app's main tape for docking.");
+    }
+    const name = requireString(body, "dock");
+    const dock = docks.find(name);
+    const berth = dock ? docks.berth(dock.id, a.box.id) : undefined;
+    if (dock && berth && (want === "send" ? berth.send : berth.receive)) return { dock, berth };
+    const denied = () =>
+      fail("dock_denied", 403, `The owner said no to ${want === "send" ? "sending" : "receiving"} on dock “${name}”.`, "Ask them to allow it in the dashboard.");
+    if (berth?.denied) throw denied();
+    const alreadyAsked = want === "send" ? berth?.wantSend : berth?.wantReceive;
+    const result = docks.request(name, a.box.id, { [want]: true });
+    if (result.berth.denied) throw denied();
+    if (!alreadyAsked) this.log(req, a.box.id, a.actor, "dock.request", "ok", { name, note: want, ip: req.ip });
+    throw fail(
+      "dock_pending",
+      403,
+      `Asked to ${want} on dock “${name}”. Waiting for the owner to approve.`,
+      `Approve it in the dashboard, or run: cardboard dock approve ${name} ${a.box.name}`,
+    );
+  }
+
+  /** Auth + berth check for the streaming dock endpoint (served by the HTTP layer). */
+  authorizeDockWatch(req: ApiRequest): AppAuth & { dock: Dock; berth: Berth } {
+    const auth = this.authenticateApp(req);
+    requireRead(auth.tape);
+    const { dock, berth } = this.dockAccess(auth, asBody(req.body), "receive", req);
+    this.log(req, auth.box.id, auth.actor, "dock.watch", "ok", { name: dock.name, ip: req.ip });
+    return { ...auth, dock, berth };
+  }
+
   private buildAppOps(): Record<string, AppOp> {
-    const { vault } = this.ctx;
+    const { vault, docks } = this.ctx;
     const ip = (req: ApiRequest) => req.ip;
 
     const recordWrite = (a: AppAuth, req: ApiRequest, action: string, key: string, notices: string[]) => {
@@ -403,8 +443,70 @@ export class Api {
         return { results };
       },
 
-      // Listed so the error message for unknown ops mentions it; served by the HTTP layer.
+      introduce: (a, body, req) => {
+        requireWrite(a.tape);
+        const box = vault.updateProfile(a.box.id, body);
+        this.log(req, a.box.id, a.actor, "introduce", "ok", { name: box.profile.title ?? a.box.name, ip: ip(req) });
+        return { profile: box.profile };
+      },
+
+      "dock.status": (a, body) => {
+        const name = requireString(body, "dock");
+        const dock = docks.find(name);
+        const berth = dock ? docks.berth(dock.id, a.box.id) : undefined;
+        // Only docked apps get counts, and only counts. Who the others are is none of their business.
+        const docked = Boolean(berth?.send || berth?.receive);
+        const others = dock && docked ? docks.berths(dock.id).filter((b) => b.boxId !== a.box.id) : [];
+        return {
+          dock: name,
+          exists: Boolean(dock),
+          me: dock ? (berth?.tag ?? docks.tagFor(dock.id, a.box.id)) : null,
+          send: Boolean(berth?.send),
+          receive: Boolean(berth?.receive),
+          waiting: { send: Boolean(berth?.wantSend && !berth.send), receive: Boolean(berth?.wantReceive && !berth.receive) },
+          denied: Boolean(berth?.denied),
+          receivers: docked ? others.filter((b) => b.receive).length : null,
+          senders: docked ? others.filter((b) => b.send).length : null,
+        };
+      },
+
+      "dock.send": (a, body, req) => {
+        requireWrite(a.tape);
+        const { dock, berth } = this.dockAccess(a, body, "send", req);
+        try {
+          const result = docks.send(dock, berth, body["body"], optString(body, "to"));
+          this.log(req, a.box.id, a.actor, "dock.send", "ok", { name: dock.name, count: result.recipients, ip: ip(req) });
+          return { ...result, from: berth.tag };
+        } catch (err) {
+          if (err instanceof CardboardError && (err.status === 422 || err.status === 413)) {
+            this.log(req, a.box.id, a.actor, "dock.customs", "denied", { name: dock.name, note: err.reason, ip: ip(req) });
+          }
+          throw err;
+        }
+      },
+
+      "dock.receive": (a, body, req) => {
+        requireRead(a.tape);
+        const { dock, berth } = this.dockAccess(a, body, "receive", req);
+        const parcels = docks.receive(dock, berth, { after: optNumber(body, "after"), limit: optNumber(body, "limit") });
+        if (optBoolean(body, "ack") && parcels.length > 0) docks.ack(dock, berth, parcels.at(-1)!.seq);
+        if (parcels.length > 0) {
+          this.log(req, a.box.id, a.actor, "dock.receive", "ok", { name: dock.name, count: parcels.length, ip: ip(req) });
+        }
+        return { me: berth.tag, parcels };
+      },
+
+      "dock.ack": (a, body, req) => {
+        requireRead(a.tape);
+        const { dock, berth } = this.dockAccess(a, body, "receive", req);
+        const seq = optNumber(body, "seq");
+        if (seq === undefined) throw fail("bad_request", 400, "`seq` is required: the seq of the last parcel you handled.");
+        return { cursor: docks.ack(dock, berth, seq) };
+      },
+
+      // Listed so the error message for unknown ops mentions them; served by the HTTP layer.
       watch: () => undefined,
+      "dock.watch": () => undefined,
     };
   }
 
@@ -448,7 +550,8 @@ export class Api {
       stats: this.ctx.vault.stats(box.id),
       inventory: this.inventoryFor(box.id),
       tapes: this.ctx.tapes.list(box.id).map((tape) => ({ tape, state: this.ctx.tapes.state(tape) })),
-      denied24h: this.ctx.audit.counts(box.id, now - DAY).denied,
+      denied24h: this.ctx.audit.deniedSince(box.id, now - DAY, { excludeAction: "dock.customs" }),
+      customs24h: this.ctx.audit.deniedSince(box.id, now - DAY, { action: "dock.customs" }),
     };
   }
 
@@ -466,6 +569,8 @@ export class Api {
       anonymousDenied24h: anonymous.n,
       lastBackupAt: lastBackup ? Number(lastBackup) : null,
       shake: this.lastShake,
+      pendingDocks: this.pendingDocks(),
+      docks: this.ctx.docks.list().map((d) => ({ name: d.name, ...this.ctx.docks.inFlight(d.id) })),
     });
   }
 
@@ -474,10 +579,39 @@ export class Api {
     return this.lastShake;
   }
 
+  private boxName(boxId: string): string {
+    return this.ctx.vault.getBox(boxId)?.name ?? "(shredded box)";
+  }
+
+  pendingDocks() {
+    return this.ctx.docks.pending().map((p) => ({ dock: p.dock, box: this.boxName(p.boxId), send: p.send, receive: p.receive, requestedAt: p.requestedAt }));
+  }
+
+  dockSummary(dock: Dock) {
+    const { docks } = this.ctx;
+    return {
+      name: dock.name,
+      createdAt: dock.createdAt,
+      settings: dock.settings,
+      inFlight: docks.inFlight(dock.id),
+      berths: docks.berths(dock.id).map((b) => ({
+        box: this.boxName(b.boxId),
+        tag: b.tag,
+        send: b.send,
+        receive: b.receive,
+        waiting: { send: b.wantSend && !b.send, receive: b.wantReceive && !b.receive },
+        denied: b.denied,
+        approvedAt: b.approvedAt,
+      })),
+    };
+  }
+
   private boxSummary(box: Box) {
     const facts = this.boxFacts(box);
     return {
       name: box.name,
+      profile: box.profile,
+      docks: this.ctx.docks.berthsOf(box.id).map((b) => ({ dock: b.dock, send: b.send, receive: b.receive, waiting: (b.wantSend && !b.send) || (b.wantReceive && !b.receive) })),
       createdAt: box.createdAt,
       settings: box.settings,
       ...facts.stats,
@@ -489,9 +623,12 @@ export class Api {
   }
 
   private buildAdminOps(): Record<string, AdminOp> {
-    const { vault, tapes, audit, hub, db, info } = this.ctx;
+    const { vault, tapes, audit, hub, db, info, docks } = this.ctx;
     const owner = "owner";
     const boxFrom = (body: Body, field = "name") => vault.requireBox(requireString(body, field));
+    const dockFrom = (body: Body, field = "dock") => docks.require(requireString(body, field));
+    const closeBerth = (dockId: string, boxId: string) => hub.closeWhere((w) => w.channel === `dock:${dockId}` && w.boxId === boxId);
+    const directions = (b: { send: boolean; receive: boolean }) => (b.send && b.receive ? "send and receive" : b.send ? "send" : "receive");
 
     return {
       overview: () => ({
@@ -500,6 +637,8 @@ export class Api {
         boxes: vault.listBoxes().map((b) => this.boxSummary(b)),
         insights: this.computeInsights(),
         shake: this.lastShake,
+        pendingDocks: this.pendingDocks(),
+        docks: docks.list().length,
       }),
 
       boxes: () => ({ boxes: vault.listBoxes().map((b) => this.boxSummary(b)) }),
@@ -536,6 +675,7 @@ export class Api {
           throw fail("confirm_shred", 400, `Shredding ${box.name} can't be undone.`, `Confirm by sending confirm: "${box.name}".`);
         }
         hub.closeWhere((w) => w.boxId === box.id);
+        docks.forgetBox(box.id);
         vault.shredBox(box.id);
         this.forgetInventory(box.id);
         audit.record(null, owner, "box.shred", "ok", { name: box.name });
@@ -634,6 +774,89 @@ export class Api {
         return { results };
       },
 
+      "box.profile": (body) => {
+        const box = boxFrom(body);
+        const updated = vault.updateProfile(box.id, asBody(body["profile"]));
+        return { box: this.boxSummary(updated) };
+      },
+
+      docks: () => ({ docks: docks.list().map((d) => this.dockSummary(d)), pending: this.pendingDocks() }),
+
+      "dock.create": (body) => {
+        const dock = docks.create(requireString(body, "name"));
+        if (body["settings"] !== undefined) docks.updateSettings(dock.id, asBody(body["settings"]));
+        const send = optStringList(body, "send");
+        const receive = optStringList(body, "receive");
+        for (const name of new Set([...send, ...receive])) {
+          const box = vault.requireBox(name);
+          const berth = docks.grant(dock.id, box.id, { send: send.includes(name), receive: receive.includes(name) })!;
+          audit.record(box.id, owner, "dock.grant", "ok", { name: dock.name, note: directions(berth) });
+        }
+        audit.record(null, owner, "dock.create", "ok", { name: dock.name });
+        return { dock: this.dockSummary(docks.require(dock.name)) };
+      },
+
+      "dock.grant": (body) => {
+        const dock = dockFrom(body);
+        const box = boxFrom(body, "box");
+        const berth = docks.grant(dock.id, box.id, { send: optBoolean(body, "send"), receive: optBoolean(body, "receive") });
+        if (!berth) closeBerth(dock.id, box.id);
+        audit.record(box.id, owner, berth ? "dock.grant" : "dock.remove", "ok", { name: dock.name, note: berth ? directions(berth) : undefined });
+        return { dock: this.dockSummary(dock) };
+      },
+
+      "dock.approve": (body) => {
+        const dock = dockFrom(body);
+        const box = boxFrom(body, "box");
+        const berth = docks.approve(dock.id, box.id);
+        audit.record(box.id, owner, "dock.approve", "ok", { name: dock.name, note: directions(berth) });
+        return { dock: this.dockSummary(dock) };
+      },
+
+      "dock.deny": (body) => {
+        const dock = dockFrom(body);
+        const box = boxFrom(body, "box");
+        docks.deny(dock.id, box.id);
+        closeBerth(dock.id, box.id);
+        audit.record(box.id, owner, "dock.deny", "ok", { name: dock.name });
+        return { dock: this.dockSummary(dock) };
+      },
+
+      "dock.remove": (body) => {
+        const dock = dockFrom(body);
+        const box = boxFrom(body, "box");
+        const removed = docks.remove(dock.id, box.id);
+        closeBerth(dock.id, box.id);
+        if (removed) audit.record(box.id, owner, "dock.remove", "ok", { name: dock.name });
+        return { removed, dock: this.dockSummary(dock) };
+      },
+
+      "dock.settings": (body) => {
+        const dock = dockFrom(body);
+        docks.updateSettings(dock.id, asBody(body["settings"]));
+        audit.record(null, owner, "dock.settings", "ok", { name: dock.name, note: Object.keys(asBody(body["settings"])).join(", ") });
+        return { dock: this.dockSummary(docks.require(dock.name)) };
+      },
+
+      "dock.peek": (body) => {
+        const dock = dockFrom(body);
+        audit.record(null, owner, "dock.peek", "ok", { name: dock.name });
+        return {
+          parcels: docks.peek(dock.id).map(({ senderBoxId, ...parcel }) => ({ ...parcel, sender: this.boxName(senderBoxId) })),
+        };
+      },
+
+      "dock.shred": (body) => {
+        const dock = dockFrom(body);
+        if (body["confirm"] !== dock.name) {
+          throw fail("confirm_shred", 400, `Shredding the dock ${dock.name} can't be undone.`, `Confirm by sending confirm: "${dock.name}".`);
+        }
+        hub.closeWhere((w) => w.channel === `dock:${dock.id}`);
+        docks.shred(dock.id);
+        audit.record(null, owner, "dock.shred", "ok", { name: dock.name });
+        return { shredded: dock.name };
+      },
+
       backup: () => {
         const dir = join(info.dataDir, "backups");
         mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -702,6 +925,16 @@ function optNumber(body: Body, field: string): number | undefined {
   if (value === undefined || value === null) return undefined;
   if (typeof value !== "number" || !Number.isFinite(value)) throw fail("bad_request", 400, `\`${field}\` must be a number.`);
   return value;
+}
+
+function optStringList(body: Body, field: string): string[] {
+  const value = body[field];
+  if (value === undefined || value === null) return [];
+  const list = typeof value === "string" ? value.split(",") : value;
+  if (!Array.isArray(list) || list.some((v) => typeof v !== "string")) {
+    throw fail("bad_request", 400, `\`${field}\` must be a list of box names.`);
+  }
+  return list.map((v) => (v as string).trim()).filter(Boolean);
 }
 
 function optBoolean(body: Body, field: string): boolean | undefined {

@@ -320,50 +320,84 @@ export class Box {
     const prefix = typeof a === "string" ? a : "";
     const onChange = (typeof a === "function" ? a : b) as (change: Change<T>) => void;
     const options = (typeof a === "function" ? b : c) as WatchOptions | undefined;
+    return this.stream("watch", { prefix }, {
+      onReady: () => options?.onReady?.(),
+      onError: options?.onError,
+      onEvent: (type, data) => {
+        if (type === "change") onChange(JSON.parse(data) as Change<T>);
+      },
+    });
+  }
+
+  /** A dock: swap data with other apps without either side learning who the other is. */
+  dock(name: string): Dock {
+    return new Dock(this, name);
+  }
+
+  /** Tell Cardboard who this app is, so you recognise it on your shelf. */
+  introduce(profile: AppProfile): Promise<{ profile: AppProfile }> {
+    return this.request("introduce", profile);
+  }
+
+  /**
+   * @internal Opens a server-sent event stream that reconnects by itself.
+   * Client errors stop it, unless `keepTrying` says the error is worth waiting out.
+   */
+  stream(
+    op: string,
+    body: unknown,
+    handlers: {
+      onEvent: (type: string, data: string) => void;
+      onReady?: (data: string) => void;
+      onError?: ((error: Error) => void) | undefined;
+      keepTrying?: (error: CardboardError) => boolean;
+      maxDelayMs?: number;
+    },
+  ): Watcher {
     const controller = new AbortController();
     let closed = false;
     const report = (err: unknown) => {
       if (closed) return;
       const error = err instanceof Error ? err : new Error(String(err));
-      if (options?.onError) options.onError(error);
-      else console.warn(`[cardboard] watch: ${error.message}`);
+      if (handlers.onError) handlers.onError(error);
+      else console.warn(`[cardboard] ${op}: ${error.message}`);
     };
 
     const run = async () => {
       let delay = 1000;
       while (!closed) {
         try {
-          const res = await this.fetchImpl(`${this.url}/v1/watch`, {
+          const res = await this.fetchImpl(`${this.url}/v1/${op}`, {
             method: "POST",
             headers: { authorization: `Bearer ${this.tape}`, "content-type": "application/json" },
-            body: JSON.stringify({ prefix }),
+            body: JSON.stringify(body),
             signal: controller.signal,
           });
           if (!res.ok || !res.body) {
             const error = toError(res.status, (await res.json().catch(() => null)) as ErrorBody);
-            if (res.status >= 400 && res.status < 500 && res.status !== 429) {
+            const transient = res.status >= 500 || res.status === 429;
+            if (!transient && !handlers.keepTrying?.(error)) {
               report(error);
               closed = true;
               return;
             }
-            throw error;
-          }
-          delay = 1000;
-          const reader = res.body.getReader();
-          const decoder = new TextDecoder();
-          let buffer = "";
-          for (;;) {
-            const { value, done } = await reader.read();
-            if (done) break;
-            buffer += decoder.decode(value, { stream: true });
-            let end: number;
-            while ((end = buffer.indexOf("\n\n")) >= 0) {
-              const event = parseEvent(buffer.slice(0, end));
-              buffer = buffer.slice(end + 2);
-              if (event.type === "ready") options?.onReady?.();
-              if (event.type === "change") {
+            if (transient) throw error;
+          } else {
+            delay = 1000;
+            const reader = res.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = "";
+            for (;;) {
+              const { value, done } = await reader.read();
+              if (done) break;
+              buffer += decoder.decode(value, { stream: true });
+              let end: number;
+              while ((end = buffer.indexOf("\n\n")) >= 0) {
+                const event = parseEvent(buffer.slice(0, end));
+                buffer = buffer.slice(end + 2);
                 try {
-                  onChange(JSON.parse(event.data) as Change<T>);
+                  if (event.type === "ready") handlers.onReady?.(event.data);
+                  else handlers.onEvent(event.type, event.data);
                 } catch (err) {
                   report(err);
                 }
@@ -376,7 +410,7 @@ export class Box {
         }
         if (closed) return;
         await sleep(delay, controller.signal);
-        delay = Math.min(delay * 2, 30_000);
+        delay = Math.min(delay * 2, handlers.maxDelayMs ?? 30_000);
       }
     };
     void run();
@@ -386,6 +420,168 @@ export class Box {
         controller.abort();
       },
     };
+  }
+}
+
+export interface AppProfile {
+  title?: string;
+  description?: string;
+  url?: string;
+  version?: string;
+}
+
+/** A parcel as a receiving app sees it. `from` is a pseudonym, never a name. */
+export interface Parcel<T = unknown> {
+  id: string;
+  seq: number;
+  from: string;
+  to: string | null;
+  body: T;
+  sentAt: number;
+  expiresAt: number;
+  /** Fields customs replaced because they held personal data. */
+  redacted: string[];
+}
+
+export interface SendResult {
+  id: string;
+  seq: number;
+  /** Your pseudonym at this dock. */
+  from: string;
+  /** How many apps will get it (never who). */
+  recipients: number;
+  redacted: string[];
+  /** Fields customs removed because they aren't on the dock's manifest. Only you are told. */
+  stripped: string[];
+}
+
+export interface DockStatus {
+  dock: string;
+  exists: boolean;
+  me: string | null;
+  send: boolean;
+  receive: boolean;
+  waiting: { send: boolean; receive: boolean };
+  denied: boolean;
+  /** How many other apps receive / send here. Only told to apps that are docked. */
+  receivers: number | null;
+  senders: number | null;
+}
+
+export interface DockListenOptions extends WatchOptions {
+  /** Called once while the owner hasn't approved this app yet. Listening starts by itself once they do. */
+  onWaiting?: (message: string) => void;
+}
+
+/**
+ * A dock is a meeting point between apps. Cardboard carries parcels between
+ * them, checks every parcel at customs, and never tells anyone who sent what.
+ * The first time an app uses a dock, Cardboard asks you to approve it.
+ */
+export class Dock {
+  readonly name: string;
+  private readonly box: Box;
+
+  constructor(box: Box, name: string) {
+    this.box = box;
+    this.name = name;
+  }
+
+  /** Sends a parcel to every app receiving at this dock, or to one pseudonym with `to`. */
+  send<T>(body: T, options: { to?: string } = {}): Promise<SendResult> {
+    return this.box.request("dock.send", { dock: this.name, body, to: options.to });
+  }
+
+  /** Answers a parcel. Only its sender gets the reply, and still doesn't learn who you are. */
+  reply<T>(parcel: Parcel, body: T): Promise<SendResult> {
+    return this.send(body, { to: parcel.from });
+  }
+
+  /** Parcels waiting for this app, oldest first. With `ack: true` they're marked as picked up. */
+  async receive<T = unknown>(options: { limit?: number; ack?: boolean; after?: number } = {}): Promise<Parcel<T>[]> {
+    const { parcels } = await this.box.request<{ parcels: Parcel<T>[] }>("dock.receive", { dock: this.name, ...options });
+    return parcels;
+  }
+
+  /** Marks everything up to this parcel as picked up. Delivered parcels are deleted. */
+  async ack(parcel: Parcel | number): Promise<void> {
+    await this.box.request("dock.ack", { dock: this.name, seq: typeof parcel === "number" ? parcel : parcel.seq });
+  }
+
+  status(): Promise<DockStatus> {
+    return this.box.request("dock.status", { dock: this.name });
+  }
+
+  /**
+   * Handles every parcel for this app, live, one at a time, and acks each one
+   * after the handler finishes. Catches up on anything that arrived while it was
+   * away. If the dock isn't approved yet, it waits and starts once you approve.
+   */
+  on<T = unknown>(handler: (parcel: Parcel<T>) => void | Promise<void>, options: DockListenOptions = {}): Watcher {
+    let lastSeq = 0;
+    let queue: Promise<void> = Promise.resolve();
+    let catchingUp = true;
+    let buffered: Parcel<T>[] = [];
+    let saidWaiting = false;
+    const report = (err: unknown) => {
+      const error = err instanceof Error ? err : new Error(String(err));
+      if (options.onError) options.onError(error);
+      else console.warn(`[cardboard] dock ${this.name}: ${error.message}`);
+    };
+    const handle = (parcel: Parcel<T>) => {
+      if (parcel.seq <= lastSeq) return;
+      lastSeq = parcel.seq;
+      queue = queue.then(async () => {
+        try {
+          await handler(parcel);
+          await this.ack(parcel.seq);
+        } catch (err) {
+          report(err);
+        }
+      });
+    };
+    const catchUp = async () => {
+      try {
+        for (;;) {
+          const batch = await this.receive<T>({ limit: 100, after: lastSeq || undefined });
+          batch.forEach(handle);
+          if (batch.length < 100) break;
+        }
+      } catch (err) {
+        report(err);
+      } finally {
+        catchingUp = false;
+        const later = buffered.sort((a, b) => a.seq - b.seq);
+        buffered = [];
+        later.forEach(handle);
+      }
+    };
+
+    return this.box.stream("dock.watch", { dock: this.name }, {
+      maxDelayMs: 10_000,
+      onError: options.onError,
+      onReady: () => {
+        saidWaiting = false;
+        catchingUp = true;
+        options.onReady?.();
+        void catchUp();
+      },
+      onEvent: (type, data) => {
+        if (type !== "parcel") return;
+        const parcel = JSON.parse(data) as Parcel<T>;
+        if (catchingUp) buffered.push(parcel);
+        else handle(parcel);
+      },
+      keepTrying: (error) => {
+        if (error.code !== "dock_pending") return false;
+        if (!saidWaiting) {
+          saidWaiting = true;
+          if (options.onWaiting) options.onWaiting(error.message);
+          else console.info(`[cardboard] ${error.message}`);
+        }
+        return true;
+      },
+    });
   }
 }
 

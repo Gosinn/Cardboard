@@ -7,6 +7,7 @@ import { CardboardError, fail } from "../shared/errors.ts";
 import { VERSION } from "../shared/version.ts";
 import { Api, errorResponse, type ApiRequest } from "./api.ts";
 import { Audit } from "./audit.ts";
+import { Docks, type Parcel } from "./docks.ts";
 import { Hub } from "./hub.ts";
 import type { ServerInfo } from "./insights.ts";
 import { openStore, resolvePaths, type Paths } from "./setup.ts";
@@ -75,6 +76,10 @@ export async function startServer(options: StartOptions = {}): Promise<RunningCa
   const tapes = new Tapes(db, now);
   const audit = new Audit(db, vault, tapes);
   const hub = new Hub();
+  const docks = new Docks(db, vault);
+  for (const dock of docks.list({ includeInternal: true })) {
+    if (dock.name.startsWith("__shake-")) docks.shred(dock.id);
+  }
   const host = options.host ?? process.env["CARDBOARD_HOST"] ?? "127.0.0.1";
   const port = options.port ?? Number(process.env["CARDBOARD_PORT"] ?? 8787);
   const info: ServerInfo = {
@@ -88,7 +93,7 @@ export async function startServer(options: StartOptions = {}): Promise<RunningCa
     trustProxy: Boolean(options.trustProxy),
     startedAt: now(),
   };
-  const api = new Api({ db, vault, tapes, audit, hub, info });
+  const api = new Api({ db, vault, tapes, audit, hub, docks, info });
   const statics = loadStatics();
 
   const handler = (req: IncomingMessage, res: ServerResponse) => {
@@ -160,6 +165,7 @@ export async function startServer(options: StartOptions = {}): Promise<RunningCa
       body,
     };
     if (!apiReq.admin && apiReq.op === "watch") return watch(apiReq, res);
+    if (!apiReq.admin && apiReq.op === "dock.watch") return watchDock(apiReq, res);
     const out = api.call(apiReq);
     sendJson(res, out.status, out.body, out.headers);
   }
@@ -181,12 +187,38 @@ export async function startServer(options: StartOptions = {}): Promise<RunningCa
       ...auth.cors,
     });
     res.write(`event: ready\ndata: ${JSON.stringify({ box: auth.box.name, prefix: auth.prefix })}\n\n`);
+    stream(res, `box:${auth.box.id}`, auth.box.id, auth.tape.id, (change: { key: string }) => change.key.startsWith(auth.prefix), "change");
+  }
+
+  /** Server-sent events: one `parcel` event per parcel addressed to this app at the dock. */
+  function watchDock(apiReq: ApiRequest, res: ServerResponse) {
+    let auth: ReturnType<Api["authorizeDockWatch"]>;
+    try {
+      auth = api.authorizeDockWatch(apiReq);
+    } catch (err) {
+      const out = errorResponse(err);
+      return sendJson(res, out.status, out.body);
+    }
+    res.writeHead(200, {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-store",
+      connection: "keep-alive",
+      "x-accel-buffering": "no",
+      ...auth.cors,
+    });
+    res.write(`event: ready\ndata: ${JSON.stringify({ dock: auth.dock.name, me: auth.berth.tag })}\n\n`);
+    const me = auth.berth.tag;
+    stream(res, `dock:${auth.dock.id}`, auth.box.id, auth.tape.id, (p: Parcel) => p.from !== me && (p.to === null || p.to === me), "parcel");
+  }
+
+  function stream(res: ServerResponse, channel: string, boxId: string, tapeId: string, accept: (event: any) => boolean, eventName: string) {
     const ping = setInterval(() => res.write(": ping\n\n"), 25_000);
     const unsubscribe = hub.subscribe({
-      boxId: auth.box.id,
-      tapeId: auth.tape.id,
-      prefix: auth.prefix,
-      send: (change) => res.write(`event: change\ndata: ${JSON.stringify(change)}\n\n`),
+      channel,
+      boxId,
+      tapeId,
+      accept,
+      send: (event) => res.write(`event: ${eventName}\ndata: ${JSON.stringify(event)}\n\n`),
       close: () => {
         clearInterval(ping);
         res.end();
@@ -213,6 +245,7 @@ export async function startServer(options: StartOptions = {}): Promise<RunningCa
   const sweeper = setInterval(() => {
     try {
       for (const [boxId, count] of vault.sweep().expired) audit.record(boxId, "system", "expire", "ok", { count });
+      docks.sweep();
       audit.prune();
     } catch (err) {
       console.error("[cardboard] housekeeping failed:", err);

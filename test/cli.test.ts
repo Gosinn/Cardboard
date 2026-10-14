@@ -36,8 +36,12 @@ describe("cardboard CLI", () => {
     const appDir = join(home, "my-notes");
     mkdirSync(appDir);
     writeFileSync(join(appDir, ".gitignore"), "node_modules\n");
-    const { stdout } = await cli(["connect", "my-notes", "--dir", appDir]);
-    assert.match(stdout, /Made a box called/);
+    writeFileSync(join(appDir, "package.json"), JSON.stringify({ name: "@gosinn/my-notes", description: "Notes for me", version: "0.3.0" }));
+    const { stdout } = await cli(["connect", "--dir", appDir]);
+    assert.match(stdout, /Made a box called .*my-notes/, "the box name comes from package.json");
+    const boxes = await t.admin("boxes");
+    const profile = boxes.body.boxes.find((b: any) => b.name === "my-notes").profile;
+    assert.deepEqual(profile, { title: "@gosinn/my-notes", description: "Notes for me", version: "0.3.0" });
 
     const dotenv = readFileSync(join(appDir, ".env"), "utf8");
     assert.match(dotenv, /^CARDBOARD_URL=http:\/\/127\.0\.0\.1:\d+$/m);
@@ -68,6 +72,30 @@ describe("cardboard CLI", () => {
     const detail = await t.admin("box.get", { name: "my-notes" });
     assert.equal(detail.body.box.settings.secrets, "block");
     await assert.rejects(cli(["box", "nope"]), /There's no box called nope/);
+  });
+
+  it("docks apps from the command line", async () => {
+    await t.admin("box.create", { name: "cli-sender" });
+    await t.admin("box.create", { name: "cli-receiver" });
+    const created = await cli(["dock", "create", "cli-dock", "--send", "cli-sender", "--receive", "cli-receiver"]);
+    assert.match(created.stdout, /Opened .*cli-dock/);
+    assert.match(created.stdout, /cli-sender can send, known there as berth-[0-9a-f]{12}/);
+
+    await t.admin("box.create", { name: "cli-asker" });
+    const asker = await t.admin("tape.create", { box: "cli-asker" });
+    await t.app(asker.body.secret, "dock.send", { dock: "cli-dock", body: { hi: 1 } });
+    const listed = await cli(["docks"]);
+    assert.match(listed.stdout, /cli-asker wants to send on .*cli-dock/);
+    await cli(["dock", "approve", "cli-dock", "cli-asker"]);
+    const sent = await t.app(asker.body.secret, "dock.send", { dock: "cli-dock", body: { hi: 2 } });
+    assert.equal(sent.status, 200);
+
+    const peek = await cli(["dock", "peek", "cli-dock"]);
+    assert.match(peek.stdout, /from .*cli-asker/);
+    await cli(["dock", "set", "cli-dock", "personal", "block"]);
+    await cli(["dock", "remove", "cli-dock", "cli-asker"]);
+    const after = await t.app(asker.body.secret, "dock.send", { dock: "cli-dock", body: { hi: 3 } });
+    assert.equal(after.body.error.code, "dock_pending");
   });
 
   it("starts a fresh Cardboard and prints the owner token once", async () => {

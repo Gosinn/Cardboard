@@ -77,6 +77,57 @@ const MIGRATIONS: string[] = [
   CREATE INDEX log_box_at ON log(box_id, at);
   CREATE INDEX log_at ON log(at);
   `,
+  `
+  -- What an app has told Cardboard about itself (title, description, url, version).
+  ALTER TABLE boxes ADD COLUMN profile TEXT NOT NULL DEFAULT '{}';
+
+  -- Docks: named meeting points where apps swap data without learning who's who.
+  CREATE TABLE docks (
+    id          TEXT PRIMARY KEY,
+    name        TEXT NOT NULL UNIQUE,
+    wrapped_key BLOB NOT NULL,
+    settings    TEXT NOT NULL DEFAULT '{}',
+    created_at  INTEGER NOT NULL,
+    last_seq    INTEGER NOT NULL DEFAULT 0
+  );
+
+  -- An app's place at a dock. can_* is what's approved, want_* what it has asked for.
+  -- tag is the app's pseudonym at this dock: a keyed hash, different at every dock.
+  CREATE TABLE berths (
+    dock_id      TEXT NOT NULL REFERENCES docks(id) ON DELETE CASCADE,
+    box_id       TEXT NOT NULL REFERENCES boxes(id) ON DELETE CASCADE,
+    tag          TEXT NOT NULL,
+    can_send     INTEGER NOT NULL DEFAULT 0,
+    can_receive  INTEGER NOT NULL DEFAULT 0,
+    want_send    INTEGER NOT NULL DEFAULT 0,
+    want_receive INTEGER NOT NULL DEFAULT 0,
+    denied       INTEGER NOT NULL DEFAULT 0,
+    requested_at INTEGER,
+    approved_at  INTEGER,
+    cursor       INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (dock_id, box_id)
+  ) WITHOUT ROWID;
+  CREATE UNIQUE INDEX berths_tag ON berths(dock_id, tag);
+  CREATE INDEX berths_box ON berths(box_id);
+
+  -- Parcels in flight. The sender is stored only as its pseudonym, plus an
+  -- encrypted copy of its box id that only the owner can read. seq counts per
+  -- dock, so apps can't gauge traffic on other docks.
+  CREATE TABLE parcels (
+    id         TEXT PRIMARY KEY,
+    dock_id    TEXT NOT NULL REFERENCES docks(id) ON DELETE CASCADE,
+    seq        INTEGER NOT NULL,
+    sender_tag TEXT NOT NULL,
+    to_tag     TEXT,
+    body_enc   BLOB NOT NULL,
+    sender_enc BLOB NOT NULL,
+    size       INTEGER NOT NULL,
+    sent_at    INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL
+  );
+  CREATE UNIQUE INDEX parcels_dock ON parcels(dock_id, seq);
+  CREATE INDEX parcels_expiry ON parcels(expires_at);
+  `,
 ];
 
 export function openDb(path: string): DB {

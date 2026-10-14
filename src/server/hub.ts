@@ -1,14 +1,18 @@
-import type { Change } from "./vault.ts";
-
+/**
+ * Fans committed events out to live watchers (server-sent event streams).
+ * Box changes go out on `box:<id>`, dock parcels on `dock:<id>`. Each watcher
+ * decides with `accept` which events are for it. Revoking a tape, undocking
+ * or shredding closes the matching streams immediately.
+ */
 export interface Watcher {
+  channel: string;
   boxId: string;
   tapeId: string | null;
-  prefix: string;
-  send: (change: Omit<Change, "boxId">) => void;
+  accept: (event: any) => boolean;
+  send: (event: unknown) => void;
   close: () => void;
 }
 
-/** Fans committed changes out to live watchers. Revoking a tape closes its streams immediately. */
 export class Hub {
   private readonly watchers = new Set<Watcher>();
 
@@ -17,10 +21,14 @@ export class Hub {
     return () => this.watchers.delete(watcher);
   }
 
-  publish(change: Change) {
-    const { boxId, ...event } = change;
+  publish(channel: string, event: unknown) {
     for (const w of this.watchers) {
-      if (w.boxId === boxId && event.key.startsWith(w.prefix)) w.send(event);
+      if (w.channel !== channel) continue;
+      try {
+        if (w.accept(event)) w.send(event);
+      } catch {
+        // One broken stream must not stop the others.
+      }
     }
   }
 

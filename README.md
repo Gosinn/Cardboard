@@ -62,6 +62,28 @@ That's the whole setup. `open()` reads `.env` by itself.
 | **Live** | `watch()` streams changes. Revoking a tape cuts its live connections immediately. |
 | **Search everything** | Find "lasagna" across every box from the dashboard or `cardboard search`. |
 
+## Docks: apps that help each other without knowing each other
+
+Two of your apps need to share data, but neither should learn who the other is. Cardboard stands in the middle: it carries the parcels, checks every one at customs, and tells nobody who sent what.
+
+```ts
+// recipe-app
+await box.dock("shopping-list").send({ item: "lamb", qty: 1 });
+
+// grocery-app
+box.dock("shopping-list").on(async (parcel) => {
+  await addToList(parcel.body); // parcel.from is "berth-0d621d65da4d", never "recipe-app"
+});
+```
+
+**Docking is one tap.** The first time an app uses a dock, Cardboard asks you. Approve it on the dashboard (or `cardboard dock approve shopping-list grocery-app`), and an app that's already listening starts receiving straight away. Or set it all up front: `cardboard dock create shopping-list --send recipe-app --receive grocery-app`.
+
+- **No names.** At each dock an app is only a pseudonym, and it's a *different* pseudonym at every dock, so apps can't link what they see across docks. `dock.reply(parcel, …)` answers privately: only the original sender gets it, and it still doesn't learn who answered.
+- **Customs.** Secrets (API keys, passwords, private keys, login tokens) are refused. Personal data (emails, phones, cards, IBANs, kennitölur…) is redacted by default, or refused or allowed per dock. Booby-trapped JSON (`__proto__` keys that infect apps doing naive merges, absurd nesting) is refused. A **manifest** like `{"item":"string","qty":"number?"}` lets only those fields cross and strips the rest. Size and rate limits apply per app. Rejected parcels are never stored.
+- **Deliver, then forget.** A parcel is deleted the moment everyone it was for has picked it up, and otherwise expires (7 days by default). Apps that join later still find deposits waiting for them.
+- **You see everything; apps see nothing.** `cardboard dock peek` (or *Look inside* on the dashboard) shows real senders. Parcels are encrypted at rest with the dock's own key.
+- **Cardboard remembers your apps.** Approvals belong to the app's box, not its tape, so redeploys and new tapes keep their docks. `cardboard connect` reads `package.json`, so your shelf knows each app's name, description and version. Apps can also call `box.introduce({ title, version })`.
+
 ## What makes it private
 
 - **Everything is encrypted at rest** with AES-256-GCM, including key names. Each box has its own random key, wrapped by a master key that lives in a separate file.
@@ -82,6 +104,8 @@ Cardboard **protects you against:**
 - a buggy app wrecking its data (history, undo, rewind)
 - tampering with the database file
 - tape guessing and forgotten, unused tapes
+
+Docks keep apps anonymous **from each other**, not from Cardboard (or you): Cardboard has to know who sent what in order to deliver it. If only one app sends on a dock, the receivers can guess who it is. Customs redacts personal data it can recognise, but it can't recognise everything (a person's name, for example), so a manifest is the strongest guarantee.
 
 It **doesn't (yet) protect against:**
 - someone who controls the *running* server, which has to hold keys in memory. Client-side "Fragile" encryption is on the roadmap.
@@ -107,6 +131,10 @@ cardboard set <box> <setting> <value>   secrets block · defaultTtl 30d · quota
 cardboard allow <box> <origin>          let a website call this box from a browser
 cardboard rewind <box> 10m              put a whole box back in time
 cardboard export [box] | import <box> <file> | backup | shred <box>
+cardboard docks                         docks, berths, and requests waiting for you
+cardboard dock create <dock> --send a,b --receive c
+cardboard dock approve|deny <dock> <app> · dock add <dock> <app> --as send|receive|both
+cardboard dock remove <dock> <app> · dock set <dock> personal block · dock peek <dock> · dock shred <dock>
 cardboard login <url> <owner-token> | reset-owner
 ```
 
@@ -124,12 +152,14 @@ cardboard login <url> <owner-token> | reset-owner
 | `batch([...])` | several writes that all happen or none do |
 | `watch(prefix, onChange)` | live changes; reconnects by itself |
 | `collection(name)` | `add`, `get`, `set`, `update`, `remove`, `find`, `findOne`, `count`, `all`, `watch` with time-ordered ids |
+| `dock(name)` | `send(body, { to })`, `reply(parcel, body)`, `receive({ ack })`, `ack(parcel)`, `status()`, `on(handler, { onWaiting })` |
+| `introduce({ title, description, url, version })` | tell Cardboard who this app is |
 
 Errors are `CardboardError`s with a `code`, a plain message and a `hint`.
 
 ## HTTP API (any language)
 
-Every call is `POST /v1/<operation>` with `Authorization: Bearer <tape>` and a JSON body. The app operations are `whoami`, `get`, `put`, `patch`, `add`, `delete`, `list`, `query`, `history`, `undo`, `batch` and `watch` (server-sent events). Owner operations live under `/v1/admin/` and take the owner token.
+Every call is `POST /v1/<operation>` with `Authorization: Bearer <tape>` and a JSON body. The app operations are `whoami`, `get`, `put`, `patch`, `add`, `delete`, `list`, `query`, `history`, `undo`, `batch`, `watch` (server-sent events), `introduce`, and for docks `dock.send`, `dock.receive`, `dock.ack`, `dock.status` and `dock.watch`. Owner operations live under `/v1/admin/` and take the owner token.
 
 ```bash
 curl -s localhost:8787/v1/put -H "authorization: Bearer $CARDBOARD_TAPE" \
@@ -150,7 +180,6 @@ CARDBOARD_DATA=/srv/cardboard CARDBOARD_KEY_FILE=/root/cardboard.key cardboard s
 
 - **Courier**: Cardboard holds your third-party API keys and makes calls for your apps, so apps never see the keys
 - **Files**: photos and documents next to JSON
-- **Hand-offs**: one app reads a slice of another's box, explicitly and revocably
 - **Fragile fields**: encrypted on the device, so even the server can't read them
 - **Passkey sign-in** for your apps' users, offline sync, scheduled off-site backups, a Python SDK
 

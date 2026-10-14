@@ -35,6 +35,18 @@ Cardboard ${VERSION}: a smart, private deposit box for your apps.
     cardboard blast <tape-id>         What a leaked tape would expose
     cardboard revoke <tape-id>        Switch a tape off now (live connections drop too)
 
+  Docks (apps swapping data without knowing each other)
+    cardboard docks                         Every dock, who's on it, waiting requests
+    cardboard dock create <dock> --send a,b --receive c   Open a dock and berth apps in one go
+    cardboard dock approve <dock> <app>     Say yes to an app that asked to dock
+    cardboard dock deny <dock> <app>        Say no (it stops asking)
+    cardboard dock add <dock> <app> --as send|receive|both
+    cardboard dock remove <dock> <app>      Take an app off a dock (cuts it off live)
+    cardboard dock set <dock> <setting> <value>   personal redact|block|allow · secrets block|allow
+                                                  shape '{"item":"string","qty":"number?"}' · ttl 7d
+    cardboard dock peek <dock>              What's in flight, and who really sent it
+    cardboard dock shred <dock>             Destroy a dock and everything in flight
+
   Boxes
     cardboard set <box> <setting> <value>   e.g. secrets block · defaultTtl 30d · quotaBytes 1GB
     cardboard allow <box> <origin>          Let a website call this box from the browser
@@ -128,6 +140,9 @@ async function main() {
       "read-only": { type: "boolean" },
       "write-only": { type: "boolean" },
       prefix: { type: "string" },
+      send: { type: "string" },
+      receive: { type: "string" },
+      as: { type: "string" },
       label: { type: "string" },
       idle: { type: "string" },
       expires: { type: "string" },
@@ -191,8 +206,9 @@ async function main() {
     }
 
     case "connect": {
-      const name = args[0] ?? slug(basename(resolve(values.dir ?? ".")));
       const dir = resolve(values.dir ?? ".");
+      const pkg = readPackageJson(dir);
+      const name = args[0] ?? slug(pkg?.name?.replace(/^@[^/]+\//, "") ?? basename(dir));
       const envFile = join(dir, ".env");
       const env = existsSync(envFile) ? readFileSync(envFile, "utf8") : "";
       if (/^\s*CARDBOARD_TAPE\s*=/m.test(env) && !values.force) {
@@ -208,6 +224,14 @@ async function main() {
       } else {
         secret = (await admin<{ secret: string }>("box.create", { name, ...tapeBody })).secret;
         created = true;
+      }
+      const profile = {
+        title: pkg?.name?.slice(0, 60),
+        description: pkg?.description?.slice(0, 200),
+        version: pkg?.version?.slice(0, 40),
+      };
+      if (profile.title || profile.description || profile.version) {
+        await admin("box.profile", { name, profile: Object.fromEntries(Object.entries(profile).filter(([, v]) => v)) });
       }
       writeEnv(envFile, env, { CARDBOARD_URL: url, CARDBOARD_TAPE: secret });
       const ignored = ensureGitignored(dir);
@@ -228,7 +252,11 @@ async function main() {
       for (const b of boxes) {
         const last = b.lastActivity ? relativeTime(b.lastActivity, Date.now()) : "never used";
         console.log(`${bold(b.name.padEnd(24))} ${String(b.items).padStart(6)} items  ${formatBytes(b.bytes).padStart(8)}  ${dim(last)}`);
+        if (b.profile.description || b.profile.version) {
+          console.log(dim(`  ${[b.profile.description, b.profile.version && `v${b.profile.version}`].filter(Boolean).join(" · ")}`));
+        }
         console.log(dim(`  ${b.summary}`));
+        if (b.docks.length) console.log(dim(`  Docks: ${b.docks.map((d) => `${d.dock} (${arrows(d)})`).join(", ")}`));
       }
       return;
     }
@@ -325,6 +353,99 @@ async function main() {
       const { results } = await admin<{ results: Array<{ box: string; key: string; snippet: string | null }> }>("search", { q });
       if (results.length === 0) return console.log("Nothing found.");
       for (const r of results) console.log(`${bold(r.box)} ${r.key}${r.snippet ? dim(`  …${r.snippet}…`) : ""}`);
+      return;
+    }
+
+    case "docks": {
+      const data = await admin<DocksView>("docks");
+      if (values.json) return console.log(JSON.stringify(data, null, 2));
+      if (data.pending.length) {
+        console.log(bold("Waiting for you"));
+        for (const p of data.pending) {
+          console.log(`  ${p.box} wants to ${arrows(p, true)} on ${bold(p.dock)}  ${dim(`→ cardboard dock approve ${p.dock} ${p.box}`)}`);
+        }
+        console.log("");
+      }
+      if (data.docks.length === 0) return console.log("No docks yet. Open one with: cardboard dock create <name> --send <app> --receive <app>");
+      for (const d of data.docks) {
+        const flight = d.inFlight.count ? `${d.inFlight.count} in flight` : "nothing in flight";
+        console.log(`${bold(d.name)}  ${dim(flight)}`);
+        for (const b of d.berths) {
+          const state = b.denied ? "refused" : !b.send && !b.receive ? "asking" : arrows(b);
+          console.log(`  ${b.box.padEnd(24)} ${state.padEnd(16)} ${dim(`known there as ${b.tag}`)}`);
+        }
+      }
+      return;
+    }
+
+    case "dock": {
+      const [action, dock, app] = args;
+      const needDock = () => need(dock, `Which dock? cardboard dock ${action} <dock>`);
+      const needApp = () => need(app, `Which app? cardboard dock ${action} <dock> <app>`);
+      switch (action) {
+        case "create": {
+          const result = await admin<{ dock: DocksView["docks"][number] }>("dock.create", {
+            name: needDock(),
+            send: values.send,
+            receive: values.receive,
+          });
+          console.log(`✓ Opened ${bold(result.dock.name)}.`);
+          for (const b of result.dock.berths) console.log(`  ${b.box} can ${arrows(b, true)}, known there as ${b.tag}`);
+          if (!values.send && !values.receive) {
+            console.log(dim("  No apps yet. Apps that use it will ask to dock, and you approve them."));
+          }
+          return;
+        }
+        case "approve":
+          await admin("dock.approve", { dock: needDock(), box: needApp() });
+          return console.log(`✓ ${app} is docked at ${dock}. If it's listening, it starts right now.`);
+        case "deny":
+          await admin("dock.deny", { dock: needDock(), box: needApp() });
+          return console.log(`✓ Refused. ${app} can't use ${dock} and won't ask again.`);
+        case "add": {
+          const as = values.as ?? "both";
+          if (!["send", "receive", "both"].includes(as)) die("--as must be send, receive or both.");
+          await admin("dock.grant", { dock: needDock(), box: needApp(), send: as !== "receive", receive: as !== "send" });
+          return console.log(`✓ ${app} can ${as === "both" ? "send and receive" : as} on ${dock}.`);
+        }
+        case "remove": {
+          const result = await admin<{ removed: boolean }>("dock.remove", { dock: needDock(), box: needApp() });
+          return console.log(result.removed ? `✓ Took ${app} off ${dock}. Its live connection is closed.` : `${app} wasn't on ${dock}.`);
+        }
+        case "set": {
+          const [, , setting, ...rest] = args;
+          if (!dock || !setting || rest.length === 0) die("Usage: cardboard dock set <dock> <setting> <value>");
+          const raw = rest.join(" ");
+          const value = setting === "ratePerMinute" ? Number(raw) : raw === "null" ? null : raw;
+          await admin("dock.settings", { dock, settings: { [setting]: value } });
+          return console.log(`✓ ${dock}: ${setting} = ${raw}`);
+        }
+        case "peek": {
+          const { parcels } = await admin<{ parcels: Array<{ seq: number; sender: string; to: string | null; sentAt: number; body: unknown; redacted: string[] }> }>(
+            "dock.peek",
+            { dock: needDock() },
+          );
+          if (parcels.length === 0) return console.log("Nothing in flight.");
+          for (const p of parcels) {
+            console.log(`${dim(`#${p.seq} ${relativeTime(p.sentAt, Date.now())}`)} from ${bold(p.sender)}${p.to ? ` to ${p.to}` : ""}`);
+            console.log(`  ${JSON.stringify(p.body)}${p.redacted.length ? dim(`  (redacted: ${p.redacted.join(", ")})`) : ""}`);
+          }
+          return;
+        }
+        case "shred": {
+          const name = needDock();
+          let confirm = values.yes;
+          if (!confirm) {
+            const rl = createInterface({ input: process.stdin, output: process.stdout });
+            confirm = (await rl.question(`This destroys the dock ${name} and everything in flight on it.\nType the dock name to confirm: `)).trim();
+            rl.close();
+          }
+          await admin("dock.shred", { dock: name, confirm });
+          return console.log(`✓ Shredded the dock ${name}.`);
+        }
+        default:
+          die("Usage: cardboard dock <create|approve|deny|add|remove|set|peek|shred> <dock> [app]", "See: cardboard help");
+      }
       return;
     }
 
@@ -435,8 +556,36 @@ async function main() {
   }
 }
 
+interface DocksView {
+  docks: Array<{
+    name: string;
+    inFlight: { count: number; bytes: number; unclaimed: number };
+    berths: Array<{ box: string; tag: string; send: boolean; receive: boolean; denied: boolean }>;
+  }>;
+  pending: Array<{ dock: string; box: string; send: boolean; receive: boolean }>;
+}
+
+/** "sends", "receives", "sends + receives" (or "send", "receive" for requests). */
+function arrows(b: { send: boolean; receive: boolean }, verb = false): string {
+  if (b.send && b.receive) return verb ? "send and receive" : "sends + receives";
+  if (b.send) return verb ? "send" : "sends";
+  return verb ? "receive" : "receives";
+}
+
+function readPackageJson(dir: string): { name?: string; description?: string; version?: string } | null {
+  try {
+    const pkg = JSON.parse(readFileSync(join(dir, "package.json"), "utf8")) as Record<string, unknown>;
+    const text = (v: unknown) => (typeof v === "string" && v ? v : undefined);
+    return { name: text(pkg["name"]), description: text(pkg["description"]), version: text(pkg["version"]) };
+  } catch {
+    return null;
+  }
+}
+
 interface BoxSummary {
   name: string;
+  profile: { title?: string; description?: string; version?: string };
+  docks: Array<{ dock: string; send: boolean; receive: boolean; waiting: boolean }>;
   items: number;
   bytes: number;
   summary: string;

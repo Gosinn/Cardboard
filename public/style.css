@@ -217,6 +217,17 @@ main {
   grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
 }
 
+.grid.wide {
+  grid-template-columns: repeat(auto-fill, minmax(min(340px, 100%), 1fr));
+  align-items: start;
+}
+
+textarea {
+  font-family: var(--mono);
+  font-size: 0.85rem;
+  resize: vertical;
+}
+
 .two {
   display: grid;
   gap: 18px;
