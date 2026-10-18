@@ -55,7 +55,7 @@ export function inventory(items: Item[]): Inventory {
     col.items++;
     col.bytes += item.size;
 
-    if (item.value && typeof item.value === "object" && !Array.isArray(item.value)) {
+    if (item.value && typeof item.value === "object" && !Array.isArray(item.value) && !ArrayBuffer.isView(item.value)) {
       for (const [field, v] of Object.entries(item.value)) {
         let f = col.fields.get(field);
         if (!f) col.fields.set(field, (f = { types: new Set(), count: 0, sensitive: new Set() }));
@@ -109,6 +109,7 @@ export function inventory(items: Item[]): Inventory {
 
 function typeName(v: unknown): string {
   if (v === null) return "empty";
+  if (ArrayBuffer.isView(v)) return "bytes";
   if (Array.isArray(v)) return "list";
   if (typeof v === "object") return "object";
   if (typeof v === "string" && /^\d{4}-\d{2}-\d{2}(T[\d:.]+(Z|[+-]\d{2}:?\d{2})?)?$/.test(v)) return "date";

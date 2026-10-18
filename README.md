@@ -94,16 +94,17 @@ This is a real lock, not a screen: the passkey makes a secret (WebAuthn's PRF ex
 
 ## Your personal box
 
-Not everything belongs to an app. On your shelf, *Make my personal box* gives you one box that's just for you: **notes, passwords, links and files** (photos, PDFs, up to 100 MB each), added and edited right in the dashboard, on your phone or your laptop. Every device you've signed in on opens it.
+Not everything belongs to an app. On your shelf, *Make my personal box* gives you one box that's just for you: **notes, passwords, links and files** (photos, videos, music, PDFs, anything up to 20 GB each), added and edited right in the dashboard, on your phone or your laptop. Every device you've signed in on opens it.
 
 - **Sealed before it leaves the device**, like everything else: titles, passwords, file names and file contents. Which box is your personal one is sealed in your profile, so the server can't even tell.
 - **Passwords** stay hidden until you tap *Show*, copy in one tap, and *Make a strong one* makes a 20-character password with no look-alike characters. Search finds them by name, website or username, never by the password itself.
-- **Files** are sealed in parts and checked against a SHA-256 hash (sealed too) when you open them. Images show a preview; anything else downloads, and is never opened as a page inside the dashboard. On a phone, *Send or save…* hands it to the share sheet (Save to Photos, Files…).
-- **Every change can be undone**: *Earlier versions* brings an old note or password back, and a deleted thing comes back with *Undo*.
+- **Files** are sealed in parts of just under 1 MB, a few at a time, so even a long video never has to fit in your phone's memory; *Stop* leaves nothing behind. They take their real size on the server (no base64, and no second copy in history), and a SHA-256 over the parts (sealed too) is checked when you download one.
+- **Videos and music play right in Cardboard**, starting at once and jumping anywhere: a small helper in the browser (a service worker) asks the page for just the pieces the player needs, and the page fetches and opens only those parts. The helper never holds a key, and answers only while the page that opened the file is open. Images show a preview. Nothing is ever opened as a page inside the dashboard: other files download (big ones streamed to disk), and on a phone *Send or save…* hands a file to the share sheet (Save to Photos, Files…).
+- **Every change can be undone**: *Earlier versions* brings an old note or password back, and a deleted thing comes back with *Undo*. A deleted file keeps its space for the box's history days; *Free the space now* lets it go at once.
 - **Changed on another device while you had it open?** It tells you, instead of silently overwriting.
 - No app can read it unless you give one a tape, and Cardboard warns you if one can.
 
-It's an ordinary box underneath (`notes/…`, `passwords/…`, `links/…`, `files/…`), so `cardboard export personal` backs it up and your own scripts can use it.
+It's an ordinary box underneath (`notes/…`, `passwords/…`, `links/…`, `files/…`, with file contents in `file-data/…`), so `cardboard export personal --out personal.jsonl` backs it up, a line at a time, and your own scripts can use it. Each person gets 10 GB by default (the host can change that), and the personal box has no smaller limit of its own.
 
 ## What makes it smart
 
@@ -233,8 +234,8 @@ Cardboard **protects you against:**
 - tampering with stored data (caught when it's opened)
 
 It **doesn't protect against:**
-- **the dashboard's own code.** It's served by the server. A server that turned malicious could send you a dashboard that steals your keys the next time you open it. The CLI and the SDK don't have this problem: their code is installed on your computer. If you don't fully trust the host, use the CLI, or serve `public/` yourself.
-- **metadata.** The server sees sizes, times, counts, which app talks on which dock, and which accounts share a box.
+- **the dashboard's own code.** It's served by the server. A server that turned malicious could send you a dashboard that steals your keys the next time you open it. The CLI and the SDK don't have this problem: their code is installed on your computer. If you don't fully trust the host, use the CLI, or serve `public/` yourself. (The media helper that plays videos is a service worker, which stays in the browser between visits; browsers fetch it fresh on every visit, so a server that's been put right replaces a bad one straight away.)
+- **metadata.** The server sees sizes, times, counts, which app talks on which dock, and which accounts share a box. In your personal box that includes roughly how big each file is, and when a video is being played (it sees which parts are fetched, never what's in them).
 - **someone you shared a box with keeping what they saw.** Taking them off cuts them off from then on; it can't make them forget. A share link intercepted *before* it's used works for whoever opens it first, so send links privately.
 - **a compromised device or app.** Whatever can open your data, can open your data. A leaked tape exposes its box until you revoke it (and anything it already copied).
 - **rollback.** A malicious server could hand an app an older sealed version of an item. It can't forge or move data, but it can replay.
@@ -281,7 +282,7 @@ cardboard reset-host                    new host token (on the server)
 |---|---|
 | `get(key)` / `getItem(key)` / `has(key)` | read (null when missing) |
 | `getMany(keys)` | several items in one request, in your order (missing ones left out) |
-| `put(key, value, { ttl: "30d", ifVersion })` | write; `ifVersion` prevents lost updates |
+| `put(key, value, { ttl: "30d", ifVersion })` | write; `ifVersion` prevents lost updates. A `Uint8Array` is stored as bytes (and comes back as one) |
 | `patch(key, changes)` | JSON merge patch (`null` removes a field); retries by itself if someone else wrote in between |
 | `delete(key, { purge })` | delete (undoable unless `purge`) |
 | `list(prefix)` / `keys(prefix)` / `items(prefix, { skip })` | list (and open) everything under a prefix; with a prefix or `skip(key)`, only the values you want are downloaded |
@@ -321,7 +322,7 @@ cardboard host invite --note "for Siggi"      # an invite link, one use, 7 days
 
 - **Invites by default.** `--open-signup` lets anyone in (they still can't see each other's data, but they use your disk). Each account gets 1 GB unless you set `cardboard host quota <account> 5GB`.
 - **HTTPS, always, beyond localhost.** Data is sealed either way, but tokens and the dashboard's own code aren't. Use Caddy (`reverse_proxy 127.0.0.1:8787`, then `--trust-proxy`), Tailscale, or `--tls-cert/--tls-key`.
-- **Backups:** `--backup-every 1d` (on in the Docker setup) or `cardboard host backup` writes a snapshot to `<data>/backups/` (keeps the newest 10). It holds only sealed data, so it's safe on any cloud drive. Keep `server.key` with it: it protects the server's own secrets (sign-in signing key, private IDs, dock pseudonyms). Lose it and apps see everyone as a new person; nobody loses data.
+- **Backups:** `--backup-every 1d` (on in the Docker setup) or `cardboard host backup` writes a snapshot to `<data>/backups/` (keeps the newest 10, or 3 once the database is over 1 GB, and skips a backup that wouldn't fit on the disk). It holds only sealed data, so it's safe on any cloud drive. Keep `server.key` with it: it protects the server's own secrets (sign-in signing key, private IDs, dock pseudonyms). Lose it and apps see everyone as a new person; nobody loses data.
 - **What you can see:** `cardboard host accounts` lists every account's boxes, devices, storage and last-seen time. That's all there is.
 - **Phones:** tell people to add Cardboard to their home screen (Safari: Share → Add to Home Screen). It gets an app icon, and Safari never clears its storage, which is where that phone's key lives.
 

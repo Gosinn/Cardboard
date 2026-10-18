@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-import { existsSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createReadStream, createWriteStream, existsSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { once } from "node:events";
 import { hostname } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
@@ -7,7 +8,7 @@ import { parseArgs } from "node:util";
 import { CardboardError } from "./shared/errors.ts";
 import { describeDuration, parseDuration, relativeTime } from "./shared/duration.ts";
 import { planName } from "./shared/activity.ts";
-import { formatBytes } from "./shared/size.ts";
+import { formatBytes, parseSize } from "./shared/size.ts";
 import { VERSION } from "./shared/version.ts";
 import type { Insight } from "./shared/insights.ts";
 import { qrEncode, qrTerminal } from "./shared/qr.ts";
@@ -107,7 +108,7 @@ whoever runs the server can't read what's in it.
     cardboard allow <box> <origin>          Let a website call this box from the browser
     cardboard rename <box> <new-name>
     cardboard rewind <box> <when>           Put a box back how it was ("10m", "2h", "2026-10-01")
-    cardboard export [box] [--out file]     Plain JSON of one box, or all of them (opened here)
+    cardboard export [box] [--out file]     One box, or all of them, opened here (JSON Lines: one item per line)
     cardboard import <box> <file>           Load a Cardboard export into a box
     cardboard shred <box>                   Destroy a box, its key, history and tapes. For good.
 
@@ -124,11 +125,13 @@ whoever runs the server can't read what's in it.
   Options for start:  --port 8787  --host 127.0.0.1  --data ./cardboard-data  --key-file <path>
                       --tls-cert <file> --tls-key <file>  --trust-proxy  --open-signup
                       --public-url https://cardboard.example.com   (where people and apps reach you)
-                      --backup-every 1d   (snapshots in <data>/backups, newest 10 kept)
+                      --backup-every 1d   (snapshots in <data>/backups, newest 10 kept; 3 once it's over 1 GB)
+                      --account-quota 50GB  (room each person gets; default 10 GB. One person: cardboard host quota)
                       --invites host      (only the host makes invites; default: everyone can invite friends)
                       --tunnel tailscale|cloudflare   (online from this computer; sets the address and HTTPS)
   The same as environment variables: CARDBOARD_TUNNEL, CARDBOARD_PORT, CARDBOARD_HOST, CARDBOARD_DATA, CARDBOARD_PUBLIC_URL,
-                      CARDBOARD_TRUST_PROXY=1, CARDBOARD_OPEN_SIGNUP=1, CARDBOARD_BACKUP_EVERY=1d, CARDBOARD_INVITES=host
+                      CARDBOARD_TRUST_PROXY=1, CARDBOARD_OPEN_SIGNUP=1, CARDBOARD_BACKUP_EVERY=1d, CARDBOARD_INVITES=host,
+                      CARDBOARD_ACCOUNT_QUOTA=50GB
 `;
 
 interface HostCredentials {
@@ -269,6 +272,7 @@ async function main() {
       "open-signup": { type: "boolean" },
       "public-url": { type: "string" },
       "backup-every": { type: "string" },
+      "account-quota": { type: "string" },
       invites: { type: "string" },
       tunnel: { type: "string" },
       url: { type: "string" },
@@ -339,6 +343,7 @@ async function main() {
         openSignup: values["open-signup"],
         invites: values.invites === "host" || values.invites === "everyone" ? values.invites : undefined,
         backupEveryMs: values["backup-every"] ? (values["backup-every"] === "never" ? null : parseDuration(values["backup-every"])) : undefined,
+        accountQuotaBytes: values["account-quota"] ? parseSize(values["account-quota"]) : undefined,
       }).catch(async (err: NodeJS.ErrnoException) => {
         await tunnel?.close();
         if (err.code === "EADDRINUSE") die(`Port ${values.port ?? 8787} is already in use.`, "Is Cardboard already running? Or pick another port with --port 8788.");
@@ -1034,17 +1039,16 @@ async function main() {
     }
 
     case "export": {
+      // JSON Lines, written as it's fetched: a header line per box, then one item per line.
       const acct = await account();
-      const box = args[0];
-      const data = box
-        ? await acct.exportBox(box)
-        : { format: "cardboard-export-all", formatVersion: 2, exportedAt: new Date().toISOString(), boxes: await Promise.all((await acct.boxes()).map((b) => acct.exportBox(b.name))) };
-      const json = `${JSON.stringify(data, null, 2)}\n`;
+      const names = args[0] ? [(await acct.box(args[0])).name] : (await acct.boxes()).map((b) => b.name);
+      const out = values.out ? createWriteStream(values.out, { mode: 0o600 }) : process.stdout;
+      for (const name of names) {
+        for await (const line of acct.exportLines(name)) if (!out.write(line)) await once(out, "drain");
+      }
       if (values.out) {
-        writeFileSync(values.out, json, { mode: 0o600 });
-        console.error(`✓ Wrote ${values.out}. It's opened, plain JSON, so keep it somewhere private.`);
-      } else {
-        process.stdout.write(json);
+        await new Promise((done) => (out as ReturnType<typeof createWriteStream>).end(done));
+        console.error(`✓ Wrote ${values.out}. It's opened, plain data, so keep it somewhere private.`);
       }
       return;
     }
@@ -1054,7 +1058,7 @@ async function main() {
       if (!box || !file) die("Usage: cardboard import <box> <file>");
       const acct = await account();
       if (!(await acct.boxes()).some((b) => b.name === box)) await acct.createBox(box);
-      const result = await acct.importBox(box, JSON.parse(readFileSync(file, "utf8")));
+      const result = await acct.importBox(box, await readExport(file));
       return console.log(`✓ Imported ${result.imported} items into ${box}${result.skipped ? ` (${result.skipped} had already expired)` : ""}.`);
     }
 
@@ -1237,3 +1241,30 @@ function ensureGitignored(dir: string): "added" | "present" {
 }
 
 main().catch((err) => (err instanceof CardboardError ? die(err.reason, err.hint) : die(err instanceof Error ? err.message : String(err))));
+
+/**
+ * An export file: JSON Lines (read a line at a time, so it can be bigger than
+ * memory; only its first box), or the single JSON object older versions wrote.
+ */
+async function readExport(file: string): Promise<unknown> {
+  const lines = createInterface({ input: createReadStream(file, "utf8"), crlfDelay: Infinity })[Symbol.asyncIterator]();
+  const first = await lines.next();
+  let header: unknown = null;
+  try {
+    header = first.done ? null : JSON.parse(first.value);
+  } catch {
+    // Not JSON Lines: an older export, one JSON object over many lines.
+  }
+  if (!header || typeof header !== "object" || !("format" in header) || "items" in header) {
+    await lines.return?.();
+    return JSON.parse(readFileSync(file, "utf8"));
+  }
+  return (async function* () {
+    for (let next = await lines.next(); !next.done; next = await lines.next()) {
+      if (!next.value.trim()) continue;
+      const record = JSON.parse(next.value) as Record<string, unknown>;
+      if (typeof record.format === "string") break; // the next box in a whole-Cardboard export
+      yield record;
+    }
+  })();
+}

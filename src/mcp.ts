@@ -194,7 +194,8 @@ export class LocalMcp {
       throw new RpcError(-32602, `Unknown tool ${JSON.stringify(name)}. Tools: ${TOOLS.map((t) => t.name).join(", ")}.`);
     }
     try {
-      const out = await this.run(name, args);
+      // Bytes (a file's parts) go to the assistant as their size, not as a wall of numbers.
+      const out = JSON.parse(JSON.stringify(await this.run(name, args), (_key, value: unknown) => (value instanceof Uint8Array ? { bytes: value.length } : value))) as Record<string, unknown>;
       let text = JSON.stringify(out, null, 2);
       if (text.length > MAX_TEXT) text = `${text.slice(0, MAX_TEXT)}\n… (cut short; ask for less, e.g. with a prefix or limit)`;
       return { content: [{ type: "text", text }], structuredContent: out };
@@ -260,6 +261,7 @@ export class LocalMcp {
         for (const mb of where) {
           for (const item of await mb.box.items()) {
             if (results.length >= 30) break;
+            if (item.value instanceof Uint8Array) continue;
             const json = JSON.stringify(item.value);
             const at = json.toLowerCase().indexOf(text);
             if (at >= 0 || item.key.toLowerCase().includes(text)) {

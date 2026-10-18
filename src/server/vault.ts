@@ -12,7 +12,9 @@ import { b64 } from "./wire.ts";
  */
 
 const DAY = 24 * 60 * 60 * 1000;
-export const DEFAULT_ACCOUNT_QUOTA = 1024 ** 3;
+export const DEFAULT_ACCOUNT_QUOTA = 10 * 1024 ** 3;
+/** Cardboard stops taking new data before the disk under it gets this full, so it can't fill the computer it runs on. */
+export const MIN_FREE_DISK = 1024 ** 3;
 const MAX_NAME_BYTES = 4096;
 
 export interface BoxSettings {
@@ -134,6 +136,9 @@ export class Vault {
   readonly defaultAccountQuota: number;
   private readonly listeners = new Set<(change: Change) => void>();
   private events: Change[] | null = null;
+
+  /** Bytes free on the disk the database is on (null if unknown). Asked with the box being written to. */
+  diskFree: (boxId?: string) => number | null = () => null;
 
   constructor(db: DB, now: () => number = Date.now, defaultAccountQuota = DEFAULT_ACCOUNT_QUOTA) {
     this.db = db;
@@ -299,6 +304,15 @@ export class Vault {
       );
     }
     const accountQuota = this.accountQuota(box.accountId);
+    const free = this.diskFree(box.id);
+    if (free !== null && free - size < MIN_FREE_DISK) {
+      throw fail(
+        "disk_full",
+        507,
+        "The computer Cardboard runs on is nearly out of space, so it isn't taking new data.",
+        `Free up space on that computer (Cardboard keeps ${formatBytes(MIN_FREE_DISK)} free), then try again.`,
+      );
+    }
     const accountUsed = this.accountBytes(box.accountId) - (existing?.size ?? 0);
     if (accountUsed + size > accountQuota) {
       throw fail(
@@ -320,6 +334,14 @@ export class Vault {
       .get(boxId, item.idx, boxId, item.idx) as { v: number | null };
     const version = (last.v ?? 0) + 1;
     const idx = b64(item.idx)!;
+    // The version being replaced moves its value into history now; until then it was kept once, in items.
+    this.db
+      .prepare(
+        `UPDATE history SET value = (SELECT i.value FROM items i WHERE i.box_id = history.box_id AND i.idx = history.idx)
+          WHERE box_id = ? AND idx = ? AND value IS NULL
+            AND version = (SELECT i.version FROM items i WHERE i.box_id = ? AND i.idx = ?)`,
+      )
+      .run(boxId, item.idx, boxId, item.idx);
     if (item.value) {
       this.db
         .prepare(
@@ -336,9 +358,24 @@ export class Vault {
       this.events?.push({ boxId, type: "delete", idx, name: b64(item.name), version, at: now });
     }
     this.db
-      .prepare("INSERT INTO history (box_id, idx, version, name, value, size, at, actor) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
-      .run(boxId, item.idx, version, item.name, item.value, item.value?.length ?? 0, now, actor);
+      .prepare("INSERT INTO history (box_id, idx, version, name, value, size, at, actor) VALUES (?, ?, ?, ?, NULL, ?, ?, ?)")
+      .run(boxId, item.idx, version, item.name, item.value?.length ?? 0, now, actor);
     return version;
+  }
+
+  /** History rows, newest first, with the live version's value filled in from items. */
+  private historyRows(boxId: string, idx: Buffer, limit = -1): HistoryRow[] {
+    const rows = this.db.prepare("SELECT * FROM history WHERE box_id = ? AND idx = ? ORDER BY version DESC LIMIT ?").all(boxId, idx, limit) as unknown as HistoryRow[];
+    return this.withLiveValues(boxId, rows);
+  }
+
+  private withLiveValues(boxId: string, rows: HistoryRow[]): HistoryRow[] {
+    const live = this.db.prepare("SELECT version, value FROM items WHERE box_id = ? AND idx = ?");
+    return rows.map((row) => {
+      if (row.value !== null) return row;
+      const item = live.get(boxId, row.idx) as { version: number; value: Uint8Array } | undefined;
+      return item && item.version === row.version ? { ...row, value: item.value } : row;
+    });
   }
 
   /** Removes an item and all of its history (expiry, or `purge: true`). Returns its sealed name, if it had one. */
@@ -389,10 +426,7 @@ export class Vault {
   }
 
   history(boxId: string, idx: Buffer, limit = 50): VersionInfo[] {
-    const rows = this.db
-      .prepare("SELECT * FROM history WHERE box_id = ? AND idx = ? ORDER BY version DESC LIMIT ?")
-      .all(boxId, idx, clampLimit(limit)) as unknown as HistoryRow[];
-    return rows.map(toVersion);
+    return this.historyRows(boxId, idx, clampLimit(limit)).map(toVersion);
   }
 
   /**
@@ -402,7 +436,7 @@ export class Vault {
   undo(boxId: string, idx: Buffer, options: { to?: number }, actor: string): { version: number; restored: number; deleted: boolean; name: Buffer } {
     return this.tx(() => {
       const box = this.requireBox(boxId);
-      const rows = this.db.prepare("SELECT * FROM history WHERE box_id = ? AND idx = ? ORDER BY version DESC").all(boxId, idx) as unknown as HistoryRow[];
+      const rows = this.historyRows(boxId, idx);
       if (rows.length === 0) throw fail("nothing_to_undo", 404, "There's no history for that item.");
       const target = options.to === undefined ? rows[1] : rows.find((r) => r.version === options.to);
       if (options.to !== undefined && !target) {
@@ -439,7 +473,7 @@ export class Vault {
       );
     }
     return this.tx(() => {
-      const rows = this.db.prepare("SELECT * FROM history WHERE box_id = ? ORDER BY idx, version").all(boxId) as unknown as HistoryRow[];
+      const rows = this.withLiveValues(boxId, this.db.prepare("SELECT * FROM history WHERE box_id = ? ORDER BY idx, version").all(boxId) as unknown as HistoryRow[]);
       const byIdx = new Map<string, HistoryRow[]>();
       for (const row of rows) {
         const key = b64(row.idx)!;

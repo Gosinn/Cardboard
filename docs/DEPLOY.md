@@ -123,7 +123,8 @@ Websites (like LORE) use Sign in with Cardboard: see [APPS.md](APPS.md).
 
 ## Backups
 
-- Every day, Cardboard writes a snapshot to `/data/backups` and keeps the newest 10. Make one any time: `cardboard host backup`.
+- Every day, Cardboard writes a snapshot to `/data/backups` and keeps the newest 10 (3 once the database is over 1 GB, say with videos in it). Make one any time: `cardboard host backup`.
+- **Space:** each person gets 10 GB unless you say otherwise (`--account-quota 50GB` for everyone, or `cardboard host quota <account-id> 50GB` for one person; `cardboard host accounts` lists the ids). Whatever the limits, Cardboard stops taking new data when less than 1 GB is left on the disk, so it can't fill the computer it runs on.
 - **Copy them somewhere else now and then** (a backup on the same disk doesn't survive the disk). With Docker: `docker compose cp cardboard:/data/backups ./cardboard-backups`. Backups hold only sealed data, so any cloud drive is fine.
 - **Keep one copy of `/data/server.key`** somewhere safe. It doesn't open anyone's data, but without it every app sees everyone as a new person after a restore.
 
@@ -170,6 +171,7 @@ CARDBOARD_DATA=/var/lib/cardboard/data node /opt/cardboard/src/cli.ts start \
 | `--backup-every 1d` | `CARDBOARD_BACKUP_EVERY` | Scheduled backups |
 | `--open-signup` | `CARDBOARD_OPEN_SIGNUP=1` | Anyone can make an account (default: invite only) |
 | `--invites host` | `CARDBOARD_INVITES=host` | Only the host makes invites (default: everyone can invite friends, 5 waiting each) |
+| `--account-quota 50GB` | `CARDBOARD_ACCOUNT_QUOTA` | Room each person gets (default 10 GB) |
 
 ## What to know before you rely on it
 

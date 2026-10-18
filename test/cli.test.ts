@@ -70,6 +70,21 @@ describe("cardboard CLI", () => {
     assert.equal(out.trim(), "from .env");
   });
 
+  it("exports a box a line at a time (bytes too) and imports it back, or an older export", async () => {
+    const script = `import { open } from ${JSON.stringify(SDK)}; const box = open(); await box.put("photo", new Uint8Array([1, 2, 3, 250])); await box.put("note", { text: "hi" });`;
+    await run(process.execPath, ["--input-type=module", "-e", script], { cwd: join(home, "my-notes"), env });
+    const out = join(home, "notes.jsonl");
+    await cli(["export", "my-notes", "--out", out]);
+    const lines = readFileSync(out, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    assert.equal(lines[0].format, "cardboard-export");
+    assert.deepEqual(lines.find((l) => l.key === "photo"), { ...lines.find((l) => l.key === "photo"), bytes: Buffer.from([1, 2, 3, 250]).toString("base64url") });
+    const { stdout } = await cli(["import", "notes-copy", out]);
+    assert.match(stdout, /Imported 3 items into notes-copy/);
+    const old = join(home, "old.json");
+    writeFileSync(old, JSON.stringify({ format: "cardboard-export", formatVersion: 2, items: [{ key: "a", value: 1 }] }, null, 2));
+    assert.match((await cli(["import", "notes-old", old])).stdout, /Imported 1 items into notes-old/);
+  });
+
   it("answers the everyday questions", async () => {
     const boxes = await cli(["boxes"]);
     assert.match(boxes.stdout, /my-notes/);

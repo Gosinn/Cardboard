@@ -584,6 +584,17 @@ textarea.plain {
   border-radius: 8px;
 }
 
+.file-preview .player {
+  display: block;
+  width: 100%;
+  max-height: 60vh;
+  border-radius: 8px;
+}
+
+.file-preview video.player {
+  background: #000;
+}
+
 @media (hover: none) {
   .drop-hint {
     display: none;

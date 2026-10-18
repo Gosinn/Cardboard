@@ -9,6 +9,8 @@ import { dockIndex, dockKeys, newClientId, readBundle } from "../client/keys.ts"
 import { Box } from "../sdk/index.ts";
 import type { Api, ApiRequest, ApiResponse } from "./api.ts";
 import { isLoopback } from "./insights.ts";
+import { MIN_FREE_DISK } from "./vault.ts";
+import { formatBytes } from "../shared/size.ts";
 import { OAuthError, type Client } from "./oauth.ts";
 
 export interface ShakeResult {
@@ -168,6 +170,25 @@ export async function runShake(api: Api): Promise<ShakeReport> {
     await check("read-only", "Read-only tapes can't write", async () => {
       const ro = await me.createTape(boxA.name, { write: false });
       return (await rejects(() => sdk(ro.secret).put("public/x", 1), "read_only")) ? pass("Writes with a read-only tape are refused.") : failed("A read-only tape wrote.");
+    });
+
+    await check("disk-guard", "Cardboard can't fill the disk", async () => {
+      // Pretend the disk is nearly full, for the test box only, and try to write.
+      const { vault } = api.ctx;
+      const real = vault.diskFree;
+      vault.diskFree = (boxId) => (boxId === boxA.id ? MIN_FREE_DISK / 2 : real(boxId));
+      let refused: boolean;
+      try {
+        refused = await rejects(() => sdk(a.secret).put("public/disk", 1), "disk_full");
+      } finally {
+        vault.diskFree = real;
+      }
+      if (!refused) return failed("A write went through with the disk nearly full.");
+      const free = real();
+      const left = free === null ? "" : ` This computer has ${formatBytes(free)} free.`;
+      return free !== null && free < 5 * 1024 ** 3
+        ? warn(`New data is refused when less than ${formatBytes(MIN_FREE_DISK)} is free, and it's getting close.${left}`)
+        : pass(`New data is refused when less than ${formatBytes(MIN_FREE_DISK)} of disk is free, so it can't fill this computer.${left}`);
     });
 
     await check("revoked", "Revoked tapes stop working", async () => {

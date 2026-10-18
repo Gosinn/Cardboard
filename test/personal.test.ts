@@ -1,9 +1,31 @@
 import assert from "node:assert/strict";
-import { randomBytes } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
+import { readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
-import { addFile, cleanValue, FILE_PART_BYTES, filePartKey, kindOfKey, listThings, readFile, removeThing, restoreThing, safeUrl, saveFileDetails, saveThing, strongPassword, type FileValue, type Thing } from "../src/client/personal.ts";
+import {
+  addFile,
+  cleanValue,
+  FILE_PART_BYTES,
+  filePartKey,
+  keysOf,
+  kindOfKey,
+  listThings,
+  purgeKeys,
+  readFile,
+  readRange,
+  removeThing,
+  restoreThing,
+  safeUrl,
+  saveFileDetails,
+  saveThing,
+  strayParts,
+  strongPassword,
+  type FileValue,
+  type Thing,
+} from "../src/client/personal.ts";
+import { toB64u } from "../src/client/crypto.ts";
+import { openDb } from "../src/server/db.ts";
 import { CardboardError, type Box } from "../src/sdk/index.ts";
 import { startTestServer, type TestServer } from "./helpers.ts";
 
@@ -73,14 +95,17 @@ describe("your personal box", () => {
     assert.equal(kindOfKey("file-data/abc/0"), null);
   });
 
-  it("keeps files of any size in sealed parts, never downloaded just to list them", async () => {
+  it("keeps files of any size in sealed parts, at their real size, never downloaded just to list them", async () => {
     const bytes = new Uint8Array(randomBytes(FILE_PART_BYTES * 2 + 1234));
+    const before = (await t.me.box("personal")).bytes;
     let progress = 0;
-    const file = await addFile(box, { name: "passport.jpg", type: "image/jpeg", bytes }, { onProgress: (f) => (progress = f) });
+    const file = await addFile(box, new File([bytes], "passport.jpg", { type: "image/jpeg" }), { onProgress: (f) => (progress = f) });
     assert.equal(progress, 1);
-    assert.equal(file.value.parts, 3);
+    assert.deepEqual([file.value.parts, file.value.partSize, file.value.hashOf, file.value.type], [3, FILE_PART_BYTES, "parts", "image/jpeg"]);
     assert.equal(file.value.title, "passport.jpg");
     assert.match(file.value.sha256, /^[0-9a-f]{64}$/);
+    const grew = (await t.me.box("personal")).bytes - before;
+    assert.ok(grew < bytes.length + 4096, `stored at its real size (${grew} bytes for ${bytes.length}), not a third more as text`);
 
     const seen = spy(box);
     const { things } = await listThings(box);
@@ -95,17 +120,63 @@ describe("your personal box", () => {
     assert.equal((renamed.value as FileValue).size, bytes.length);
   });
 
+  it("reads any stretch of a file, fetching only the parts it's in", async () => {
+    const bytes = new Uint8Array(randomBytes(FILE_PART_BYTES * 3 + 77));
+    const file = await addFile(box, new File([bytes], "clip.webm", { type: "video/webm" }));
+    const seen = spy(box);
+    const cases: Array<[number, number]> = [[0, 1], [FILE_PART_BYTES - 5, FILE_PART_BYTES + 5], [10, FILE_PART_BYTES * 2 + 3], [bytes.length - 1, bytes.length - 1], [0, bytes.length - 1]];
+    for (const [start, end] of cases) assert.deepEqual(await readRange(box, file, start, end), bytes.subarray(start, end + 1), `${start}-${end}`);
+    const parts = seen.filter((s) => s.op === "get.many").map((s) => (s.body.idxs as string[]).length);
+    assert.deepEqual(parts, [1, 2, 3, 1, 4]);
+    await rejectsWith(readRange(box, file, 5, bytes.length), "bad_range");
+    await rejectsWith(readRange(box, file, 9, 3), "bad_range");
+  });
+
+  it("can be stopped part way, leaving nothing behind", async () => {
+    const stop = new AbortController();
+    const bytes = new Uint8Array(FILE_PART_BYTES * 20);
+    const sending = addFile(box, new File([bytes], "big.mov"), { signal: stop.signal, onProgress: (f) => f > 0.3 && stop.abort() });
+    await assert.rejects(sending, (err: Error) => err.name === "AbortError");
+    const { things } = await listThings(box);
+    assert.ok(!things.some((x) => x.value.title === "big.mov"));
+    assert.deepEqual(await strayParts(box, things), [], "the parts it sent were removed straight away");
+  });
+
+  it("cleans up after an upload that never finished", async () => {
+    await box.batch([0, 1].map((n) => ({ op: "put" as const, key: filePartKey("abandoned", n), value: new Uint8Array([n]) })));
+    const { things } = await listThings(box);
+    assert.deepEqual(await strayParts(box, things), [], "too recent: it may still be going on another device");
+    const stray = await strayParts(box, things, Date.now() + 7 * 60 * 60 * 1000);
+    assert.deepEqual(stray.sort(), [filePartKey("abandoned", 0), filePartKey("abandoned", 1)]);
+    await purgeKeys(box, stray);
+    assert.equal(await box.get(filePartKey("abandoned", 0)), null);
+  });
+
+  it("still reads files saved before 0.6 (base64 parts, whole-file hash)", async () => {
+    const bytes = new Uint8Array(randomBytes(512 * 1024 + 99));
+    const id = "oldfile";
+    await box.batch([0, 1].map((n) => ({ op: "put" as const, key: filePartKey(id, n), value: toB64u(bytes.subarray(n * 512 * 1024, (n + 1) * 512 * 1024)) })));
+    const sha256 = createHash("sha256").update(bytes).digest("hex");
+    await box.put(`files/${id}`, { title: "old.jpg", name: "old.jpg", type: "image/jpeg", size: bytes.length, parts: 2, sha256, notes: "" });
+    const old = (await listThings(box)).things.find((x) => x.id === id) as Thing<FileValue>;
+    assert.deepEqual(await readFile(box, old), bytes);
+    assert.deepEqual(await readRange(box, old, 512 * 1024 - 2, 512 * 1024 + 2), bytes.subarray(512 * 1024 - 2, 512 * 1024 + 3));
+    await purgeKeys(box, keysOf(old));
+  });
+
   it("notices a damaged file instead of handing it back", async () => {
-    const file = await addFile(box, { name: "a.bin", type: "", bytes: new Uint8Array([1, 2, 3, 4]) });
-    await box.put(filePartKey(file.id, 0), Buffer.from([1, 2, 3, 5]).toString("base64url"));
+    const file = await addFile(box, new File([new Uint8Array([1, 2, 3, 4])], "a.bin"));
+    await box.put(filePartKey(file.id, 0), new Uint8Array([1, 2, 3, 5]));
     await rejectsWith(readFile(box, file), "file_damaged");
+    await box.put(filePartKey(file.id, 0), new Uint8Array([1, 2, 3]));
+    await rejectsWith(readRange(box, file, 0, 1), "file_damaged");
     await box.delete(filePartKey(file.id, 0));
     await rejectsWith(readFile(box, file), "file_incomplete");
   });
 
-  it("deletes things with their files, and brings them back", async () => {
+  it("deletes things with their files, brings them back, or frees the space for good", async () => {
     const bytes = new Uint8Array(randomBytes(FILE_PART_BYTES + 10));
-    const file = await addFile(box, { name: "will.pdf", type: "application/pdf", bytes });
+    const file = await addFile(box, new File([bytes], "will.pdf", { type: "application/pdf" }));
     await removeThing(box, file);
     assert.ok(!(await listThings(box)).things.some((x) => x.id === file.id));
     assert.equal(await box.get(filePartKey(file.id, 1)), null, "its parts went too");
@@ -113,6 +184,11 @@ describe("your personal box", () => {
     const back = (await listThings(box)).things.find((x) => x.id === file.id) as Thing<FileValue>;
     assert.ok(back);
     assert.deepEqual(await readFile(box, back), bytes);
+
+    await removeThing(box, back);
+    await purgeKeys(box, keysOf(back));
+    assert.deepEqual(await box.history(filePartKey(file.id, 1)), [], "no copy kept in history");
+    await rejectsWith(restoreThing(box, back), "nothing_to_undo");
   });
 
   it("is searched for what you'd read, never for a password", async () => {
@@ -137,7 +213,7 @@ describe("your personal box", () => {
   it("stays sealed past the server", async () => {
     const canary = `canary-${Date.now()}`;
     await saveThing(box, "password", { title: canary, username: canary, password: canary, notes: canary });
-    await addFile(box, { name: `${canary}.txt`, type: "text/plain", bytes: new TextEncoder().encode(canary.repeat(100)) });
+    await addFile(box, new File([canary.repeat(100)], `${canary}.txt`, { type: "text/plain" }));
     t.cb.api.ctx.db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
     assert.ok(!readFileSync(join(t.cb.paths.dataDir, "cardboard.db")).includes(Buffer.from(canary)));
   });
@@ -184,5 +260,110 @@ describe("strong passwords", () => {
     }
     assert.equal(seen.size, 200);
     assert.equal(strongPassword(4).length, 12, "never shorter than 12");
+  });
+});
+
+describe("keeping each value once", () => {
+  it("stores bytes as bytes, keeps the live version once, and still undoes", async () => {
+    const t = await startTestServer({ shake: false });
+    try {
+      const { box } = await t.newBox("bytes");
+      const one = new Uint8Array(randomBytes(300_000));
+      const two = new Uint8Array(randomBytes(300_000));
+      await box.put("blob", one);
+      assert.deepEqual(await box.get("blob"), one, "a Uint8Array comes back as one");
+      await box.put("blob", two);
+      await box.put("json", { a: 1 });
+      const db = t.cb.api.ctx.db;
+      const stored = (sql: string) => (db.prepare(sql).get() as { n: number }).n;
+      assert.ok(stored("SELECT COALESCE(SUM(LENGTH(value)), 0) AS n FROM items") < 600_000 + 1000);
+      assert.ok(stored("SELECT COALESCE(SUM(LENGTH(value)), 0) AS n FROM history") < 300_000 + 100, "history holds the old version only, not a second copy of the live one");
+      const versions = await box.history("blob");
+      assert.deepEqual(versions.map((v) => v.value), [two, one]);
+      await box.undo("blob");
+      assert.deepEqual(await box.get("blob"), one);
+      await box.delete("blob");
+      await box.undo("blob");
+      assert.deepEqual(await box.get("blob"), one, "a deleted value comes back too");
+      assert.equal(stored("SELECT COUNT(*) AS n FROM history h JOIN items i ON i.box_id = h.box_id AND i.idx = h.idx AND i.version = h.version WHERE h.value IS NOT NULL"), 0);
+
+      const exported = await t.me.exportBox("bytes");
+      await t.me.createBox("bytes-copy");
+      await t.me.importBox("bytes-copy", exported);
+      assert.deepEqual(await (await t.me.open("bytes-copy")).get("blob"), one, "exports carry bytes");
+    } finally {
+      await t.stop();
+    }
+  });
+
+  it("moves an older database over without losing a version", async () => {
+    const t = await startTestServer({ shake: false });
+    const file = join(t.cb.paths.dataDir, "cardboard.db");
+    try {
+      const { box } = await t.newBox("old");
+      await box.put("k", { v: 1 });
+      await box.put("k", { v: 2 });
+    } finally {
+      await t.cb.close();
+    }
+    // As 0.5 left it: the live version stored twice.
+    let db = openDb(file);
+    db.exec("UPDATE history SET value = (SELECT i.value FROM items i WHERE i.box_id = history.box_id AND i.idx = history.idx AND i.version = history.version) WHERE value IS NULL AND EXISTS (SELECT 1 FROM items i WHERE i.box_id = history.box_id AND i.idx = history.idx AND i.version = history.version)");
+    const version = (db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version;
+    db.exec(`PRAGMA user_version = ${version - 1}`);
+    db.close();
+    db = openDb(file);
+    try {
+      const rows = db.prepare("SELECT version, value IS NULL AS empty FROM history ORDER BY version").all() as Array<{ version: number; empty: number }>;
+      assert.deepEqual(rows.slice(-2).map((r) => [r.version, r.empty]), [[1, 0], [2, 1]]);
+    } finally {
+      db.close();
+      rmSync(t.dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("room for files", () => {
+  it("gives each person 10 GB and a personal box with no small limit of its own", async () => {
+    const t = await startTestServer({ shake: false });
+    try {
+      assert.equal((await t.me.me()).quota.limit, 10 * 1024 ** 3);
+      const box = await t.me.makePersonalBox();
+      assert.equal(box.settings.quotaBytes, 1024 ** 4);
+    } finally {
+      await t.stop();
+    }
+  });
+
+  it("never fills the disk: writes and backups stop with 1 GB left, and the host is told", async () => {
+    let free = 50 * 1024 ** 3;
+    const t = await startTestServer({ shake: false, diskFree: () => free });
+    try {
+      const { box } = await t.newBox("photos");
+      await box.put("a", new Uint8Array(1000));
+      free = 1024 ** 3 + 500;
+      await rejectsWith(box.put("b", new Uint8Array(1000)), "disk_full");
+      assert.throws(() => t.cb.api.backup(), (err: CardboardError) => err.code === "disk_full");
+      assert.equal(t.cb.api.backupIfDue(1000), false, "a scheduled backup waits for room instead");
+      const insights = t.cb.api.computeHostInsights();
+      assert.ok(insights.some((i) => i.level === "danger" && /GB of disk left/.test(i.title)), JSON.stringify(insights));
+      free = 50 * 1024 ** 3;
+      await box.put("b", new Uint8Array(1000));
+      assert.equal(t.cb.api.backup().kept, 10);
+    } finally {
+      await t.stop();
+    }
+  });
+
+  it("shake-tests the disk guard without touching anyone else's writes", async () => {
+    const t = await startTestServer({ diskFree: () => 50 * 1024 ** 3 });
+    try {
+      const check = t.cb.shake!.results.find((r) => r.id === "disk-guard");
+      assert.equal(check?.status, "pass", JSON.stringify(check));
+      const { box } = await t.newBox("after-shake");
+      await box.put("x", 1);
+    } finally {
+      await t.stop();
+    }
   });
 });

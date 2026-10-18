@@ -17,7 +17,7 @@ import { CardboardError, fail } from "../shared/errors.ts";
 import type { Duration } from "../shared/duration.ts";
 import { ctx } from "../shared/contexts.ts";
 import { inspect, type CustomsPolicy } from "../shared/customs.ts";
-import { isPlainObject, mergePatch, sortableId, validateKey, type Item } from "../shared/data.ts";
+import { decodeValue, encodeValue, isPlainObject, mergePatch, sortableId, validateKey, type Item } from "../shared/data.ts";
 import { notice, scan, SECRET_KINDS, type Finding } from "../shared/detect.ts";
 import { matches, sortItems, type Where } from "../shared/query.ts";
 import { fromB64u, open as openSealed, openJson, openText, seal, sealJson, toB64u } from "../client/crypto.ts";
@@ -300,19 +300,25 @@ export class Box {
     const idx = await itemIndex(o.keys, key);
     const [name, sealedValue] = await Promise.all([
       seal(o.keys.seal, key, ctx.itemName(o.boxId, idx)),
-      seal(o.keys.seal, JSON.stringify(value), ctx.itemValue(o.boxId, idx)),
+      seal(o.keys.seal, encodeValue(value), ctx.itemValue(o.boxId, idx)),
     ]);
     return { idx, name: toB64u(name), value: toB64u(sealedValue) };
   }
 
   private async openItem<T>(o: Opened, wire: WireItem): Promise<Item<T>> {
     const key = await openText(o.keys.seal, fromB64u(wire.name), ctx.itemName(o.boxId, wire.idx));
-    const value = wire.value !== undefined ? (JSON.parse(await openText(o.keys.seal, fromB64u(wire.value), ctx.itemValue(o.boxId, wire.idx))) as T) : (undefined as T);
+    const value = wire.value !== undefined ? ((await this.openValue(o, wire.idx, wire.value)) as T) : (undefined as T);
     return { key, value, version: wire.version, size: wire.size, createdAt: wire.createdAt, updatedAt: wire.updatedAt, expiresAt: wire.expiresAt };
+  }
+
+  /** A sealed value, opened: JSON, or a Uint8Array if it was stored as bytes. */
+  private async openValue(o: Opened, idx: string, sealed: string): Promise<unknown> {
+    return decodeValue(await openSealed(o.keys.seal, fromB64u(sealed), ctx.itemValue(o.boxId, idx)));
   }
 
   /** Looks for secrets before anything is sealed, and refuses them if the box says so. */
   private check(o: Opened, key: string, value: unknown): { findings: Finding[]; notices: string[] } {
+    if (value instanceof Uint8Array) return { findings: [], notices: [] };
     const findings = scan(value);
     if (o.settings?.secrets === "block") {
       const secret = findings.find((f) => SECRET_KINDS.has(f.kind));
@@ -476,7 +482,7 @@ export class Box {
         version: v.version,
         at: v.at,
         deleted: v.deleted,
-        ...(v.value ? { value: JSON.parse(await openText(o.keys.seal, fromB64u(v.value), ctx.itemValue(o.boxId, idx))) as T } : {}),
+        ...(v.value ? { value: (await this.openValue(o, idx, v.value)) as T } : {}),
         size: v.size,
         actor: v.actor,
       })),
@@ -569,7 +575,7 @@ export class Box {
           const key = await openText(o.keys.seal, fromB64u(raw.name), ctx.itemName(o.boxId, raw.idx));
           if (!key.startsWith(prefix)) return;
           const change: Change<T> = { type: raw.type, key, version: raw.version, at: raw.at };
-          if (raw.value) change.value = JSON.parse(await openText(o.keys.seal, fromB64u(raw.value), ctx.itemValue(o.boxId, raw.idx))) as T;
+          if (raw.value) change.value = (await this.openValue(o, raw.idx, raw.value)) as T;
           if (raw.reason) change.reason = raw.reason;
           onChange(change);
         }).catch((err) => (options?.onError ? options.onError(err as Error) : console.warn(`[cardboard] watch: ${(err as Error).message}`)));

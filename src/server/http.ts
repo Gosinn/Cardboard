@@ -1,4 +1,5 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, statfsSync } from "node:fs";
+import { parseSize } from "../shared/size.ts";
 import { createServer as createHttpServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { createServer as createHttpsServer } from "node:https";
 import { stripTypeScriptTypes } from "node:module";
@@ -38,7 +39,10 @@ export interface StartOptions {
   /** Who may make invite links: "everyone" with an account (default, up to 5 waiting each) or only the "host". */
   invites?: "everyone" | "host";
   /** Storage per account unless the host sets it per person (default 1 GB). */
+  /** Space each person gets unless the host says otherwise (default 10 GB). */
   accountQuotaBytes?: number;
+  /** For tests: how much disk is free. */
+  diskFree?: () => number | null;
   /** Run the shake test on startup (default true). */
   shake?: boolean;
   /** Back up the database this often (ms) into <data>/backups, keeping the newest 10. Off unless set. */
@@ -78,13 +82,18 @@ const STATIC: Record<string, string> = {
   "/icon-192.png": "image/png",
   "/icon-512.png": "image/png",
   "/apple-touch-icon.png": "image/png",
+  "/media-sw.js": "text/javascript; charset=utf-8",
 };
 const CSP = [
   "default-src 'none'",
   "script-src 'self'",
   "style-src 'self'",
-  // blob: for previews of images in your personal box, opened on the device.
+  // blob: for files in your personal box opened on the device; 'self' media is streamed by media-sw.js.
   "img-src 'self' data: blob:",
+  "media-src 'self' blob:",
+  "worker-src 'self'",
+  // Downloads streamed by media-sw.js go through a hidden frame.
+  "frame-src 'self'",
   "connect-src 'self'",
   "manifest-src 'self'",
   "base-uri 'none'",
@@ -102,7 +111,18 @@ export async function startServer(options: StartOptions = {}): Promise<RunningCa
   db.prepare("DELETE FROM oauth_clients WHERE registered_by = 'shake'").run();
 
   const accounts = new Accounts(db, now);
-  const vault = new Vault(db, now, options.accountQuotaBytes ?? DEFAULT_ACCOUNT_QUOTA);
+  const accountQuota = options.accountQuotaBytes ?? (process.env["CARDBOARD_ACCOUNT_QUOTA"] ? parseSize(process.env["CARDBOARD_ACCOUNT_QUOTA"]) : DEFAULT_ACCOUNT_QUOTA);
+  const vault = new Vault(db, now, accountQuota);
+  vault.diskFree =
+    options.diskFree ??
+    (() => {
+      try {
+        const fs = statfsSync(paths.dataDir);
+        return fs.bavail * fs.bsize;
+      } catch {
+        return null;
+      }
+    });
   const tapes = new Tapes(db, now);
   const audit = new Audit(db, now);
   const hub = new Hub();
@@ -163,6 +183,8 @@ export async function startServer(options: StartOptions = {}): Promise<RunningCa
         "content-type": file.type,
         "cache-control": "no-cache",
         ...(file.type.startsWith("text/html") ? { "content-security-policy": CSP } : {}),
+        // The media helper needs no network of its own: it only answers with what the page hands it.
+        ...(path === "/media-sw.js" ? { "content-security-policy": "default-src 'none'" } : {}),
       });
       res.end(req.method === "HEAD" ? undefined : file.body);
       return;

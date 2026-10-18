@@ -26,6 +26,8 @@ export interface ServerInfo {
 export interface HostInsightInput {
   now: number;
   info: ServerInfo;
+  /** Bytes free on the disk Cardboard keeps its data on (null if unknown). */
+  diskFree?: number | null;
   accounts: number;
   anonymousDenied24h: number;
   lastBackupAt: number | null;
@@ -65,6 +67,15 @@ export function hostInsights(input: HostInsightInput): Insight[] {
       title: `${input.anonymousDenied24h} attempts with bad tokens in the last day`,
       detail: "Something is knocking with tokens Cardboard doesn't recognise. Cardboard slows each address down after 30 tries.",
       fix: "cardboard host log",
+    });
+  }
+
+  if (typeof input.diskFree === "number" && input.diskFree < 5 * 1024 ** 3) {
+    const gb = (input.diskFree / 1024 ** 3).toFixed(1);
+    out.push({
+      level: input.diskFree < 2 * 1024 ** 3 ? "danger" : "warn",
+      title: `This computer has ${gb} GB of disk left`,
+      detail: "Cardboard stops taking new data when less than 1 GB is free, so it can't fill the disk. Free up space, or move Cardboard's data folder to a bigger disk.",
     });
   }
 

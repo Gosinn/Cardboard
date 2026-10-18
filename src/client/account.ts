@@ -33,7 +33,7 @@ import {
 } from "./crypto.ts";
 import type { DeviceLock, DeviceRecord, DeviceStore } from "./device.ts";
 import { accountKeys, boxIndex, boxKeys, bundle, dockIndex, dockKeys, newClientId, newKey, type AccountKeys, type BoxKeys } from "./keys.ts";
-import { isFileData, kindOfKey, searchText } from "./personal.ts";
+import { isFileData, kindOfKey, PERSONAL_SETTINGS, searchText } from "./personal.ts";
 import { Rpc } from "./rpc.ts";
 
 /**
@@ -670,7 +670,7 @@ export class Account {
     const me = await this.me();
     const existing = await this.personalBox(me);
     if (existing) return existing;
-    const box = await this.createBox(await this.freeName("personal"));
+    const box = await this.createBox(await this.freeName("personal"), PERSONAL_SETTINGS);
     await this.writeProfile({ ...me.profile, personal: box.id });
     return box;
   }
@@ -943,37 +943,78 @@ export class Account {
     return this.rpc.call("rewind", { box: box.id, to });
   }
 
-  async exportBox(name: string) {
-    const box = await this.box(name);
-    const items = await (await this.open(box)).items();
-    return {
-      format: "cardboard-export",
-      formatVersion: 2,
-      box: box.name,
-      exportedAt: new Date().toISOString(),
-      items: items.map(({ key, value, version, createdAt, updatedAt, expiresAt }) => ({ key, value, version, createdAt, updatedAt, expiresAt })),
-    };
+  /**
+   * A box, ready to export: a header, then every item, fetched a few MB at a
+   * time so a box full of videos never has to fit in memory. Bytes (a file's
+   * parts) come as base64 in `bytes`; everything else as JSON in `value`.
+   */
+  async *exportRecords(name: string): AsyncGenerator<Record<string, unknown>> {
+    const info = await this.box(name);
+    const box = await this.open(info);
+    yield { format: "cardboard-export", formatVersion: 3, box: info.name, exportedAt: new Date().toISOString() };
+    const entries = await box.list("", { limit: Infinity });
+    for (let i = 0; i < entries.length; ) {
+      let end = i + 1;
+      for (let bytes = entries[i]!.size; end < entries.length && end - i < 500 && bytes + entries[end]!.size <= 8 * 1024 * 1024; end++) bytes += entries[end]!.size;
+      for (const { key, value, version, createdAt, updatedAt, expiresAt } of await box.getMany(entries.slice(i, end).map((e) => e.key))) {
+        yield value instanceof Uint8Array ? { key, bytes: toB64u(value), version, createdAt, updatedAt, expiresAt } : { key, value, version, createdAt, updatedAt, expiresAt };
+      }
+      i = end;
+    }
   }
 
+  /** The export as JSON Lines (one record per line), for writing straight to a file. */
+  async *exportLines(name: string): AsyncGenerator<string> {
+    for await (const record of this.exportRecords(name)) yield `${JSON.stringify(record)}\n`;
+  }
+
+  /** The whole export as one object, in memory: fine for boxes without big files. */
+  async exportBox(name: string) {
+    const records: Array<Record<string, unknown>> = [];
+    for await (const record of this.exportRecords(name)) records.push(record);
+    const [header, ...items] = records;
+    return { ...header!, items };
+  }
+
+  /**
+   * Imports an export: the object exportBox gives, a list of { key, value }
+   * (or { key, bytes }), or records one at a time (JSON Lines, read as you go).
+   */
   async importBox(name: string, data: unknown): Promise<{ imported: number; skipped: number }> {
     const list = (data && typeof data === "object" && "items" in data ? (data as { items: unknown }).items : data) as unknown;
-    if (!Array.isArray(list)) throw fail("bad_import", 400, "Import expects a list of { key, value } items, like a Cardboard export.");
+    const records = list as AsyncIterable<unknown> | Iterable<unknown>;
+    if (!Array.isArray(list) && !(list && typeof list === "object" && (Symbol.asyncIterator in list || Symbol.iterator in list))) {
+      throw fail("bad_import", 400, "Import expects a list of { key, value } items, like a Cardboard export.");
+    }
+    const box = await this.open(name);
     const now = Date.now();
-    const ops: Array<{ op: "put"; key: string; value: unknown; ttl?: number }> = [];
+    let ops: Array<{ op: "put"; key: string; value: unknown; ttl?: number }> = [];
+    let bytes = 0;
+    let imported = 0;
     let skipped = 0;
-    for (const raw of list) {
-      const item = raw as { key?: unknown; value?: unknown; expiresAt?: unknown };
-      if (!item || typeof item.key !== "string" || item.value === undefined) throw fail("bad_import", 400, "Every imported item needs a string `key` and a `value`.");
+    const flush = async () => {
+      if (ops.length) await box.batch(ops);
+      imported += ops.length;
+      ops = [];
+      bytes = 0;
+    };
+    for await (const raw of records) {
+      const item = raw as { key?: unknown; value?: unknown; bytes?: unknown; expiresAt?: unknown; format?: unknown };
+      if (item && typeof item.format === "string" && item.key === undefined) continue; // a header line
+      if (item && typeof item.bytes === "string") item.value = fromB64u(item.bytes);
+      if (!item || typeof item.key !== "string" || item.value === undefined) throw fail("bad_import", 400, "Every imported item needs a string `key` and a `value` (or `bytes`).");
       const expiresAt = typeof item.expiresAt === "number" ? item.expiresAt : null;
       if (expiresAt !== null && expiresAt <= now) {
         skipped++;
         continue;
       }
+      const size = item.value instanceof Uint8Array ? item.value.length : JSON.stringify(item.value).length;
+      if (ops.length >= 200 || (ops.length > 0 && bytes + size > 8 * 1024 * 1024)) await flush();
       ops.push({ op: "put", key: item.key, value: item.value, ...(expiresAt ? { ttl: Math.ceil((expiresAt - now) / 1000) } : {}) });
+      bytes += size;
     }
-    const box = await this.open(name);
-    for (let i = 0; i < ops.length; i += 200) await box.batch(ops.slice(i, i + 200));
-    return { imported: ops.length, skipped };
+    await flush();
+    return { imported, skipped };
   }
 
   // ── Tapes ────────────────────────────────────────────────────────────────
@@ -1177,6 +1218,7 @@ export class Account {
       for (const item of await (await this.open(box)).items("", { skip: isFileData })) {
         if (results.length >= 50) return results;
         // In your personal box, search what you'd read (titles, notes, usernames), never a password.
+        if (item.value instanceof Uint8Array) continue;
         const thing = box.id === personal && kindOfKey(item.key) !== null;
         const text = thing ? searchText(item.value) : JSON.stringify(item.value);
         const at = text.toLowerCase().indexOf(q);

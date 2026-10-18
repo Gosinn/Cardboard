@@ -2,13 +2,15 @@ import type { Box } from "../sdk/index.ts";
 import { isPlainObject, sortableId, type Item } from "../shared/data.ts";
 import { fail } from "../shared/errors.ts";
 import { formatBytes } from "../shared/size.ts";
-import { fromB64u, sha256, toB64u } from "./crypto.ts";
+import { fromB64u, sha256 } from "./crypto.ts";
 
 /**
  * Your personal box, as the dashboard keeps it: notes, passwords, links and
  * files. Each kind is a collection ("notes/<id>"), so the CLI and your own
- * scripts can read them too. A file's bytes sit apart, in parts
- * ("file-data/<id>/<n>"), so listing the box never downloads them.
+ * scripts can read them too. A file's bytes sit apart, in parts of just under
+ * 1 MB ("file-data/<id>/<n>"), so listing the box never downloads them, any
+ * size of file can be sent or read a piece at a time, and a video can play
+ * from the middle without fetching the start.
  */
 
 export type ThingKind = "note" | "password" | "link" | "file";
@@ -35,8 +37,15 @@ export interface FileValue {
   type: string;
   size: number;
   parts: number;
-  /** SHA-256 of the bytes, checked when the file is read back. */
+  /** Bytes per part (the last can be shorter). Files saved before 0.6 have none: 512 KiB parts, kept as base64 text. */
+  partSize?: number;
+  /**
+   * Checked when the whole file is read. With hashOf "parts", it's the SHA-256
+   * of the parts' own SHA-256s, so it can be worked out a part at a time.
+   * Before 0.6, it was the SHA-256 of the whole file.
+   */
   sha256: string;
+  hashOf?: "parts";
   notes: string;
 }
 
@@ -65,12 +74,17 @@ const FIELDS: Record<ThingKind, string[]> = {
 };
 
 export const FILE_DATA = "file-data/";
-/** Raw bytes per part: about 700 KB once sealed, under the 1 MB an item may hold. */
-export const FILE_PART_BYTES = 512 * 1024;
-export const MAX_FILE_BYTES = 100 * 1024 * 1024;
-/** Parts sent per request while uploading (about 5.5 MB). */
+/** Bytes per part, stored as they are: just under the 1 MB an item may hold once sealed. */
+export const FILE_PART_BYTES = 960 * 1024;
+const LEGACY_PART_BYTES = 512 * 1024;
+export const MAX_FILE_BYTES = 20 * 1024 ** 3;
+/** Parts per request while sending or reading a whole file (about 7.5 MB). */
 const PARTS_PER_REQUEST = 8;
 const MAX_TEXT = 200_000;
+/** Your personal box has no small limit of its own: only your account's limit applies. */
+export const PERSONAL_SETTINGS = { quotaBytes: 1024 ** 4 };
+/** The limit every box got before 0.6, raised for a personal box made back then. */
+export const OLD_BOX_QUOTA = 512 * 1024 * 1024;
 
 export function thingKey(kind: ThingKind, id: string): string {
   return `${KINDS[kind].collection}/${id}`;
@@ -143,6 +157,8 @@ function toThing(item: Item): Thing | null {
     const raw = item.value as Record<string, unknown>;
     if (typeof raw.size !== "number" || typeof raw.parts !== "number") return null;
     Object.assign(value, { name: text(raw.name, 500), type: text(raw.type, 200), size: raw.size, parts: raw.parts, sha256: text(raw.sha256, 64) });
+    if (typeof raw.partSize === "number") value.partSize = raw.partSize;
+    if (raw.hashOf === "parts") value.hashOf = "parts";
   }
   if (!value.title) value.title = `Untitled ${KINDS[kind].one}`;
   return { kind, id: item.key.slice(item.key.indexOf("/") + 1), key: item.key, value: value as unknown as Thing["value"], version: item.version, createdAt: item.createdAt, updatedAt: item.updatedAt };
@@ -179,57 +195,63 @@ export async function saveFileDetails(box: Box, file: Thing<FileValue>, input: {
   return toThing((await box.getItem(file.key))!)!;
 }
 
-/** Moves it out (with its file parts). Kept in history, so `restoreThing` brings it back. */
+/** Moves it out (with its file parts). Kept in history, so `restoreThing` brings it back, and `purgeKeys(box, keysOf(thing))` frees the space now. */
 export async function removeThing(box: Box, thing: Thing): Promise<void> {
-  const parts = thing.kind === "file" ? Array.from({ length: (thing.value as FileValue).parts }, (_, i) => filePartKey(thing.id, i)) : [];
   // The thing first, so a half-done delete never leaves a file without its bytes.
   await box.delete(thing.key);
+  const parts = keysOf(thing).slice(1);
   for (let i = 0; i < parts.length; i += 200) await box.batch(parts.slice(i, i + 200).map((key) => ({ op: "delete" as const, key })));
 }
 
 export async function restoreThing(box: Box, thing: Thing): Promise<void> {
-  if (thing.kind === "file") for (let i = 0; i < (thing.value as FileValue).parts; i++) await box.undo(filePartKey(thing.id, i));
+  for (const key of keysOf(thing).slice(1)) await box.undo(key);
   await box.undo(thing.key);
 }
 
-async function sha256Hex(bytes: Uint8Array): Promise<string> {
-  return [...(await sha256(bytes))].map((b) => b.toString(16).padStart(2, "0")).join("");
-}
+const hex = (bytes: Uint8Array) => [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
 
 /**
- * Seals a file into the box: its bytes in parts first, then the entry that
- * lists it, so a file never shows up half uploaded. If it fails part way, the
- * parts already sent are removed.
+ * Seals a file into the box a part at a time (so it never has to fit in
+ * memory), then writes the entry that lists it, so a file never shows up half
+ * sent. If it fails or is stopped part way, the parts already sent are removed.
  */
 export async function addFile(
   box: Box,
-  file: { name: string; type: string; bytes: Uint8Array },
-  options: { title?: string; notes?: string; onProgress?: (fraction: number) => void } = {},
+  file: Blob,
+  options: { name?: string; type?: string; title?: string; notes?: string; signal?: AbortSignal; onProgress?: (fraction: number, bytes: number) => void } = {},
 ): Promise<Thing<FileValue>> {
-  const { bytes } = file;
-  if (bytes.length > MAX_FILE_BYTES) {
-    throw fail("file_too_big", 413, `${file.name} is ${Math.round(bytes.length / 1024 / 1024)} MB; a file can be at most ${MAX_FILE_BYTES / 1024 / 1024} MB.`, "Split it, or keep a smaller copy.");
+  const name = (options.name ?? (file as File).name ?? "file").slice(0, 500) || "file";
+  const size = file.size;
+  if (size > MAX_FILE_BYTES) {
+    throw fail("file_too_big", 413, `${name} is ${formatBytes(size)}; a file can be at most ${formatBytes(MAX_FILE_BYTES)}.`, "Split it, or keep a smaller copy.");
   }
   const id = sortableId(Date.now());
-  const parts = Math.max(1, Math.ceil(bytes.length / FILE_PART_BYTES));
+  const parts = Math.max(1, Math.ceil(size / FILE_PART_BYTES));
+  const hashes = new Uint8Array(parts * 32);
   const sent: string[] = [];
   try {
     for (let first = 0; first < parts; first += PARTS_PER_REQUEST) {
+      options.signal?.throwIfAborted();
       const ops = [];
       for (let n = first; n < Math.min(parts, first + PARTS_PER_REQUEST); n++) {
-        ops.push({ op: "put" as const, key: filePartKey(id, n), value: toB64u(bytes.subarray(n * FILE_PART_BYTES, (n + 1) * FILE_PART_BYTES)) });
+        const bytes = new Uint8Array(await file.slice(n * FILE_PART_BYTES, (n + 1) * FILE_PART_BYTES).arrayBuffer());
+        hashes.set(await sha256(bytes), n * 32);
+        ops.push({ op: "put" as const, key: filePartKey(id, n), value: bytes });
       }
       await box.batch(ops);
       sent.push(...ops.map((o) => o.key));
-      options.onProgress?.(sent.length / parts);
+      options.onProgress?.(sent.length / parts, Math.min(size, sent.length * FILE_PART_BYTES));
     }
+    options.signal?.throwIfAborted();
     const value: FileValue = {
-      title: text(options.title, 500).trim() || file.name.slice(0, 500),
-      name: file.name.slice(0, 500),
-      type: file.type.slice(0, 200),
-      size: bytes.length,
+      title: text(options.title, 500).trim() || name,
+      name,
+      type: (options.type ?? file.type ?? "").slice(0, 200),
+      size,
       parts,
-      sha256: await sha256Hex(bytes),
+      partSize: FILE_PART_BYTES,
+      sha256: hex(await sha256(hashes)),
+      hashOf: "parts",
       notes: text(options.notes),
     };
     const key = thingKey("file", id);
@@ -241,25 +263,113 @@ export async function addFile(
   }
 }
 
-/** A file's bytes, put back together and checked against the hash it was saved with. */
-export async function readFile(box: Box, file: Thing<FileValue>, onProgress?: (fraction: number) => void): Promise<Uint8Array> {
-  const { size, parts, sha256 } = file.value;
-  const out = new Uint8Array(size);
+function layout(file: FileValue) {
+  const partSize = file.partSize ?? LEGACY_PART_BYTES;
+  if (!(partSize > 0) || file.parts !== Math.max(1, Math.ceil(file.size / partSize))) throw damaged(file);
+  return { partSize, length: (n: number) => (n < file.parts - 1 ? partSize : file.size - (file.parts - 1) * partSize) };
+}
+
+const damaged = (file: FileValue) => fail("file_damaged", 422, `${file.name} doesn't match what was saved.`, "Upload it again.");
+
+/** Parts first..last of a file, opened and checked for their length. */
+async function readParts(box: Box, file: Thing<FileValue>, first: number, last: number): Promise<Uint8Array[]> {
+  const { length } = layout(file.value);
+  const keys = Array.from({ length: last - first + 1 }, (_, i) => filePartKey(file.id, first + i));
+  const found = new Map((await box.getMany(keys)).map((item) => [item.key, item.value]));
+  return keys.map((key, i) => {
+    const raw = found.get(key);
+    if (raw === undefined) throw fail("file_incomplete", 404, `Part of ${file.value.name} is missing.`, "Undo its last change, or upload it again.");
+    const bytes = raw instanceof Uint8Array ? raw : typeof raw === "string" ? fromB64u(raw) : null;
+    if (!bytes || bytes.length !== length(first + i)) throw damaged(file.value);
+    return bytes;
+  });
+}
+
+/** Bytes start..end (inclusive) of a file, fetching only the parts they're in: what playing from the middle of a video needs. */
+export async function readRange(box: Box, file: Thing<FileValue>, start: number, end: number): Promise<Uint8Array> {
+  const { size } = file.value;
+  if (!(start >= 0 && end >= start && end < size)) throw fail("bad_range", 416, `Bytes ${start}–${end} aren't in ${file.value.name} (${size} bytes).`);
+  const { partSize } = layout(file.value);
+  const first = Math.floor(start / partSize);
+  const last = Math.floor(end / partSize);
+  const out = new Uint8Array(end - start + 1);
   let at = 0;
-  for (let first = 0; first < parts; first += PARTS_PER_REQUEST) {
-    const keys = Array.from({ length: Math.min(PARTS_PER_REQUEST, parts - first) }, (_, i) => filePartKey(file.id, first + i));
-    const items = await box.getMany<string>(keys);
-    if (items.length !== keys.length) throw fail("file_incomplete", 404, `Part of ${file.value.name} is missing.`, "Undo its last change, or upload it again.");
-    for (const item of items) {
-      const chunk = fromB64u(item.value);
-      if (at + chunk.length > size) throw fail("file_damaged", 422, `${file.value.name} doesn't match what was saved.`, "Upload it again.");
-      out.set(chunk, at);
-      at += chunk.length;
-    }
-    onProgress?.(Math.min(1, (first + keys.length) / parts));
-  }
-  if (at !== size || (sha256 && (await sha256Hex(out)) !== sha256)) throw fail("file_damaged", 422, `${file.value.name} doesn't match what was saved.`, "Upload it again.");
+  const parts = await readParts(box, file, first, last);
+  parts.forEach((part, i) => {
+    const offset = (first + i) * partSize;
+    const piece = part.subarray(Math.max(0, start - offset), Math.min(part.length, end - offset + 1));
+    out.set(piece, at);
+    at += piece.length;
+  });
   return out;
+}
+
+/**
+ * A whole file, a part at a time, checked against its hash at the end (the
+ * last step throws if it doesn't match). Only a few parts are in memory at once.
+ */
+export async function* fileChunks(box: Box, file: Thing<FileValue>, onProgress?: (fraction: number) => void): AsyncGenerator<Uint8Array> {
+  const { parts, sha256: expected, hashOf } = file.value;
+  layout(file.value);
+  const hashes = new Uint8Array(parts * 32);
+  // Files from before 0.6 (100 MB at most) were hashed whole.
+  const whole: Uint8Array[] = [];
+  for (let first = 0; first < parts; first += PARTS_PER_REQUEST) {
+    const chunk = await readParts(box, file, first, Math.min(parts, first + PARTS_PER_REQUEST) - 1);
+    for (const [i, part] of chunk.entries()) {
+      if (hashOf === "parts") hashes.set(await sha256(part), (first + i) * 32);
+      else whole.push(part);
+      yield part;
+    }
+    onProgress?.(Math.min(1, (first + chunk.length) / parts));
+  }
+  const actual = hashOf === "parts" ? await sha256(hashes) : await sha256(concat(whole));
+  if (expected && hex(actual) !== expected) throw damaged(file.value);
+}
+
+function concat(chunks: Uint8Array[]): Uint8Array {
+  const out = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0));
+  let at = 0;
+  for (const c of chunks) {
+    out.set(c, at);
+    at += c.length;
+  }
+  return out;
+}
+
+/** A whole file in memory, checked against its hash: for previews, and for handing to the phone's share sheet. */
+export async function readFile(box: Box, file: Thing<FileValue>, onProgress?: (fraction: number) => void): Promise<Uint8Array> {
+  const chunks: Uint8Array[] = [];
+  for await (const chunk of fileChunks(box, file, onProgress)) chunks.push(chunk);
+  return concat(chunks);
+}
+
+/**
+ * Parts left behind by an upload that never finished (the page was closed
+ * part way): parts with no file listing them, untouched for 6 hours, so an
+ * upload still running on another device is left alone.
+ */
+export async function strayParts(box: Box, things: Thing[], now = Date.now()): Promise<string[]> {
+  const files = new Set(things.filter((t) => t.kind === "file").map((t) => t.id));
+  const byId = new Map<string, { keys: string[]; newest: number }>();
+  for (const entry of await box.list(FILE_DATA, { limit: Infinity })) {
+    const id = entry.key.slice(FILE_DATA.length).split("/")[0]!;
+    if (files.has(id)) continue;
+    const group = byId.get(id) ?? { keys: [], newest: 0 };
+    group.keys.push(entry.key);
+    group.newest = Math.max(group.newest, entry.updatedAt);
+    byId.set(id, group);
+  }
+  return [...byId.values()].filter((g) => g.newest < now - 6 * 60 * 60 * 1000).flatMap((g) => g.keys);
+}
+
+/** Removes things for good (no undo), with their file parts: frees the space now rather than when their history runs out. */
+export async function purgeKeys(box: Box, keys: string[]): Promise<void> {
+  for (let i = 0; i < keys.length; i += 200) await box.batch(keys.slice(i, i + 200).map((key) => ({ op: "delete" as const, key, purge: true })));
+}
+
+export function keysOf(thing: Thing): string[] {
+  return [thing.key, ...(thing.kind === "file" ? Array.from({ length: (thing.value as FileValue).parts }, (_, i) => filePartKey(thing.id, i)) : [])];
 }
 
 /** What search may look at: never a password, never a file's bytes. */

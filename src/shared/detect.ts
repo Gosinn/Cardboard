@@ -79,6 +79,7 @@ export function scan(value: unknown): Finding[] {
 
   const visit = (node: unknown, path: string, field: string | null, depth: number) => {
     if (depth > MAX_DEPTH || strings > MAX_STRINGS || findings.length >= MAX_FINDINGS) return;
+    if (ArrayBuffer.isView(node)) return; // bytes (a file), not data to read
     if (typeof node === "string") {
       strings++;
       scanString(node.length > MAX_STRING ? node.slice(0, MAX_STRING) : node, path || "(value)", field, add);

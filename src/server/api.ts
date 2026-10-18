@@ -16,7 +16,8 @@ import { noShare, type Member, type Sharing } from "./sharing.ts";
 import type { Emergency, EmergencyLink } from "./emergency.ts";
 import { describeDuration } from "../shared/duration.ts";
 import { tapeView, type Tape, type Tapes } from "./tapes.ts";
-import type { Box, Sealed, StoredItem, Vault } from "./vault.ts";
+import { formatBytes } from "../shared/size.ts";
+import { MIN_FREE_DISK, type Box, type Sealed, type StoredItem, type Vault } from "./vault.ts";
 import {
   asBody,
   b64,
@@ -117,6 +118,7 @@ type HostOp = (body: Body, req: ApiRequest) => unknown;
 type ItemOp = (scope: ItemScope, body: Body, req: ApiRequest) => unknown;
 
 const DAY = 24 * 60 * 60 * 1000;
+const HOUR = 60 * 60 * 1000;
 const MAX_BATCH = 500;
 /** Items one get.many can ask for. */
 const MAX_GET_MANY = 1000;
@@ -1552,6 +1554,7 @@ export class Api {
     return hostInsights({
       now,
       info,
+      diskFree: this.ctx.vault.diskFree(),
       accounts: accounts.list().length,
       anonymousDenied24h: anonymous.n,
       lastBackupAt: lastBackup ? Number(lastBackup) : null,
@@ -1565,13 +1568,20 @@ export class Api {
   }
 
   /**
-   * A snapshot of the database in <data>/backups, keeping the newest 10. Only
-   * sealed data is inside, so a copy can live anywhere; restoring also needs
-   * the server key file (for sign-in keys and apps' private IDs, not data).
+   * A snapshot of the database in <data>/backups, keeping the newest 10 (3
+   * once the database is over 1 GB, so videos don't fill the disk ten times
+   * over). Only sealed data is inside, so a copy can live anywhere; restoring
+   * also needs the server key file (for sign-in keys and apps' private IDs).
    */
   backup(): { file: string; bytes: number; kept: number } {
-    const { db, info } = this.ctx;
+    const { db, info, vault } = this.ctx;
     const dir = join(info.dataDir, "backups");
+    const size = statSync(info.dbFile).size;
+    const free = vault.diskFree();
+    if (free !== null && free - size < MIN_FREE_DISK) {
+      throw fail("disk_full", 507, `There isn't room for a backup on this computer: it needs about ${formatBytes(size)}, and ${formatBytes(free)} is free.`, "Free up space, or move old backups somewhere else.");
+    }
+    const keep = size > 1024 ** 3 ? 3 : KEEP_BACKUPS;
     mkdirSync(dir, { recursive: true, mode: 0o700 });
     const stamp = new Date(this.now()).toISOString().replace(/[:.]/g, "-");
     const file = join(dir, `cardboard-${stamp}.db`);
@@ -1580,16 +1590,24 @@ export class Api {
     const old = readdirSync(dir)
       .filter((f) => /^cardboard-.*\.db$/.test(f))
       .sort()
-      .slice(0, -KEEP_BACKUPS);
+      .slice(0, -keep);
     for (const f of old) rmSync(join(dir, f));
-    return { file, bytes: statSync(file).size, kept: KEEP_BACKUPS };
+    return { file, bytes: statSync(file).size, kept: keep };
   }
 
   /** Makes a backup if the last one is older than `everyMs` (checked by a timer; survives restarts). */
   backupIfDue(everyMs: number): boolean {
     const last = Number(getMeta(this.ctx.db, "last_backup_at") ?? 0);
-    if (this.now() - last < everyMs) return false;
-    this.backup();
+    const tried = Number(getMeta(this.ctx.db, "backup_tried_at") ?? 0);
+    if (this.now() - last < everyMs || this.now() - tried < HOUR) return false;
+    setMeta(this.ctx.db, "backup_tried_at", String(this.now()));
+    try {
+      this.backup();
+    } catch (err) {
+      // No room: try again in an hour, and say so in the host's log.
+      this.ctx.audit.record({ accountId: null, actor: "system", action: "backup", outcome: "error", note: (err as Error).message });
+      return false;
+    }
     this.ctx.audit.record({ accountId: null, actor: "system", action: "backup", note: "scheduled" });
     return true;
   }

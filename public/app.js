@@ -7,7 +7,28 @@ import { qrEncode, qrPath } from "/lib/shared/qr.ts";
 import { describeDuration } from "/lib/shared/duration.ts";
 import { toName } from "/lib/shared/names.ts";
 import { createPasskey, hasBuiltInPasskeys, passkeyBlocker, passkeySecret } from "/lib/client/passkey.ts";
-import { addFile, KINDS, listThings, MAX_FILE_BYTES, readFile, removeThing, restoreThing, safeUrl, saveFileDetails, saveThing, searchText, strongPassword, subtitle } from "/lib/client/personal.ts";
+import {
+  addFile,
+  fileChunks,
+  KINDS,
+  keysOf,
+  listThings,
+  MAX_FILE_BYTES,
+  OLD_BOX_QUOTA,
+  PERSONAL_SETTINGS,
+  purgeKeys,
+  readFile,
+  readRange,
+  removeThing,
+  restoreThing,
+  safeUrl,
+  saveFileDetails,
+  saveThing,
+  searchText,
+  strayParts,
+  strongPassword,
+  subtitle,
+} from "/lib/client/personal.ts";
 import { Rpc } from "/lib/client/rpc.ts";
 import { browserName, browserStore, makeKey } from "/device.js";
 
@@ -165,6 +186,8 @@ function closeModal(notify = true) {
   if (modal.hidden) return;
   modal.hidden = true;
   delete modal.dataset.keep;
+  for (const el of modal.querySelectorAll("video, audio")) el.pause();
+  forgetMedia("play");
   modal.replaceChildren();
   const hook = onModalClose;
   onModalClose = null;
@@ -261,6 +284,7 @@ async function signOutHere() {
     await browserStore.clear();
   }
   account = null;
+  forgetMedia();
   location.hash = "#/";
   render();
 }
@@ -277,11 +301,123 @@ for (const event of ["pointerdown", "keydown", "wheel", "touchstart"]) addEventL
 function lockNow() {
   if (!account?.lock) return;
   account = null;
+  forgetMedia();
   delete modal.dataset.sticky;
   closeModal(false);
   render();
 }
 lockButton.addEventListener("click", lockNow);
+
+// ── Playing and downloading big files (with media-sw.js) ─────────────────────
+//
+// A video plays a piece at a time: the player asks for /media/<token>/…, the
+// media helper (a service worker) asks this page for those bytes, and this
+// page fetches the sealed parts and opens them. Keys never leave this page,
+// and a token works only while this page holds it.
+
+/** token → { info: { name, type, size? }, range?(start, end), chunks(), kind: "play" | "download", streams, used } */
+const media = new Map();
+let mediaHelper = null;
+/** Safari, and every browser on iPhone and iPad: they play through the helper, but downloads go the old way. */
+const WEBKIT = /AppleWebKit/.test(navigator.userAgent) && !/Chrome|Chromium|Edg\//.test(navigator.userAgent);
+
+/** Starts the media helper once; resolves true when it's answering for this page. */
+function startMediaHelper() {
+  if (!("serviceWorker" in navigator) || !isSecureContext) return Promise.resolve(false);
+  mediaHelper ??= navigator.serviceWorker
+    .register("/media-sw.js")
+    .then(async () => {
+      if (!navigator.serviceWorker.controller) {
+        await new Promise((resolve) => {
+          navigator.serviceWorker.addEventListener("controllerchange", resolve, { once: true });
+          setTimeout(resolve, 5000);
+        });
+      }
+      return Boolean(navigator.serviceWorker.controller);
+    })
+    .catch(() => false);
+  return mediaHelper;
+}
+
+function offerMedia(entry) {
+  const token = crypto.randomUUID();
+  media.set(token, { ...entry, streams: new Map(), used: Date.now() });
+  return `/media/${token}/${encodeURIComponent(entry.info.name)}`;
+}
+
+/** Stops answering for players (closing the file), or for everything (locking, signing out). */
+function forgetMedia(kind) {
+  for (const [token, entry] of media) {
+    if (kind && entry.kind !== kind) continue;
+    for (const stream of entry.streams.values()) stream.return?.();
+    media.delete(token);
+  }
+}
+setInterval(() => {
+  for (const [token, entry] of media) if (entry.kind === "download" && Date.now() - entry.used > 30 * 60_000) media.delete(token);
+}, 60_000);
+
+navigator.serviceWorker?.addEventListener("message", async (e) => {
+  const port = e.ports[0];
+  if (!port || e.data?.cardboard !== "media") return;
+  const { type, token, stream } = e.data;
+  const entry = media.get(token);
+  if (!entry) return port.postMessage({ error: "This file isn't open on this page." });
+  entry.used = Date.now();
+  try {
+    if (type === "info") return port.postMessage(entry.info);
+    if (type === "read") {
+      if (!entry.range) throw new Error("This can't be read in pieces.");
+      const bytes = await entry.range(e.data.start, e.data.end);
+      return port.postMessage({ bytes: bytes.buffer }, [bytes.buffer]);
+    }
+    if (type === "open") {
+      const id = crypto.randomUUID();
+      entry.streams.set(id, entry.chunks()[Symbol.asyncIterator]());
+      return port.postMessage({ stream: id });
+    }
+    const it = entry.streams.get(stream);
+    if (type === "close" || !it) {
+      it?.return?.();
+      entry.streams.delete(stream);
+      return port.postMessage({ done: true });
+    }
+    const next = await it.next();
+    if (next.done) {
+      entry.streams.delete(stream);
+      if (entry.kind === "download") media.delete(token);
+      return port.postMessage({ done: true });
+    }
+    const copy = next.value.slice();
+    port.postMessage({ bytes: copy.buffer }, [copy.buffer]);
+  } catch (err) {
+    port.postMessage({ error: err.reason || err.message });
+  }
+});
+
+/** Saves a download a piece at a time through the media helper (nothing big in memory). Returns false if it can't here. */
+async function streamDownload(entry) {
+  if (WEBKIT || !(await startMediaHelper())) return false;
+  // A hidden frame, not <a download>: Chrome sends <a download> straight to the server, past the helper.
+  // If anything goes wrong, the error lands in the frame, never in place of this page.
+  const frame = h("iframe", { hidden: true, src: `${offerMedia({ ...entry, kind: "download" })}?download` });
+  document.body.append(frame);
+  setTimeout(() => frame.remove(), 60 * 60_000);
+  return true;
+}
+
+/** Saves bytes held in memory (small files, or browsers without the helper). */
+function blobDownload(parts, name) {
+  const url = URL.createObjectURL(new Blob(parts, { type: "application/octet-stream" }));
+  const a = h("a", { href: url, download: name });
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
+}
+
+/** Most a phone can hold in memory to hand a file over (share sheet, or a download without the helper). */
+const IN_MEMORY_MAX = 300 * 1024 * 1024;
 
 function lockIfIdle() {
   const idle = account?.lock?.idleMs;
@@ -836,10 +972,42 @@ async function renderBox(name, openKey) {
 
 // ── Your personal box ───────────────────────────────────────────────────────
 
+/**
+ * A player for a video or song in your personal box. It streams through the
+ * media helper (any size, starts at once, jumps anywhere); without it, files
+ * up to 200 MB are opened whole first.
+ */
+async function play(where, entry, fetchBytes) {
+  const video = entry.info.type.startsWith("video/");
+  const player = h(video ? "video" : "audio", { controls: true, preload: "metadata", playsinline: true, class: "player" });
+  // Watching counts as using Cardboard, so the idle lock waits until it's over.
+  player.addEventListener("timeupdate", () => (lastActive = Date.now()));
+  const fallback = async () => {
+    if (entry.info.size > 200 * 1024 * 1024) {
+      return fill(where, h("p", { class: "muted small" }, "This browser can't play it from here. Download it, then play it."));
+    }
+    fill(where, h("p", { class: "muted small" }, "Opening…"));
+    try {
+      player.src = URL.createObjectURL(new Blob([await fetchBytes()], { type: entry.info.type }));
+      player.onerror = () => fill(where, h("p", { class: "muted small" }, "This browser can't play this kind of file. Download it, then play it."));
+      fill(where, player);
+    } catch (err) {
+      fill(where, errorBox(err));
+    }
+  };
+  if (!(await startMediaHelper())) return fallback();
+  player.addEventListener("error", fallback, { once: true });
+  player.src = offerMedia({ ...entry, kind: "play" });
+  fill(where, player);
+}
+
 const ICON = { note: "📝", password: "🔑", link: "🔗", file: "📎" };
+const iconOf = (t) => (t.kind !== "file" ? ICON[t.kind] : /^video\//.test(t.value.type) ? "🎬" : /^audio\//.test(t.value.type) ? "🎵" : /^image\//.test(t.value.type) ? "🖼️" : ICON.file);
 const NEW_LABEL = { note: "Note", password: "Password", link: "Link", file: "File" };
 
 async function renderPersonal(info, me, openKey) {
+  // Personal boxes made before 0.6 had the 512 MB every box got: only the account's limit applies now.
+  if (info.settings.quotaBytes === OLD_BOX_QUOTA) info = await account.setBoxSettings(info.name, PERSONAL_SETTINGS);
   const box = await account.open(info);
   let things = [];
   let other = 0;
@@ -850,9 +1018,21 @@ async function renderPersonal(info, me, openKey) {
   const notice = h("div", { class: "stack" });
   const files = h("input", { type: "file", multiple: true, hidden: true });
 
+  const usage = h("div", { class: "muted small" }, `Your Cardboard is using ${bytes(me.quota.used)} of ${bytes(me.quota.limit)}.`);
+  let tidied = false;
   async function load() {
     ({ things, other } = await listThings(box));
     draw();
+    account
+      .me()
+      .then(({ quota }) => (usage.textContent = `Your Cardboard is using ${bytes(quota.used)} of ${bytes(quota.limit)}.`))
+      .catch(() => {});
+    if (tidied) return;
+    tidied = true;
+    // Parts left by an upload that was cut off (the page closed part way): nothing lists them, so they go.
+    strayParts(box, things)
+      .then((stray) => stray.length && purgeKeys(box, stray))
+      .catch(() => {});
   }
 
   function draw() {
@@ -883,7 +1063,7 @@ async function renderPersonal(info, me, openKey) {
       h(
         "button",
         { type: "button", class: "thing-open", onclick: () => editThing(t.kind, t) },
-        h("span", { class: "thing-icon", "aria-hidden": "true" }, ICON[t.kind]),
+        h("span", { class: "thing-icon", "aria-hidden": "true" }, iconOf(t)),
         h("span", { class: "thing-text" }, h("strong", {}, t.value.title), h("span", { class: "muted small" }, subtitle(t) || " ")),
         h("span", { class: "muted small thing-when" }, ago(t.updatedAt)),
       ),
@@ -910,29 +1090,57 @@ async function renderPersonal(info, me, openKey) {
         await load();
       }),
     );
-    say(h("span", {}, `Deleted “${t.value.title}”.`), undo);
+    const purge = h("button", { type: "button", class: "secondary tiny" }, "Free the space now");
+    purge.addEventListener("click", () =>
+      withBusy(purge, async () => {
+        if (!confirm(`Delete “${t.value.title}” for good? It can't be undone after this.`)) return;
+        await purgeKeys(box, keysOf(t));
+        say(h("span", {}, `“${t.value.title}” is gone for good.`));
+      }),
+    );
+    say(h("span", {}, t.kind === "file" ? `Deleted “${t.value.title}”. Its ${bytes(t.value.size)} stay in history for ${info.settings.historyDays} days, in case you change your mind.` : `Deleted “${t.value.title}”.`), h("span", { class: "row" }, undo, t.kind === "file" ? purge : null));
     await load();
   }
 
   async function upload(chosen) {
-    for (const file of chosen) {
-      if (file.size > MAX_FILE_BYTES) {
-        say(h("span", {}, `${file.name} is ${bytes(file.size)}: a file can be at most ${bytes(MAX_FILE_BYTES)}.`));
-        continue;
+    const fresh = await account.box(info.name);
+    const { quota } = await account.me();
+    let room = Math.min(fresh.settings.quotaBytes - fresh.bytes, quota.limit - quota.used);
+    const stop = new AbortController();
+    const stopButton = h("button", { type: "button", class: "secondary tiny", onclick: () => stop.abort() }, "Stop");
+    // Closing the page part way would lose the upload, and a phone that goes to sleep pauses it.
+    const warn = (e) => e.preventDefault();
+    addEventListener("beforeunload", warn);
+    const awake = await navigator.wakeLock?.request("screen").catch(() => null);
+    try {
+      for (const file of chosen) {
+        if (file.size > MAX_FILE_BYTES) {
+          say(h("span", {}, `${file.name} is ${bytes(file.size)}: a file can be at most ${bytes(MAX_FILE_BYTES)}.`));
+          continue;
+        }
+        if (file.size + 1024 * 1024 > room) {
+          say(h("span", {}, `There isn't room for ${file.name} (${bytes(file.size)}): ${bytes(Math.max(0, room))} left. Delete things you don't need (and free their space), or ask whoever runs your Cardboard for more room.`));
+          continue;
+        }
+        const progress = h("span", {}, `Sealing ${file.name}…`);
+        say(progress, stopButton);
+        try {
+          await addFile(box, file, {
+            signal: stop.signal,
+            onProgress: (f, done) => (progress.textContent = `Sealing ${file.name}… ${Math.round(f * 100)}% (${bytes(done)} of ${bytes(file.size)})`),
+          });
+          room -= file.size;
+          say(h("span", {}, `Added ${file.name}. Sealed here before it left this device.`));
+        } catch (err) {
+          say(err.name === "AbortError" ? h("span", {}, `Stopped. Nothing of ${file.name} was kept.`) : errorBox(err));
+          break;
+        }
       }
-      const progress = h("span", {}, `Sealing ${file.name}…`);
-      say(progress);
-      try {
-        await addFile(box, { name: file.name, type: file.type, bytes: new Uint8Array(await file.arrayBuffer()) }, {
-          onProgress: (f) => (progress.textContent = `Sealing ${file.name}… ${Math.round(f * 100)}%`),
-        });
-        say(h("span", {}, `Added ${file.name}. Sealed here before it left this device.`));
-      } catch (err) {
-        say(errorBox(err));
-        return load();
-      }
+    } finally {
+      removeEventListener("beforeunload", warn);
+      awake?.release().catch(() => {});
+      await load();
     }
-    await load();
   }
 
   /** The editor for a note, password or link (new without `thing`), and the viewer for a file. */
@@ -994,16 +1202,18 @@ async function renderPersonal(info, me, openKey) {
       const progress = h("span", { class: "muted small" });
       let loaded = null;
       const fetchBytes = async () => (loaded ??= await readFile(box, thing, (f) => (progress.textContent = f < 1 ? `Opening… ${Math.round(f * 100)}%` : "")));
+      const tooBig = () => new Error(`${bytes(v.size)} is too big for this browser to hold at once. Download it on a computer (Chrome, Edge or Firefox), or play it here.`);
+      const fileEntry = { info: { name: v.name || "file", type: v.type, size: v.size }, range: (start, end) => readRange(box, thing, start, end), chunks: () => fileChunks(box, thing) };
       save.addEventListener("click", () =>
         withBusy(save, async () => {
           try {
-            // As a plain download, never opened as a page here: a file can't run anything in the dashboard.
-            const url = URL.createObjectURL(new Blob([await fetchBytes()], { type: "application/octet-stream" }));
-            const a = h("a", { href: url, download: v.name || "file" });
-            document.body.append(a);
-            a.click();
-            a.remove();
-            setTimeout(() => URL.revokeObjectURL(url), 60_000);
+            // Always as a download, never opened as a page here: a file can't run anything in the dashboard.
+            if (await streamDownload(fileEntry)) {
+              progress.textContent = "Downloading. Keep this page open until it's done.";
+              return;
+            }
+            if (v.size > IN_MEMORY_MAX) throw tooBig();
+            blobDownload([await fetchBytes()], v.name || "file");
           } catch (err) {
             status.replaceChildren(errorBox(err));
           }
@@ -1012,6 +1222,7 @@ async function renderPersonal(info, me, openKey) {
       send?.addEventListener("click", () =>
         withBusy(send, async () => {
           try {
+            if (v.size > IN_MEMORY_MAX) throw tooBig();
             const file = new File([await fetchBytes()], v.name || "file", { type: v.type || "application/octet-stream" });
             if (!navigator.canShare({ files: [file] })) throw new Error("This browser can't send this kind of file. Use Download instead.");
             await navigator.share({ files: [file], title: v.title }).catch((err) => {
@@ -1037,6 +1248,8 @@ async function renderPersonal(info, me, openKey) {
             fill(preview, img);
           })
           .catch((err) => fill(preview, errorBox(err)));
+      } else if (/^(video|audio)\//.test(v.type)) {
+        play(preview, fileEntry, fetchBytes);
       }
     }
 
@@ -1089,7 +1302,7 @@ async function renderPersonal(info, me, openKey) {
     const form = h(
       "form",
       { class: "stack" },
-      h("h2", {}, h("span", { "aria-hidden": "true" }, `${ICON[kind]} `), thing ? v.title : `New ${KINDS[kind].one}`),
+      h("h2", {}, h("span", { "aria-hidden": "true" }, `${thing ? iconOf(thing) : ICON[kind]} `), thing ? v.title : `New ${KINDS[kind].one}`),
       body,
       h("div", { class: "row" }, saveButton, cancel, del),
       thing ? h("div", { class: "muted small" }, `Changed ${ago(thing.updatedAt)} · version ${thing.version}`) : null,
@@ -1146,6 +1359,7 @@ async function renderPersonal(info, me, openKey) {
         h("a", { href: "#/", class: "small" }, "← Shelf"),
         h("h1", {}, "Your personal box"),
         h("div", { class: "muted" }, "Just for you. Everything is sealed on this device before it leaves, and opens on every device you've signed in on."),
+        usage,
         peopleChip(info),
       ),
     ),
@@ -1384,7 +1598,7 @@ async function browser(info, openKey) {
         item
           ? h("div", { class: "muted small" }, `version ${item.version} · ${bytes(item.size)} sealed · changed ${ago(item.updatedAt)}${item.expiresAt ? ` · expires ${new Date(item.expiresAt).toLocaleString()}` : ""}`)
           : h("div", { class: "muted small" }, "Deleted (still in history)."),
-        item ? h("pre", {}, JSON.stringify(item.value, null, 2)) : null,
+        item ? h("pre", {}, item.value instanceof Uint8Array ? `${bytes(item.value.length)} of file data` : JSON.stringify(item.value, null, 2)) : null,
         versions.length > 1
           ? h(
               "details",
@@ -1550,16 +1764,36 @@ function timeMachine(boxName) {
 }
 
 function dangerZone(box) {
-  const exportBtn = h("button", { type: "button", class: "secondary" }, "Export as JSON");
+  const exportBtn = h("button", { type: "button", class: "secondary" }, "Export");
+  const exportStatus = h("span", { class: "muted small" }, "Everything, opened, as plain data (one item per line). Keep the file somewhere private.");
   exportBtn.addEventListener("click", () =>
     withBusy(exportBtn, async () => {
-      const data = await account.exportBox(box.name);
-      const url = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: "application/json" }));
-      const a = h("a", { href: url, download: `${box.name}-${new Date().toISOString().slice(0, 10)}.json` });
-      document.body.append(a);
-      a.click();
-      a.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      try {
+        const name = `${box.name}-${new Date().toISOString().slice(0, 10)}.jsonl`;
+        const encoder = new TextEncoder();
+        // Written a megabyte at a time, so a box full of videos never has to fit in memory.
+        const chunks = async function* () {
+          let batch = "";
+          for await (const line of account.exportLines(box.name)) {
+            batch += line;
+            if (batch.length > 1024 * 1024) {
+              yield encoder.encode(batch);
+              batch = "";
+            }
+          }
+          if (batch) yield encoder.encode(batch);
+        };
+        if (await streamDownload({ info: { name, type: "application/x-ndjson" }, chunks })) {
+          exportStatus.textContent = "Exporting. Keep this page open until the download is done.";
+          return;
+        }
+        if (box.bytes > IN_MEMORY_MAX) throw new Error(`${box.name} is too big to export in this browser. On the computer Cardboard runs on: node src/cli.ts export ${box.name} --out ${name}`);
+        const lines = [];
+        for await (const line of account.exportLines(box.name)) lines.push(line);
+        blobDownload(lines, name);
+      } catch (err) {
+        exportStatus.replaceChildren(errorBox(err));
+      }
     }),
   );
   if (box.shared) {
@@ -1567,7 +1801,7 @@ function dangerZone(box) {
       "section",
       { class: "card stack danger-zone" },
       h("h2", {}, "Moving day"),
-      h("div", { class: "row" }, exportBtn, h("span", { class: "muted small" }, "Everything, opened, in plain JSON. Keep the file somewhere private.")),
+      h("div", { class: "row" }, exportBtn, exportStatus),
     );
   }
   const confirmName = h("input", { placeholder: box.name, "aria-label": "Type the box name to confirm" });
@@ -1588,7 +1822,7 @@ function dangerZone(box) {
     "section",
     { class: "card stack danger-zone" },
     h("h2", {}, "Moving day & shredding"),
-    h("div", { class: "row" }, exportBtn, h("span", { class: "muted small" }, "Everything, opened, in plain JSON. Keep the file somewhere private.")),
+    h("div", { class: "row" }, exportBtn, exportStatus),
     h("p", { class: "small" }, `Shredding deletes the box's key with everything else, so every item, version, tape and log line is gone for good, backups included${box.people.members.length ? ", for everyone you share it with too" : ""}. Type the name to confirm.`),
     h("div", { class: "row" }, confirmName, shredBtn),
     status,

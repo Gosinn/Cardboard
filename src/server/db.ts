@@ -330,6 +330,15 @@ const MIGRATIONS: string[] = [
   -- Who made an invite: an account (when the host lets people invite friends), or NULL for the host.
   ALTER TABLE invites ADD COLUMN created_by TEXT;
   `,
+  `
+  -- Each value is kept once. The live version lives in items, and its history
+  -- row holds NULL until a newer version (or a delete) copies it in. Before
+  -- this, every value was stored twice. (A history row with value NULL is now
+  -- a deletion only when it isn't the live version.)
+  UPDATE history SET value = NULL
+   WHERE value IS NOT NULL AND EXISTS (
+     SELECT 1 FROM items i WHERE i.box_id = history.box_id AND i.idx = history.idx AND i.version = history.version);
+  `,
 ];
 
 export function openDb(path: string): DB {
