@@ -11,6 +11,7 @@ import { formatBytes } from "./shared/size.ts";
 import { VERSION } from "./shared/version.ts";
 import type { Insight } from "./shared/insights.ts";
 import { qrEncode, qrTerminal } from "./shared/qr.ts";
+import type { Tunnel, TunnelKind } from "./node/tunnel.ts";
 import { cleanInvite, recoverWithFriends, recoverWithKit, signUp, startPairing, unlock, type Account } from "./client/account.ts";
 import { Rpc } from "./client/rpc.ts";
 import { configDir, FileStore, writePrivate } from "./node/store.ts";
@@ -28,6 +29,8 @@ whoever runs the server can't read what's in it.
 
   Getting started
     cardboard start                   Start a Cardboard server (first run sets everything up)
+    cardboard start --tunnel tailscale   …and put it online from this computer, free, at a fixed https:// address
+    cardboard start --tunnel cloudflare  …or at a throwaway address, with no account at all
     cardboard signup [invite-link]    Make your account on this computer (prints your recovery kit)
     cardboard connect <app>           Connect the app in this folder: makes a box + tape, writes .env
 
@@ -121,7 +124,8 @@ whoever runs the server can't read what's in it.
                       --public-url https://cardboard.example.com   (where people and apps reach you)
                       --backup-every 1d   (snapshots in <data>/backups, newest 10 kept)
                       --invites host      (only the host makes invites; default: everyone can invite friends)
-  The same as environment variables: CARDBOARD_PORT, CARDBOARD_HOST, CARDBOARD_DATA, CARDBOARD_PUBLIC_URL,
+                      --tunnel tailscale|cloudflare   (online from this computer; sets the address and HTTPS)
+  The same as environment variables: CARDBOARD_TUNNEL, CARDBOARD_PORT, CARDBOARD_HOST, CARDBOARD_DATA, CARDBOARD_PUBLIC_URL,
                       CARDBOARD_TRUST_PROXY=1, CARDBOARD_OPEN_SIGNUP=1, CARDBOARD_BACKUP_EVERY=1d, CARDBOARD_INVITES=host
 `;
 
@@ -236,6 +240,7 @@ async function main() {
       "public-url": { type: "string" },
       "backup-every": { type: "string" },
       invites: { type: "string" },
+      tunnel: { type: "string" },
       url: { type: "string" },
       dir: { type: "string" },
       force: { type: "boolean" },
@@ -282,22 +287,38 @@ async function main() {
     case "start": {
       const { startServer } = await import("./server/index.ts");
       if ((values["tls-cert"] && !values["tls-key"]) || (!values["tls-cert"] && values["tls-key"])) die("HTTPS needs both --tls-cert and --tls-key.");
+      const tunnelKind = values.tunnel ?? process.env["CARDBOARD_TUNNEL"];
+      let tunnel: Tunnel | null = null;
+      if (tunnelKind) {
+        const { openTunnel, TUNNEL_KINDS } = await import("./node/tunnel.ts");
+        if (!(TUNNEL_KINDS as readonly string[]).includes(tunnelKind)) die(`There's no "${tunnelKind}" tunnel.`, "Use --tunnel tailscale (a fixed address, free account) or --tunnel cloudflare (no account, new address each time).");
+        if (values["public-url"] || values.host || values["tls-cert"]) die("--tunnel picks the address and HTTPS for you.", "Leave out --public-url, --host and --tls-cert.");
+        const port = values.port ? Number(values.port) : Number(process.env["CARDBOARD_PORT"] ?? process.env["PORT"] ?? 8787);
+        console.log(dim(`\n  Opening a ${tunnelKind} tunnel to this computer…`));
+        tunnel = await openTunnel(tunnelKind as TunnelKind, port, { say: (line) => console.log(`  ${line}`) });
+      }
       const cb = await startServer({
         dataDir: values.data,
         keyFile: values["key-file"],
         host: values.host,
         port: values.port ? Number(values.port) : undefined,
         tls: values["tls-cert"] ? { cert: values["tls-cert"], key: values["tls-key"]! } : undefined,
-        trustProxy: values["trust-proxy"],
-        publicUrl: values["public-url"],
+        // Behind a tunnel, Cardboard only listens on this computer, and the tunnel says who's calling.
+        trustProxy: values["trust-proxy"] || Boolean(tunnel),
+        publicUrl: tunnel?.url ?? values["public-url"],
         openSignup: values["open-signup"],
         invites: values.invites === "host" || values.invites === "everyone" ? values.invites : undefined,
         backupEveryMs: values["backup-every"] ? (values["backup-every"] === "never" ? null : parseDuration(values["backup-every"])) : undefined,
       }).catch((err: NodeJS.ErrnoException) => {
+        tunnel?.close();
         if (err.code === "EADDRINUSE") die(`Port ${values.port ?? 8787} is already in use.`, "Is Cardboard already running? Or pick another port with --port 8788.");
         throw err;
       });
-      console.log(`\n  ${bold("Cardboard is open")} at ${cb.url}`);
+      if (tunnel) {
+        console.log(`\n  ${bold("Cardboard is online")} at ${bold(tunnel.url)}  ${dim(`(and ${cb.url} on this computer)`)}`);
+        console.log(dim(`  ${tunnel.note}`));
+        console.log(dim("  It's up while this computer is on and awake (Mac: run it with caffeinate -i to stop it sleeping)."));
+      } else console.log(`\n  ${bold("Cardboard is open")} at ${cb.url}`);
       console.log(dim(`  Data: ${cb.paths.dataDir} (sealed by people's own devices: the server can't read it)`));
       console.log(dim(`  Server key: ${cb.paths.keyFile}`));
       console.log(dim(`  Sign in with Cardboard issuer: ${cb.publicUrl}`));
@@ -308,15 +329,17 @@ async function main() {
         console.log(dim("  It runs the server (invites, backups, the shake test). It can't open anyone's data."));
         if (cb.firstInvite) {
           console.log(`\n  ${bold("Make your account:")} open ${cb.firstInvite}`);
-          console.log(`  or run: ${bold("cardboard signup")}`);
+          printQr(cb.firstInvite, !values["no-qr"]);
+          console.log(`  (scan it with your phone) or run: ${bold("cardboard signup")}`);
         }
-      }
+      } else if (tunnel) printQr(tunnel.url, !values["no-qr"]);
       if (cb.shake) {
         console.log(`\n  ${cb.shake.ok ? "✓" : "✗"} Shake test: ${cb.shake.summary}`);
         for (const r of cb.shake.results.filter((r) => r.status !== "pass")) console.log(`    ${STATUS[r.status]} ${r.title}: ${r.detail}`);
       }
       console.log("");
       const stop = async () => {
+        tunnel?.close();
         await cb.close();
         process.exit(0);
       };

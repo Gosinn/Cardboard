@@ -238,7 +238,14 @@ export class Api {
     } catch {
       originHost = null;
     }
-    if (!originHost || originHost !== req.host) {
+    // Its own address: the Host header, or the public address (a tunnel or proxy may rewrite Host on the way).
+    let publicHost: string | null = null;
+    try {
+      publicHost = new URL(this.ctx.info.publicUrl).host;
+    } catch {
+      publicHost = null;
+    }
+    if (!originHost || (originHost !== req.host && originHost !== publicHost)) {
       throw fail("not_dashboard", 403, "This part of Cardboard only answers its own dashboard and CLI.", "Apps use their tape, from an origin allowed in the box settings.");
     }
   }

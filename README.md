@@ -44,7 +44,7 @@ That's the whole setup. `open()` reads `.env` by itself. (Don't use `npx cardboa
 
 > Requires Node 22.18+. To use the SDK from another project: `npm install github:gosinn/cardboard`.
 >
-> Putting it on a server for real (HTTPS, backups, your family's phones)? Railway in a browser, or `docker compose up -d` on your own server: see [docs/DEPLOY.md](docs/DEPLOY.md). Connecting a website like LORE: [docs/APPS.md](docs/APPS.md).
+> Putting it online for real (HTTPS, your family's phones)? For free from your own computer: `node src/cli.ts start --tunnel tailscale`. Or always on, with Railway or `docker compose up -d` on a server. See [docs/DEPLOY.md](docs/DEPLOY.md). Connecting a website like LORE: [docs/APPS.md](docs/APPS.md).
 
 ---
 
@@ -290,7 +290,7 @@ Every call is `POST /v1/<operation>` with a JSON body. The token decides who you
 
 ## Running it for real (the host)
 
-**[docs/DEPLOY.md](docs/DEPLOY.md)** walks through it in about ten minutes: on Railway from your browser (nothing to look after), or with Docker and Caddy (automatic HTTPS) on any small server.
+**[docs/DEPLOY.md](docs/DEPLOY.md)** walks through it in about ten minutes: for free from your own computer (`cardboard start --tunnel tailscale` gives it a fixed `https://` address through Tailscale Funnel, with HTTPS ending on your computer), on Railway (nothing to look after), or with Docker and Caddy (automatic HTTPS) on any small server.
 
 ```bash
 echo CARDBOARD_DOMAIN=cardboard.example.com > .env

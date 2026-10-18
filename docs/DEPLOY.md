@@ -1,13 +1,43 @@
-# Putting Cardboard on a server
+# Putting Cardboard online
 
-Two ways, both with real HTTPS, daily backups, and phones that open it with Face ID:
+Three ways, all with real HTTPS (which Face ID needs) and phones that open it like an app:
 
-- **[A. Railway](#a-railway-no-server-to-look-after)**: no server to look after. About 10 minutes in a web browser, a few dollars a month. Best for trying it out with friends.
-- **[B. Your own server](#b-your-own-server-docker--caddy)** (a VPS or a Raspberry Pi) with Docker. A bit more setup, full control.
+- **[A. Free, on your own computer](#a-free-on-your-own-computer)**: one command, no hosting, no money. Online while the computer is on and awake. Best for trying it out with a friend.
+- **[B. Railway](#b-railway-paid-always-on)**: a few dollars a month, always on, nothing to look after.
+- **[C. Your own server](#c-your-own-server-docker--caddy)** (a VPS or a Raspberry Pi) with Docker. Always on, full control.
 
-**Decide the address before you rely on it.** Devices, Face ID locks and app sign-ins are tied to the address Cardboard is reached at. Moving later is possible (everyone signs back in with their recovery kit or by pairing, and turns Face ID on again), but it's easier not to.
+**Decide the address before you rely on it.** Devices, Face ID locks and app sign-ins are tied to the address Cardboard is reached at. Moving later is possible (everyone signs back in with their recovery kit or by pairing, and turns Face ID on again), and your data comes along, but it's easier not to.
 
-## A. Railway (no server to look after)
+## A. Free, on your own computer
+
+Your computer runs Cardboard, and a free tunnel gives it an `https://` address anyone can reach. Cardboard itself only listens on your computer: nothing on your network is opened up.
+
+1. Install **Node.js** (the LTS version, from [nodejs.org](https://nodejs.org)) and **Tailscale** (from [tailscale.com/download](https://tailscale.com/download)). Open Tailscale and sign in: it's free, with your Google, Microsoft, Apple or GitHub account.
+2. In a terminal:
+
+   ```bash
+   git clone https://github.com/Gosinn/Cardboard.git && cd Cardboard
+   node src/cli.ts start --tunnel tailscale
+   ```
+
+   The first time, Tailscale prints a link to turn on **Funnel** (what lets people outside your own devices reach this one address). Open it and say yes; Cardboard carries on by itself.
+3. It prints your address (like `https://laptop.tail1234.ts.net`, the same every time), the host token, and a **QR code of your invite: scan it with your phone** to make your account.
+
+Use the `https://` address everywhere, on this computer too (`http://127.0.0.1:8787` is a different address to your browser, with its own sign-in). Keep the terminal open: Cardboard is online while it runs. On a Mac, start it as `caffeinate -i node src/cli.ts start --tunnel tailscale` so the computer doesn't sleep (keep it plugged in). Next time, run the same command in the same folder: same address, same data (it lives in `cardboard-data/` there).
+
+HTTPS ends on your own computer: Tailscale only relays encrypted bytes. On Linux, let your user set up Funnel once with `sudo tailscale set --operator=$USER`.
+
+**No account at all, just for an afternoon?** `node src/cli.ts start --tunnel cloudflare` (install `cloudflared` first: `brew install cloudflared` on a Mac, `winget install Cloudflare.cloudflared` on Windows). You get a random `https://….trycloudflare.com` address with no sign-up, but:
+
+- it's a **new address every time** it starts, and then everyone signs back in (recovery kit or pairing);
+- live updates (`watch()`) may not get through;
+- HTTPS ends at Cloudflare's servers, not yours.
+
+**Always on, still free:** the same command on an old laptop or a Raspberry Pi that stays on at home. (Free cloud servers exist too, such as Oracle Cloud's Always Free tier, but they usually ask for a card at sign-up to check you're real.)
+
+Then carry on at [Make your account](#make-your-account).
+
+## B. Railway (paid, always on)
 
 1. Go to [railway.com](https://railway.com) and sign in with GitHub.
 2. **New project → Deploy from GitHub repo → Gosinn/Cardboard.** Railway builds it from the `Dockerfile`; `railway.json` tells it how to check it's healthy.
@@ -32,7 +62,7 @@ cardboard host login https://your-address <host-token>
 cardboard host invite --note "Siggi"
 ```
 
-## B. Your own server (Docker + Caddy)
+## C. Your own server (Docker + Caddy)
 
 You need a small Linux server with Docker (1 CPU and 1 GB of memory is plenty for a family: Hetzner, DigitalOcean, a Raspberry Pi at home with ports 80 and 443 forwarded…) and a domain name.
 
@@ -82,7 +112,7 @@ To restore: stop Cardboard, put a backup in place as `/data/cardboard.db` (delet
 
 ## Updating
 
-Railway redeploys by itself when the repository changes. With Docker:
+On your own computer: stop it (Ctrl+C), `git pull`, start it again. Railway redeploys by itself when the repository changes. With Docker:
 
 ```bash
 docker compose exec cardboard cardboard host backup
@@ -113,6 +143,7 @@ CARDBOARD_DATA=/var/lib/cardboard/data node /opt/cardboard/src/cli.ts start \
 
 | Option | Environment | |
 |---|---|---|
+| `--tunnel tailscale\|cloudflare` | `CARDBOARD_TUNNEL` | Online from this computer: sets the address and HTTPS for you |
 | `--public-url` | `CARDBOARD_PUBLIC_URL` | The address people and apps use (the Sign in with Cardboard issuer) |
 | `--port` | `CARDBOARD_PORT` or `PORT` | Default 8787 |
 | `--data` | `CARDBOARD_DATA` | Where the database, server key and backups live |
