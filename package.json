@@ -1,6 +1,6 @@
 {
   "name": "cardboard",
-  "version": "0.4.4",
+  "version": "0.4.5",
   "description": "A smart, private, end-to-end encrypted deposit box for all your personal apps.",
   "type": "module",
   "license": "UNLICENSED",

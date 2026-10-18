@@ -11,6 +11,7 @@ import { qrEncode, qrPath } from "../src/shared/qr.ts";
 import { createHash } from "node:crypto";
 import { win32 } from "node:path";
 import { isModulePath } from "../src/server/http.ts";
+import { NAME_PATTERN, toName } from "../src/shared/names.ts";
 
 describe("durations and sizes", () => {
   it("parses the ways people write durations", () => {
@@ -247,5 +248,17 @@ describe("serving the dashboard's code", () => {
     for (const bad of ["client\\account.ts", "client/../server/api.ts", "server/api.ts", "client//account.ts", "client/Account.ts", "../client/account.ts"]) {
       assert.ok(!isModulePath(bad), bad);
     }
+  });
+});
+
+describe("names people type", () => {
+  it("turns anything into a name apps can use", () => {
+    assert.equal(toName("LORE"), "lore");
+    assert.equal(toName("  Shopping list! "), "shopping-list");
+    assert.equal(toName("Innkaupalisti fjölskyldunnar"), "innkaupalisti-fjolskyldunnar");
+    assert.equal(toName("Þórður & Æsa"), "thordur-aesa");
+    assert.equal(toName("!!!"), "");
+    const long = toName(`${"a".repeat(62)} b`);
+    assert.ok(long.length <= 63 && !long.endsWith("-") && NAME_PATTERN.test(long));
   });
 });

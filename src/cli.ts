@@ -11,6 +11,7 @@ import { formatBytes } from "./shared/size.ts";
 import { VERSION } from "./shared/version.ts";
 import type { Insight } from "./shared/insights.ts";
 import { qrEncode, qrTerminal } from "./shared/qr.ts";
+import { toName } from "./shared/names.ts";
 import type { Tunnel, TunnelKind } from "./node/tunnel.ts";
 import { cleanInvite, recoverWithFriends, recoverWithKit, signUp, startPairing, unlock, type Account } from "./client/account.ts";
 import { Rpc } from "./client/rpc.ts";
@@ -702,7 +703,7 @@ async function main() {
       const list = (v: string | undefined) => (v ? v.split(",").map((s) => s.trim()).filter(Boolean) : []);
       switch (action) {
         case "create": {
-          const created = await acct.createDock(needDock(), { send: list(values.send), receive: list(values.receive) });
+          const created = await acct.createDock(toName(needDock()) || needDock(), { send: list(values.send), receive: list(values.receive) });
           console.log(`✓ Opened ${bold(created.name!)}.`);
           for (const b of created.berths) console.log(`  ${b.box} can ${arrows(b, true)}, known there as ${b.tag}`);
           if (!values.send && !values.receive) console.log(dim("  No apps yet. Apps that use it will ask to dock, and you approve them."));
@@ -1199,7 +1200,7 @@ function need(value: string | undefined, message: string): string {
 }
 
 function slug(name: string): string {
-  return name.toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 63) || "my-app";
+  return toName(name) || "my-app";
 }
 
 function tapeOptions(values: Record<string, unknown>, label: string) {

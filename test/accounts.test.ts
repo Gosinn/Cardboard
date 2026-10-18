@@ -192,6 +192,14 @@ describe("accounts, devices and recovery", () => {
     assert.match(res.body.error.message, /tokenHash/);
   });
 
+  it("finds boxes and docks the way people type them, and says what name would work", async () => {
+    await t.me.createBox("lore-world");
+    assert.equal((await t.me.box("LORE World")).name, "lore-world");
+    await t.me.createDock("story-bits");
+    await t.me.dockSettings("Story Bits", { ttl: "1d" });
+    await assert.rejects(t.me.createBox("LORE"), (err: unknown) => err instanceof CardboardError && err.code === "bad_box_name" && /try lore/.test(err.hint ?? ""));
+  });
+
   it("slows down people guessing recovery codes and pairing ids", async () => {
     t.cb.api.limiter.reset("127.0.0.1");
     let last = 0;

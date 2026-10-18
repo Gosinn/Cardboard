@@ -5,6 +5,7 @@
 import { claimEmergency, cleanInvite, deviceLock, recoverWithFriends, recoverWithKit, requestEmergency, signUp, startPairing, unlock, viewEmergency } from "/lib/client/account.ts";
 import { qrEncode, qrPath } from "/lib/shared/qr.ts";
 import { describeDuration } from "/lib/shared/duration.ts";
+import { toName } from "/lib/shared/names.ts";
 import { createPasskey, hasBuiltInPasskeys, passkeyBlocker, passkeySecret } from "/lib/client/passkey.ts";
 import { Rpc } from "/lib/client/rpc.ts";
 import { browserName, browserStore, makeKey } from "/device.js";
@@ -673,20 +674,43 @@ function peopleChip(b) {
   return null;
 }
 
+/**
+ * A name field that takes whatever you type ("LORE", "Shopping list") and shows
+ * the name apps will use ("lore", "shopping-list").
+ */
+function nameField(label, example) {
+  const input = h("input", { placeholder: example, required: true, "aria-label": label, autocapitalize: "off", spellcheck: "false" });
+  const preview = h("div", { class: "muted small" }, "Type any name.");
+  input.addEventListener("input", () => {
+    const name = toName(input.value);
+    preview.textContent = !input.value.trim() ? "Type any name." : name ? (name === input.value.trim() ? "Apps use this name." : `Apps will call it: ${name}`) : "Use at least one letter or number.";
+  });
+  return {
+    input,
+    preview,
+    value() {
+      const name = toName(input.value);
+      if (!name) throw new Error("Give it a name with at least one letter or number.");
+      return name;
+    },
+  };
+}
+
 function newBoxCard() {
-  const name = h("input", { placeholder: "recipe-app", pattern: "[a-z0-9][a-z0-9\\-]*", required: true, "aria-label": "Box name" });
+  const name = nameField("Box name", "e.g. LORE");
   const status = h("div");
   const form = h(
     "form",
     { class: "boxcard new stack" },
     h("h3", {}, "New box"),
-    h("div", { class: "muted small" }, "One box per app. Lowercase letters, numbers and dashes."),
-    name,
+    h("div", { class: "muted small" }, "One box per app."),
+    name.input,
+    name.preview,
     h("button", { type: "submit" }, "Make box + tape"),
     status,
   );
   onSubmit(form, status, async () => {
-    const box = await account.createBox(name.value.trim());
+    const box = await account.createBox(name.value());
     const { secret } = await account.createTape(box.name, { label: "dashboard" });
     showSecret(`${box.name} is ready`, secret, box.name, null, render);
   });
@@ -1476,7 +1500,13 @@ async function renderDocks() {
     h(
       "div",
       { class: "page-head" },
-      h("div", {}, h("h1", {}, "Docks"), h("div", { class: "muted" }, "Meeting points where your apps swap data. Each app only ever sees a pseudonym, parcels are sealed so only approved apps can open them, and customs runs at both ends.")),
+      h(
+        "div",
+        {},
+        h("h1", {}, "Docks"),
+        h("div", { class: "muted" }, "Meeting points where your apps swap data. Each app only ever sees a pseudonym, parcels are sealed so only approved apps can open them, and customs runs at both ends."),
+        h("div", { class: "small" }, "Most apps don't need one: an app gets its own box on your shelf when it connects or signs in. A dock is for two or more of your apps that should pass things to each other."),
+      ),
     ),
     pendingCard(pending) || h("span"),
     h("div", { class: "grid wide" }, docks.filter((d) => d.name).map((d) => dockCard(d)), newDockCard(boxes)),
@@ -1583,14 +1613,15 @@ function dockSettings(d) {
 }
 
 function newDockCard(boxes) {
-  const name = h("input", { placeholder: "shopping-list", pattern: "[a-z0-9][a-z0-9\\-]*", required: true, "aria-label": "Dock name" });
+  const name = nameField("Dock name", "e.g. Shopping list");
   const picks = boxes.map((b) => ({ box: b.name, send: h("input", { type: "checkbox" }), receive: h("input", { type: "checkbox" }) }));
   const status = h("div");
   const form = h(
     "form",
     { class: "card stack" },
     h("h2", {}, "New dock"),
-    h("label", { class: "field" }, "Name", name),
+    h("label", { class: "field" }, "Name", name.input),
+    name.preview,
     picks.length
       ? h(
           "div",
@@ -1608,7 +1639,7 @@ function newDockCard(boxes) {
     status,
   );
   onSubmit(form, status, async () => {
-    await account.createDock(name.value.trim(), { send: picks.filter((p) => p.send.checked).map((p) => p.box), receive: picks.filter((p) => p.receive.checked).map((p) => p.box) });
+    await account.createDock(name.value(), { send: picks.filter((p) => p.send.checked).map((p) => p.box), receive: picks.filter((p) => p.receive.checked).map((p) => p.box) });
     render();
   });
   return form;

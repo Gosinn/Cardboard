@@ -1,5 +1,6 @@
 import { CardboardError, fail } from "../shared/errors.ts";
 import { ctx } from "../shared/contexts.ts";
+import { NAME_PATTERN, toName } from "../shared/names.ts";
 import { describe, type OpenedEntry, type Outcome } from "../shared/activity.ts";
 import { blastRadius, type BlastRadius } from "../shared/blast.ts";
 import { inspect } from "../shared/customs.ts";
@@ -826,10 +827,13 @@ export class Account {
     return this.boxCache!;
   }
 
+  /** A box by name. "LORE" finds "lore": names are typed by people too. */
   async box(name: string): Promise<BoxInfo> {
+    const wanted = new Set([name, toName(name)]);
     for (const fresh of [false, true]) {
       if (fresh) await this.boxes();
       for (const box of (await this.cache()).values()) if (box.name === name) return box;
+      for (const box of (await this.cache()).values()) if (wanted.has(box.name)) return box;
     }
     throw fail("no_such_box", 404, `There's no box called ${name}.`, `Make it with: cardboard connect ${name}`);
   }
@@ -839,8 +843,8 @@ export class Account {
   }
 
   async createBox(name: string, settings?: Record<string, unknown>): Promise<BoxInfo> {
-    if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(name)) {
-      throw fail("bad_box_name", 400, `"${name}" can't be used as a box name.`, "Use lowercase letters, numbers and dashes, like recipe-app.");
+    if (!NAME_PATTERN.test(name)) {
+      throw fail("bad_box_name", 400, `"${name}" can't be used as a box name.`, `Names are lowercase letters, numbers and dashes${toName(name) ? `: try ${toName(name)}` : ", like recipe-app"}.`);
     }
     for (const box of (await this.cache()).values()) {
       if (box.shared && box.name === name) throw fail("box_exists", 409, `You already have a box called ${name} (shared with you by ${box.shared.from}).`, "Pick another name, or rename that one.");
@@ -882,7 +886,7 @@ export class Account {
   }
 
   async renameBox(name: string, to: string): Promise<BoxInfo> {
-    if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(to)) throw fail("bad_box_name", 400, `"${to}" can't be used as a box name.`, "Use lowercase letters, numbers and dashes.");
+    if (!NAME_PATTERN.test(to)) throw fail("bad_box_name", 400, `"${to}" can't be used as a box name.`, `Names are lowercase letters, numbers and dashes${toName(to) ? `: try ${toName(to)}` : ""}.`);
     const box = await this.box(name);
     if ((await this.boxes()).some((b) => b.name === to && b.id !== box.id)) throw fail("box_exists", 409, `You already have a box called ${to}.`);
     if (box.shared) {
@@ -1061,7 +1065,7 @@ export class Account {
     const root = fromB64u(opened.box);
     const keys = await boxKeys(root);
     const id = newClientId("mem");
-    const wanted = (options.name ?? opened.name).toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 50) || "shared";
+    const wanted = toName(options.name ?? opened.name).slice(0, 50) || "shared";
     const name = await this.freeName(wanted);
     const as = (options.as ?? (await this.me()).profile.name ?? "").trim().slice(0, 60) || "Someone";
     const res = await this.rpc.call<{ box: WireBox }>("share.accept", {
@@ -1286,8 +1290,14 @@ export class Account {
 
   /** Finds a dock by name, including one an app asked for that you haven't opened yet. */
   private async findDock(name: string): Promise<WireDock | undefined> {
-    const idx = await dockIndex(this.keys.names, name);
-    return (await this.rawDocks()).docks.find((d) => d.idx === idx);
+    const { docks } = await this.rawDocks();
+    for (const candidate of new Set([name, toName(name)])) {
+      if (!candidate) continue;
+      const idx = await dockIndex(this.keys.names, candidate);
+      const found = docks.find((d) => d.idx === idx);
+      if (found) return found;
+    }
+    return undefined;
   }
 
   private async requireDock(name: string): Promise<WireDock & { key: string }> {
@@ -1306,8 +1316,8 @@ export class Account {
   }
 
   async createDock(name: string, options: { send?: string[]; receive?: string[]; settings?: Record<string, unknown> } = {}): Promise<DockInfo> {
-    if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(name)) {
-      throw fail("bad_dock_name", 400, `"${name}" can't be used as a dock name.`, "Use lowercase letters, numbers and dashes, like shopping-list.");
+    if (!NAME_PATTERN.test(name)) {
+      throw fail("bad_dock_name", 400, `"${name}" can't be used as a dock name.`, `Names are lowercase letters, numbers and dashes${toName(name) ? `: try ${toName(name)}` : ", like shopping-list"}.`);
     }
     const existing = await this.findDock(name);
     if (existing?.key) throw fail("dock_exists", 409, `There's already a dock called ${name}.`);
@@ -1466,7 +1476,7 @@ export class Account {
       if (options.box && !box) throw fail("no_such_box", 404, "You don't have that box.");
       if (box?.shared && !box.shared.write) throw fail("read_only", 403, `${box.name} was shared with you read-only, so an app can't keep its data there.`, "Pick another box.");
       if (!box) {
-        box = await this.createBox(await this.freeName(slug(req.client.name)));
+        box = await this.createBox(await this.freeName(toName(req.client.name) || "connected-app"));
         await this.setBoxProfile(box.name, { title: req.client.name.slice(0, 60), ...(req.client.uri ? { url: req.client.uri } : {}) });
       }
       boxId = box.id;
@@ -1499,14 +1509,3 @@ function defaultDeviceName(kind: DeviceKind): string {
   return kind === "browser" ? "a browser" : kind === "cli" ? "a computer (CLI)" : "a device";
 }
 
-function slug(name: string): string {
-  return (
-    name
-      .toLowerCase()
-      .normalize("NFKD")
-      .replace(/[̀-ͯ]/g, "")
-      .replace(/[^a-z0-9]+/g, "-")
-      .replace(/^-+|-+$/g, "")
-      .slice(0, 50) || "connected-app"
-  );
-}
