@@ -77,6 +77,18 @@ export function describe(e: OpenedEntry): string {
       return `${who} left ${box}`;
     case "member.remove":
       return `${who} took ${e.what ?? "someone"} off ${box}`;
+    case "emergency.create":
+      return `${who} made an emergency access link${e.what ? ` for ${e.what}` : ""}${e.note ? ` (${e.note})` : ""}`;
+    case "emergency.stop":
+      return `${who} stopped someone using an emergency access link${e.what ? ` (${e.what}'s)` : ""}`;
+    case "emergency.approve":
+      return `${who} let ${e.what ?? "someone"} in early with emergency access`;
+    case "emergency.remove":
+      return `${who} removed an emergency access link${e.what ? ` for ${e.what}` : ""}`;
+    case "invite.create":
+      return `${who} made an invite link for a friend`;
+    case "invite.revoke":
+      return `${who} cancelled an invite link`;
     case "recovery.set":
       return `${who} changed the recovery plan to ${planName(e.note)}`;
     case "profile.set":

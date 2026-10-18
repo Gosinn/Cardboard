@@ -2,7 +2,9 @@
 // browser, so everything is opened right here: the server only ever sends
 // sealed bytes. Anything that came from an app (key names, values, labels) is
 // inserted with textContent, never as HTML.
-import { cleanInvite, deviceLock, recoverWithFriends, recoverWithKit, signUp, startPairing, unlock } from "/lib/client/account.ts";
+import { claimEmergency, cleanInvite, deviceLock, recoverWithFriends, recoverWithKit, requestEmergency, signUp, startPairing, unlock, viewEmergency } from "/lib/client/account.ts";
+import { qrEncode, qrPath } from "/lib/shared/qr.ts";
+import { describeDuration } from "/lib/shared/duration.ts";
 import { createPasskey, hasBuiltInPasskeys, passkeyBlocker, passkeySecret } from "/lib/client/passkey.ts";
 import { Rpc } from "/lib/client/rpc.ts";
 import { browserName, browserStore, makeKey } from "/device.js";
@@ -18,6 +20,10 @@ let account = null;
 let pendingConnect = null;
 /** A share link someone sent you (its code), waiting for this browser to be signed in. */
 let pendingShare = null;
+/** An emergency access link someone gave you (its code). */
+let pendingEmergency = null;
+/** A pairing code scanned from a new device's screen, to approve here. */
+let pendingPair = null;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -105,6 +111,33 @@ function copyButton(text, label = "Copy") {
     setTimeout(() => (btn.textContent = label), 1500);
   });
   return btn;
+}
+
+/** A QR code of `text`, drawn as SVG (dark on white, whatever the theme, so cameras read it). */
+function qrCode(text, label = "QR code") {
+  const NS = "http://www.w3.org/2000/svg";
+  const matrix = qrEncode(text);
+  const size = matrix.length + 8;
+  const svg = document.createElementNS(NS, "svg");
+  svg.setAttribute("viewBox", `0 0 ${size} ${size}`);
+  svg.setAttribute("class", "qr");
+  svg.setAttribute("role", "img");
+  svg.setAttribute("aria-label", label);
+  const bg = document.createElementNS(NS, "rect");
+  bg.setAttribute("width", String(size));
+  bg.setAttribute("height", String(size));
+  bg.setAttribute("fill", "#fff");
+  const dots = document.createElementNS(NS, "path");
+  dots.setAttribute("d", qrPath(matrix));
+  dots.setAttribute("fill", "#000");
+  svg.append(bg, dots);
+  return svg;
+}
+
+/** Copy, and on phones the share sheet. */
+function sendButtons(link, title) {
+  const send = navigator.share ? h("button", { type: "button", class: "secondary", onclick: () => navigator.share({ title, url: link }).catch(() => {}) }, "Send…") : null;
+  return h("div", { class: "row" }, copyButton(link, "Copy link"), send);
 }
 
 function fixLine(fix) {
@@ -400,6 +433,8 @@ function renderWelcome(info) {
     ? h("p", {}, h("strong", {}, pendingConnect.appName ?? "An app"), " wants you to sign in with Cardboard. First, open your Cardboard in this browser.")
     : pendingShare
       ? h("p", {}, "Someone shared a box with you. First, open your Cardboard in this browser. No account here yet? Ask whoever runs this Cardboard for an invite, then open the link again.")
+      : pendingPair
+        ? h("p", { class: "error" }, "That pairing code is for approving a new device, so scan it with a phone or computer that's already signed in to your Cardboard.")
       : h("p", { class: "muted" }, "Your private, end-to-end encrypted deposit box. Your keys live on your devices: whoever runs this server can't read anything you keep here.");
 
   const panes = {
@@ -486,9 +521,11 @@ function pairPane() {
         fill(
           status,
           h("div", { class: "stack" },
-            h("p", {}, "Your pairing code:"),
+            h("p", {}, "Scan this with your phone (where you're signed in to Cardboard):"),
+            qrCode(`${ORIGIN}/#pair=${pending.code}`, "QR code to approve this browser"),
+            h("p", {}, "Or type this code on a device that's already signed in:"),
             h("code", { class: "secret big" }, pending.code),
-            h("p", { class: "small" }, "On a device that's already signed in, open ", h("strong", {}, "You → Devices → Add a device"), " and type it in, or run:"),
+            h("p", { class: "small" }, "It's under ", h("strong", {}, "You → Devices → Add a device"), ". Or run:"),
             h("code", { class: "secret" }, `cardboard devices add ${pending.code}`),
             h("p", { class: "muted small" }, "Waiting for you to approve it (the code works for 10 minutes)…"),
           ),
@@ -613,6 +650,7 @@ async function renderShelf() {
       h("div", {}, h("h1", {}, me.profile.name ? `${me.profile.name}'s shelf` : "Your shelf"), h("div", { class: "muted" }, `${plural(boxes.length, "box").replace("boxs", "boxes")} · ${bytes(me.quota.used)} of ${bytes(me.quota.limit)}`)),
       shakeChip,
     ),
+    emergencyAlerts(me),
     search,
     results,
     pendingCard(docks.pending),
@@ -806,15 +844,13 @@ async function peopleSection(box) {
 }
 
 function showShareLink(boxName, forWhom, result, onDone) {
-  const send = navigator.share
-    ? h("button", { type: "button", class: "secondary", onclick: () => navigator.share({ title: `Join ${boxName} on Cardboard`, url: result.link }).catch(() => {}) }, "Send…")
-    : null;
   openModal(
     onDone,
     h("h2", {}, `Share ${boxName}${forWhom ? ` with ${forWhom}` : ""}`),
-    h("p", {}, "Send this link privately (Signal, iMessage, in person). Whoever opens it first, with their own Cardboard here, joins the box. Then it stops working."),
+    h("p", {}, "Send this link privately (Signal, iMessage), or let them scan the code. Whoever opens it first, with their own Cardboard here, joins the box. Then it stops working."),
+    qrCode(result.link, "QR code of the share link"),
     h("code", { class: "secret" }, result.link),
-    h("div", { class: "row" }, copyButton(result.link, "Copy link"), send),
+    sendButtons(result.link, `Join ${boxName} on Cardboard`),
     h("p", { class: "muted small" }, `The secret is the part after #, which browsers never send to a server, so Cardboard can't open it either. It works until ${new Date(result.expiresAt).toLocaleString()}.`),
     h("div", { class: "row" }, h("button", { type: "button", onclick: () => closeModal() }, "Done")),
   );
@@ -1136,6 +1172,264 @@ function dangerZone(box) {
   );
 }
 
+// ── If something happens to you ─────────────────────────────────────────────
+
+const WAITS = [
+  ["1d", "1 day"],
+  ["3d", "3 days"],
+  ["7d", "7 days"],
+  ["14d", "14 days"],
+  ["30d", "30 days"],
+  ["90d", "90 days"],
+];
+
+/** Someone is using one of your emergency links right now: stop it, or let them in. Shown on the shelf and on You. */
+function emergencyAlerts(me) {
+  return me.emergency.map((l) => {
+    const stop = h("button", { type: "button", class: "danger" }, "Stop it");
+    const allow = h("button", { type: "button", class: "secondary" }, "Let them in now");
+    stop.addEventListener("click", () =>
+      withBusy(stop, async () => {
+        await account.stopEmergency(l.id);
+        render();
+      }),
+    );
+    allow.addEventListener("click", () =>
+      withBusy(allow, async () => {
+        if (!confirm(`Let ${l.label || "them"} into your whole Cardboard now?`)) return;
+        await account.allowEmergency(l.id);
+        render();
+      }),
+    );
+    return h(
+      "section",
+      { class: "card stack alert" },
+      h("h2", {}, `Someone is using your emergency access link${l.label ? ` (the one for ${l.label})` : ""}`),
+      h("p", {}, `Unless you stop it, they can open your whole Cardboard ${l.approvedAt ? "now" : `on ${new Date(l.readyAt).toLocaleString()}`}. If that's not what you want, stop it now.`),
+      h("div", { class: "row" }, stop, allow),
+    );
+  });
+}
+
+async function emergencyCard() {
+  const links = await account.emergencyLinks();
+  const { profile } = await account.me();
+  const list = links.map((l) => {
+    const remove = h("button", { type: "button", class: "secondary tiny" }, "Remove");
+    remove.addEventListener("click", () =>
+      withBusy(remove, async () => {
+        if (!confirm(`Remove ${l.label ? `${l.label}'s` : "this"} emergency link? It stops working at once.`)) return;
+        await account.removeEmergency(l.id);
+        render();
+      }),
+    );
+    const state = l.readyAt ? h("span", { class: "chip danger" }, "being used now") : h("span", { class: "chip" }, `waits ${describeDuration(l.waitMs)}`);
+    return h("li", { class: "row spread" }, h("div", {}, h("strong", {}, l.label || "Someone you trust"), " ", state, h("div", { class: "muted small" }, `made ${ago(l.createdAt)}`)), remove);
+  });
+  const forWhom = h("input", { placeholder: "e.g. Anna", maxlength: 60 });
+  const as = h("input", { value: profile.name || "", placeholder: "e.g. Gosinn", maxlength: 60, required: true });
+  const message = h("textarea", { rows: 3, maxlength: 1000, placeholder: "Optional, e.g. “The house papers are in the documents box.”" });
+  const wait = h("select", {}, WAITS.map(([v, label]) => h("option", { value: v, selected: v === "7d" }, label)));
+  const status = h("div");
+  const form = h(
+    "form",
+    { class: "stack" },
+    h("div", { class: "two" }, h("label", { class: "field" }, "Who's it for (just for you)", forWhom), h("label", { class: "field" }, "Your name, as they'll see it", as)),
+    h("label", { class: "field" }, "A message for them (sealed: only they'll read it)", message),
+    h("label", { class: "row small" }, "If they use it, wait", wait, "before letting them in"),
+    h("button", { type: "submit" }, "Make the link"),
+    status,
+  );
+  onSubmit(form, status, async () => {
+    const result = await account.addEmergencyLink({ label: forWhom.value.trim() || undefined, as: as.value.trim(), message: message.value, wait: wait.value });
+    showEmergencyLink(forWhom.value.trim(), as.value.trim(), wait.selectedOptions[0].textContent, result.link, render);
+  });
+  return h(
+    "section",
+    { class: "card stack" },
+    h("h2", {}, "If something happens to you"),
+    h(
+      "p",
+      { class: "small" },
+      "Give someone you trust a link, or a printed QR code. If they ever use it, every one of your devices is told, and you can stop it. If you don't (because you can't), they get into your Cardboard after the wait you choose.",
+    ),
+    links.length ? h("ul", { class: "list" }, list) : null,
+    h("details", {}, h("summary", {}, links.length ? "Add someone else" : "Add someone you trust"), form),
+  );
+}
+
+function showEmergencyLink(forWhom, from, wait, link, onDone) {
+  const print = h("button", { type: "button", class: "secondary", onclick: () => window.print() }, "Print");
+  openModal(
+    onDone,
+    h("h2", {}, `Emergency access to ${from || "my"}${from ? "'s" : ""} Cardboard`),
+    h("p", {}, forWhom ? `For ${forWhom}. ` : "", "Keep this somewhere safe. If something happens to ", from || "me", ", scan the code (or open the link) and choose “Ask for access”."),
+    qrCode(link, "QR code of the emergency access link"),
+    h("code", { class: "secret" }, link),
+    h("div", { class: "row" }, sendButtons(link, "Emergency access to my Cardboard"), print),
+    h("p", { class: "muted small" }, `When it's used, ${from || "the owner"} is told on every device and has ${wait} to stop it. Treat it like a house key: whoever holds it can ask. The secret is after the #, so the server can't use it.`),
+    h("div", { class: "row" }, h("button", { type: "button", onclick: () => closeModal() }, "Done")),
+  );
+}
+
+/** You were given an emergency access link. Works with or without a Cardboard account of your own. */
+async function renderEmergency(code) {
+  nav.hidden = true;
+  const logo = document.querySelector(".brand svg").cloneNode(true);
+  const card = (...children) => fill(app, h("section", { class: "card stack login" }, h("div", { class: "row" }, logo, h("h1", {}, "Emergency access")), ...children));
+  let preview;
+  try {
+    preview = await viewEmergency({ url: ORIGIN, link: code });
+  } catch (err) {
+    pendingEmergency = null;
+    return card(errorBox(err), h("a", { href: "#/" }, "Go to Cardboard"));
+  }
+  const status = h("div");
+  const message = preview.message ? [h("p", { class: "small muted" }, `${preview.from}'s message for you:`), h("p", { class: "message" }, preview.message)] : null;
+
+  if (!preview.requestedAt) {
+    const ask = h("button", { type: "button", class: "danger" }, "Ask for access");
+    ask.addEventListener("click", () =>
+      withBusy(ask, async () => {
+        if (!confirm(`${preview.from} will be told on every one of their devices. Continue?`)) return;
+        try {
+          await requestEmergency({ url: ORIGIN, link: code });
+          renderEmergency(code);
+        } catch (err) {
+          status.replaceChildren(errorBox(err));
+        }
+      }),
+    );
+    return card(
+      h("p", {}, h("strong", {}, preview.from), " gave you this in case something happens to them."),
+      message,
+      h("p", {}, `If you ask for access, ${preview.from} is told on all their devices and has ${describeDuration(preview.waitMs)} to stop it. If they don't, you can open their Cardboard with this same link (keep it).`),
+      h("div", { class: "row" }, ask),
+      status,
+    );
+  }
+
+  if (!preview.open) {
+    return card(
+      h("p", {}, `You asked for access to ${preview.from}'s Cardboard ${ago(preview.requestedAt)}.`),
+      message,
+      h("p", {}, h("strong", {}, `You can open it from ${new Date(preview.readyAt).toLocaleString()}`), `, unless ${preview.from} stops it. Come back to this same link then.`),
+    );
+  }
+
+  if (await browserStore.load()) {
+    return card(
+      h("p", {}, `You can open ${preview.from}'s Cardboard now.`),
+      message,
+      h("p", { class: "error" }, "This browser is already signed in to a Cardboard. Open the link in another browser, or a new browser profile, to open theirs."),
+    );
+  }
+  const name = deviceNameField();
+  const go = h("button", { type: "button" }, `Open ${preview.from}'s Cardboard`);
+  go.addEventListener("click", () =>
+    withBusy(go, async () => {
+      try {
+        account = await claimEmergency({ ...getInOptions(name.value.trim()), link: code });
+        pendingEmergency = null;
+        history.replaceState(null, "", "#/");
+        await render();
+        const later = h("button", { type: "button", class: "secondary", onclick: () => closeModal() }, "Later");
+        const kit = h("button", { type: "button" }, "Make my recovery kit");
+        kit.addEventListener("click", () => withBusy(kit, async () => showRecovery(await account.setRecovery("kit"), render)));
+        openModal(
+          null,
+          h("h2", {}, `You're in ${preview.from}'s Cardboard`),
+          h("p", {}, "This browser is one of its devices now. Make a recovery kit, so you don't depend on this one browser to get back in."),
+          h("div", { class: "row" }, kit, later),
+        );
+      } catch (err) {
+        status.replaceChildren(errorBox(err));
+      }
+    }),
+  );
+  return card(
+    h("p", {}, h("strong", {}, `You can open ${preview.from}'s Cardboard now.`), " This browser becomes one of its devices, and the link stops working."),
+    message,
+    h("label", { class: "field" }, "What to call this browser", name),
+    h("div", { class: "row" }, go),
+    status,
+  );
+}
+
+/** You scanned the QR code a new device is showing: approve it here. */
+function renderApprovePair(code) {
+  nav.hidden = false;
+  const name = h("input", { placeholder: "e.g. Laptop", maxlength: 60 });
+  const status = h("div");
+  const no = h("button", { type: "button", class: "secondary" }, "Cancel");
+  no.addEventListener("click", () => {
+    pendingPair = null;
+    location.hash = "#/";
+  });
+  const form = h(
+    "form",
+    { class: "card stack login" },
+    h("h1", {}, "Add a new device?"),
+    h("p", {}, "This lets the device that showed you this code open your whole Cardboard. ", h("strong", {}, "Only continue if it's yours, it's in front of you, and you just asked it to pair.")),
+    h("p", { class: "muted small" }, "Did someone send you this code, or ask you to scan it? Then cancel: that's how people get tricked into letting strangers in."),
+    h("label", { class: "field" }, "What to call it", name),
+    h("div", { class: "row" }, h("button", { type: "submit" }, "Approve"), no),
+    status,
+  );
+  onSubmit(form, status, async () => {
+    await account.approveDevice(code, name.value.trim() || undefined);
+    pendingPair = null;
+    fill(app, h("section", { class: "card stack login" }, h("h1", {}, "Approved"), h("p", {}, "It's signing in now."), h("a", { href: "#/you" }, "See your devices")));
+  });
+  fill(app, form);
+}
+
+/** Invite a friend to make their own account here (when the host allows it). */
+async function inviteCard(me) {
+  if (me.server.invites !== "everyone") return null;
+  const { invites } = await account.invites();
+  const make = h("button", { type: "button" }, "Make an invite link");
+  make.addEventListener("click", () =>
+    withBusy(make, async () => {
+      try {
+        const { link, expiresAt } = await account.inviteFriend();
+        openModal(
+          render,
+          h("h2", {}, "Invite a friend"),
+          h("p", {}, "Send this, or let them scan it. It makes them their own account here, and works once."),
+          qrCode(link, "QR code of the invite link"),
+          h("code", { class: "secret" }, link),
+          sendButtons(link, "Join me on Cardboard"),
+          h("p", { class: "muted small" }, `Works until ${new Date(expiresAt).toLocaleString()}. Their account is theirs: you can't see into it, and they can't see into yours. Share a box with them afterwards.`),
+          h("div", { class: "row" }, h("button", { type: "button", onclick: () => closeModal() }, "Done")),
+        );
+      } catch (err) {
+        status.replaceChildren(errorBox(err));
+      }
+    }),
+  );
+  const status = h("div");
+  const waiting = invites.map((i) => {
+    const cancel = h("button", { type: "button", class: "secondary tiny" }, "Cancel");
+    cancel.addEventListener("click", () =>
+      withBusy(cancel, async () => {
+        await account.cancelInvite(i.id);
+        render();
+      }),
+    );
+    return h("li", { class: "row spread" }, h("div", { class: "muted small" }, `Invite made ${ago(i.createdAt)}, not used yet · works until ${new Date(i.expiresAt).toLocaleDateString()}`), cancel);
+  });
+  return h(
+    "section",
+    { class: "card stack" },
+    h("h2", {}, "Invite a friend"),
+    h("p", { class: "small" }, "Friends get their own Cardboard here, with their own keys. Then you can share boxes with each other."),
+    waiting.length ? h("ul", { class: "list" }, waiting) : null,
+    h("div", { class: "row" }, make),
+    status,
+  );
+}
+
 // ── Docks ───────────────────────────────────────────────────────────────────
 
 function direction(p) {
@@ -1396,7 +1690,7 @@ function assistantCard() {
 
 function connectCard(issuer) {
   const name = h("input", { placeholder: "My App", required: true });
-  const redirect = h("input", { placeholder: "https://myapp.example.com/callback", required: true });
+  const redirect = h("input", { placeholder: "https://myapp.example.com/callback, http://localhost:5173/callback", required: true });
   const server = h("input", { type: "checkbox", checked: true });
   const status = h("div");
   const form = h(
@@ -1409,7 +1703,7 @@ function connectCard(issuer) {
     status,
   );
   onSubmit(form, status, async () => {
-    const r = await account.registerApp({ name: name.value.trim(), redirectUris: [redirect.value.trim()], public: !server.checked });
+    const r = await account.registerApp({ name: name.value.trim(), redirectUris: redirect.value.split(/[\s,]+/).filter(Boolean), public: !server.checked });
     fill(
       status,
       h(
@@ -1714,6 +2008,7 @@ async function renderYou() {
 
   fill(app, 
     h("div", { class: "page-head" }, h("div", {}, h("h1", {}, "You"), h("div", { class: "muted small mono" }, me.id))),
+    emergencyAlerts(me),
     h(
       "div",
       { class: "two" },
@@ -1728,6 +2023,8 @@ async function renderYou() {
         "div",
         {},
         h("section", { class: "card stack" }, h("h2", {}, "If you lose every device"), h("p", { class: "small" }, "Pick how you'd get back in. Cardboard can't reset anything for you: that's what keeps everyone else out."), recovery),
+        await emergencyCard(),
+        await inviteCard(me),
         h("section", { class: "card stack danger-zone" }, h("h2", {}, "Delete account"), h("p", { class: "small" }, "Everything goes: boxes, history, tapes, docks, connected apps, devices."), h("div", { class: "row" }, confirmDelete, deleteBtn), deleteStatus),
       ),
     ),
@@ -1759,10 +2056,27 @@ function takeShareFromUrl() {
   history.replaceState(null, "", "#/join");
 }
 
+/** Emergency access (#emergency=<code>) and pairing (#pair=<code>) links, the same way. */
+function takeEmergencyAndPairFromUrl() {
+  const emergency = hashParam("emergency");
+  if (emergency) {
+    pendingEmergency = emergency;
+    history.replaceState(null, "", "#/emergency");
+  }
+  const pair = hashParam("pair");
+  if (pair) {
+    pendingPair = pair;
+    history.replaceState(null, "", "#/pair");
+  }
+}
+
 async function render() {
   closeModal(false);
   takeConnectFromUrl();
   takeShareFromUrl();
+  takeEmergencyAndPairFromUrl();
+  // Someone else's emergency link: it's about their Cardboard, whoever is signed in here.
+  if (pendingEmergency) return renderEmergency(pendingEmergency);
   if (!account) {
     if (await deviceLock(browserStore)) return renderLocked();
     try {
@@ -1783,6 +2097,7 @@ async function render() {
     return renderConnect(id);
   }
   if (pendingShare) return renderJoin(pendingShare);
+  if (pendingPair) return renderApprovePair(pendingPair);
   nav.hidden = false;
   const [, page, arg, key] = location.hash.split("/");
   for (const a of nav.querySelectorAll("a")) a.classList.toggle("active", a.getAttribute("href") === `#/${page && page !== "box" ? page : ""}`);
@@ -1807,6 +2122,8 @@ async function render() {
 window.addEventListener("hashchange", () => {
   if (!hashParam("connect")) pendingConnect = null;
   if (location.hash !== "#/join" && !hashParam("share")) pendingShare = null;
+  if (location.hash !== "#/emergency" && !hashParam("emergency")) pendingEmergency = null;
+  if (location.hash !== "#/pair" && !hashParam("pair")) pendingPair = null;
   render();
 });
 render();

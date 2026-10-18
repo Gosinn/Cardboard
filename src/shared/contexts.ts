@@ -5,7 +5,7 @@
  * never change.
  */
 export const ctx = {
-  accountKey: (via: "device" | "kit" | "friends" | "pairing" | "passkey") => `account-key|${via}`,
+  accountKey: (via: "device" | "kit" | "friends" | "pairing" | "passkey" | "emergency") => `account-key|${via}`,
   /** A passkey-locked device's envelope: the passkey-sealed account key, sealed again by the device's own key. */
   lockedEnvelope: "locked-envelope",
   /** A locked device's token, sealed by its passkey. Kept on that device only. */
@@ -38,4 +38,8 @@ export const ctx = {
   /** What a box's people call each other, sealed by the box key. */
   ownerLabel: (boxId: string) => `owner-label|${boxId}`,
   memberLabel: (boxId: string, memberId: string) => `member-label|${boxId}|${memberId}`,
+  /** Who an emergency access link is from, and their message, sealed by a key made from the link. */
+  emergencyNote: "emergency-note",
+  /** Your note on who an emergency access link is for, sealed by your meta key. */
+  emergencyLabel: "emergency-label",
 } as const;

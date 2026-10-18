@@ -68,6 +68,21 @@ describe("Sign in with Cardboard", () => {
     assert.deepEqual(userinfo, { sub: session.user.id }, "the server itself never had your name to give out");
   });
 
+  it("lets a website that signed you in use its box from its own pages, and no other website", async () => {
+    const { pending, callback } = await signIn(config);
+    const session = await finishSignIn(config, callback, pending);
+    const app = "http://localhost:5173";
+    const ok = await t.raw(session.accessToken, "whoami", {}, { origin: app });
+    assert.equal(ok.status, 200);
+    assert.equal(ok.headers.get("access-control-allow-origin"), app);
+    const evil = await t.raw(session.accessToken, "whoami", {}, { origin: "https://evil.example" });
+    assert.equal(evil.status, 403);
+    const preflight = await fetch(`${t.cb.url}/v1/put`, { method: "OPTIONS", headers: { origin: app, "access-control-request-method": "POST" } });
+    assert.equal(preflight.status, 204);
+    const stranger = await fetch(`${t.cb.url}/v1/put`, { method: "OPTIONS", headers: { origin: "https://evil.example", "access-control-request-method": "POST" } });
+    assert.equal(stranger.status, 403);
+  });
+
   it("relays only sealed bytes: nothing readable passes through the token endpoint", async () => {
     const pending = await startSignIn(config);
     const { id } = await requestId(pending.url);
@@ -103,6 +118,33 @@ describe("Sign in with Cardboard", () => {
     assert.equal(claims.aud, config.clientId);
     assert.equal(claims.nonce, pending.nonce);
     assert.equal(claims.name, undefined, "names never go into server-signed tokens for apps that take sealed data");
+  });
+
+  it("keeps a website's tabs in step: they share fresh tokens instead of tripping copied-token detection", async () => {
+    let stored: string | null = null;
+    const storage = { get: () => stored, set: (v: string) => void (stored = v) };
+    const shared = { ...config, storage };
+    const { pending, callback } = await signIn(shared);
+    const tabA = await finishSignIn(shared, callback, pending);
+    assert.ok(stored && JSON.parse(stored).refreshToken === tabA.refreshToken, "saved by itself");
+    const tabB = await resumeSession(shared);
+    assert.equal(tabB.accessToken, tabA.accessToken, "a new tab uses the saved access token: no refresh needed");
+    assert.equal(tabB.user.id, tabA.user.id);
+
+    await tabA.refresh();
+    assert.notEqual(tabB.refreshToken, tabA.refreshToken);
+    await tabB.refresh();
+    assert.equal(tabB.refreshToken, tabA.refreshToken, "tab B picked up tab A's tokens instead of reusing its old refresh token");
+    await tabB.box().put("tabs", { ok: true });
+    assert.deepEqual(await tabA.box().get("tabs"), { ok: true });
+    assert.ok(!(await t.me.me()).alarms.some((a) => /used twice/.test(a.text)), "no false alarm");
+
+    // An old save without access tokens (or a bare refresh token) still resumes.
+    const legacy = await resumeSession(config, JSON.stringify({ refreshToken: tabA.refreshToken, keys: JSON.parse(stored!).keys }));
+    assert.equal(legacy.user.id, tabA.user.id);
+    await tabA.signOut();
+    assert.equal(stored, "", "signing out forgets the saved session");
+    await assert.rejects(resumeSession(shared), (err: unknown) => err instanceof CardboardError && err.code === "not_signed_in");
   });
 
   it("remembers: the same private ID and the same box next time, and after a restart of the app", async () => {

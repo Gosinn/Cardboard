@@ -11,6 +11,7 @@ import { Accounts } from "./accounts.ts";
 import { Api, errorResponse, type ApiRequest } from "./api.ts";
 import { Audit } from "./audit.ts";
 import { Docks, type Parcel } from "./docks.ts";
+import { Emergency } from "./emergency.ts";
 import { Hub } from "./hub.ts";
 import { OAuth } from "./oauth.ts";
 import { createOAuthHandler } from "./oauth-http.ts";
@@ -34,6 +35,8 @@ export interface StartOptions {
   publicUrl?: string;
   /** Let anyone make an account (default: invite only). */
   openSignup?: boolean;
+  /** Who may make invite links: "everyone" with an account (default, up to 5 waiting each) or only the "host". */
+  invites?: "everyone" | "host";
   /** Storage per account unless the host sets it per person (default 1 GB). */
   accountQuotaBytes?: number;
   /** Run the shake test on startup (default true). */
@@ -103,7 +106,7 @@ export async function startServer(options: StartOptions = {}): Promise<RunningCa
   const hub = new Hub();
   const docks = new Docks(db, now, keys.subkey("dock-tags"));
   const host = options.host ?? process.env["CARDBOARD_HOST"] ?? "127.0.0.1";
-  const port = options.port ?? Number(process.env["CARDBOARD_PORT"] ?? 8787);
+  const port = options.port ?? Number(process.env["CARDBOARD_PORT"] ?? process.env["PORT"] ?? 8787);
   const info: ServerInfo = {
     version: VERSION,
     dataDir: paths.dataDir,
@@ -116,12 +119,14 @@ export async function startServer(options: StartOptions = {}): Promise<RunningCa
     publicUrl: "",
     startedAt: now(),
     signup: options.openSignup || process.env["CARDBOARD_OPEN_SIGNUP"] === "1" ? "open" : "invite",
+    invites: (options.invites ?? process.env["CARDBOARD_INVITES"]) === "host" ? "host" : "everyone",
   };
   const oauth = new OAuth(db, vault, tapes, keys, () => info.publicUrl);
   const sharing = new Sharing(db, vault, now);
+  const emergency = new Emergency(db, now);
   const backupEvery = options.backupEveryMs !== undefined ? options.backupEveryMs : process.env["CARDBOARD_BACKUP_EVERY"];
   const backupEveryMs = typeof backupEvery === "string" ? (backupEvery === "never" ? null : parseDuration(backupEvery)) : (backupEvery ?? null);
-  const api = new Api({ db, accounts, vault, tapes, audit, hub, docks, oauth, sharing, info });
+  const api = new Api({ db, accounts, vault, tapes, audit, hub, docks, oauth, sharing, emergency, info });
   const oauthHandler = createOAuthHandler({ oauth, api, ip: (req) => clientIp(req, info.trustProxy) });
   const statics = loadStatics();
   const modules = new Map<string, Buffer | null>();

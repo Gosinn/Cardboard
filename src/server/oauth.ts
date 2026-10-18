@@ -305,6 +305,21 @@ export class OAuth {
     return row && toClient(row);
   }
 
+  /**
+   * The websites an app signs people in from (the origins of its redirect
+   * URIs). A website that signed you in may call its box from the browser
+   * without you adding it to the box's allowed origins.
+   */
+  clientOrigins(clientId: string): string[] {
+    return originsOf(this.client(clientId)?.redirectUris ?? []);
+  }
+
+  /** Whether any app signs people in from this website (for browsers' CORS preflight, which carries no token). */
+  isClientOrigin(origin: string): boolean {
+    const rows = this.db.prepare("SELECT redirect_uris FROM oauth_clients WHERE redirect_uris LIKE ?").all(`%${origin.replace(/[%_]/g, "")}%`) as Array<{ redirect_uris: string }>;
+    return rows.some((r) => originsOf(JSON.parse(r.redirect_uris) as string[]).includes(origin));
+  }
+
   /** Apps this account added by hand. */
   clientsOf(accountId: string): Client[] {
     return (this.db.prepare("SELECT * FROM oauth_clients WHERE registered_by = ? ORDER BY created_at DESC").all(accountId) as unknown as ClientRow[]).map(toClient);
@@ -684,6 +699,19 @@ export function isAllowedRedirect(uri: string): boolean {
   if (url.protocol === "https:") return true;
   if (url.protocol === "http:") return ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
   return /^[a-z][a-z0-9+-]*(\.[a-z0-9+-]+)+:$/.test(url.protocol);
+}
+
+function originsOf(uris: string[]): string[] {
+  const out = new Set<string>();
+  for (const uri of uris) {
+    try {
+      const url = new URL(uri);
+      if (url.protocol === "https:" || url.protocol === "http:") out.add(url.origin);
+    } catch {
+      // App schemes (com.example.app:/callback) aren't websites.
+    }
+  }
+  return [...out];
 }
 
 function toClient(row: ClientRow): Client {

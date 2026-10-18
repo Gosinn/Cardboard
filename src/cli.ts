@@ -5,11 +5,12 @@ import { basename, join, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { parseArgs } from "node:util";
 import { CardboardError } from "./shared/errors.ts";
-import { parseDuration, relativeTime } from "./shared/duration.ts";
+import { describeDuration, parseDuration, relativeTime } from "./shared/duration.ts";
 import { planName } from "./shared/activity.ts";
 import { formatBytes } from "./shared/size.ts";
 import { VERSION } from "./shared/version.ts";
 import type { Insight } from "./shared/insights.ts";
+import { qrEncode, qrTerminal } from "./shared/qr.ts";
 import { cleanInvite, recoverWithFriends, recoverWithKit, signUp, startPairing, unlock, type Account } from "./client/account.ts";
 import { Rpc } from "./client/rpc.ts";
 import { configDir, FileStore, writePrivate } from "./node/store.ts";
@@ -86,6 +87,15 @@ whoever runs the server can't read what's in it.
     cardboard join <link> [--as "Anna"]     Join a box someone shared with you
     cardboard people remove <box> <name>    Take someone off a box (their apps are cut off too)
     cardboard leave <box>                   Leave a box someone shared with you
+    cardboard invite [--expires 7d]         An invite link (and QR code) for a friend to join this Cardboard
+    cardboard invite list | cancel <id>
+
+  If something happens to you
+    cardboard emergency add --for Anna [--wait 7d] [--message "…"] [--as "Gosinn"]
+                                            A link (and QR code) for someone you trust. If they use it,
+                                            you're warned everywhere; unless you stop it, they get in after the wait
+    cardboard emergency                     Your emergency links, and whether anyone is using one
+    cardboard emergency stop|allow|remove <name>
 
   Boxes
     cardboard set <box> <setting> <value>   e.g. secrets block · defaultTtl 30d · quotaBytes 1GB
@@ -110,8 +120,9 @@ whoever runs the server can't read what's in it.
                       --tls-cert <file> --tls-key <file>  --trust-proxy  --open-signup
                       --public-url https://cardboard.example.com   (where people and apps reach you)
                       --backup-every 1d   (snapshots in <data>/backups, newest 10 kept)
+                      --invites host      (only the host makes invites; default: everyone can invite friends)
   The same as environment variables: CARDBOARD_PORT, CARDBOARD_HOST, CARDBOARD_DATA, CARDBOARD_PUBLIC_URL,
-                      CARDBOARD_TRUST_PROXY=1, CARDBOARD_OPEN_SIGNUP=1, CARDBOARD_BACKUP_EVERY=1d
+                      CARDBOARD_TRUST_PROXY=1, CARDBOARD_OPEN_SIGNUP=1, CARDBOARD_BACKUP_EVERY=1d, CARDBOARD_INVITES=host
 `;
 
 interface HostCredentials {
@@ -182,6 +193,15 @@ function printKit(kit: string) {
   console.log(dim("  Prefer another way? cardboard recovery device|friends|none"));
 }
 
+/** A link as a QR code a phone camera can scan (only on a real terminal; --no-qr leaves it out). */
+function printQr(link: string, show: boolean) {
+  if (!show || !process.stdout.isTTY) return;
+  console.log(`\n${qrTerminal(qrEncode(link))
+    .split("\n")
+    .map((line) => `  ${line}`)
+    .join("\n")}\n`);
+}
+
 function printInsights(insights: Insight[]) {
   if (insights.length === 0) return console.log("✓ Nothing to fix. Everything looks good.");
   for (const i of insights) {
@@ -215,6 +235,7 @@ async function main() {
       "open-signup": { type: "boolean" },
       "public-url": { type: "string" },
       "backup-every": { type: "string" },
+      invites: { type: "string" },
       url: { type: "string" },
       dir: { type: "string" },
       force: { type: "boolean" },
@@ -242,6 +263,9 @@ async function main() {
       "no-own": { type: "boolean" },
       note: { type: "string" },
       for: { type: "string" },
+      message: { type: "string" },
+      wait: { type: "string" },
+      "no-qr": { type: "boolean" },
       ttl: { type: "string" },
       json: { type: "boolean" },
       help: { type: "boolean", short: "h" },
@@ -267,6 +291,7 @@ async function main() {
         trustProxy: values["trust-proxy"],
         publicUrl: values["public-url"],
         openSignup: values["open-signup"],
+        invites: values.invites === "host" || values.invites === "everyone" ? values.invites : undefined,
         backupEveryMs: values["backup-every"] ? (values["backup-every"] === "never" ? null : parseDuration(values["backup-every"])) : undefined,
       }).catch((err: NodeJS.ErrnoException) => {
         if (err.code === "EADDRINUSE") die(`Port ${values.port ?? 8787} is already in use.`, "Is Cardboard already running? Or pick another port with --port 8788.");
@@ -324,11 +349,13 @@ async function main() {
       const target = args[0];
       if (target && !/^https?:\/\//.test(target)) die("pair takes the address of your Cardboard.", `On the new device: cardboard pair https://… · To approve a code here: cardboard devices add ${target}`);
       if (await store.load()) die("This computer is already signed in.", "To approve another device, run: cardboard devices add <code>");
-      const pending = await startPairing({ url: (target ?? defaultUrl()).replace(/\/+$/, ""), store, kind: "cli", label: values.name ?? deviceLabel() });
-      console.log(`\n  Pairing code:  ${bold(pending.code)}\n`);
-      console.log("  On a device that's already signed in, run:");
+      const base = (target ?? defaultUrl()).replace(/\/+$/, "");
+      const pending = await startPairing({ url: base, store, kind: "cli", label: values.name ?? deviceLabel() });
+      console.log(`\n  Pairing code:  ${bold(pending.code)}`);
+      printQr(`${base}/#pair=${pending.code}`, !values["no-qr"]);
+      console.log("  Scan it with your phone (signed in to Cardboard), or on a device that's already signed in, run:");
       console.log(`    cardboard devices add ${pending.code}`);
-      console.log(dim("  or open Devices in your dashboard and type it in. Waiting (10 minutes)…"));
+      console.log(dim("  or open You → Add a device in your dashboard and type it in. Waiting (10 minutes)…"));
       const acct = await pending.wait();
       console.log(`\n  ✓ This computer is signed in (${acct.id}).\n`);
       return;
@@ -773,8 +800,9 @@ async function main() {
       const forWhom = values.for ?? values.label;
       const { link, expiresAt } = await acct.shareBox(name, { write: !values["read-only"], label: forWhom, as: values.as, expires: values.expires });
       console.log(`\nSend this to ${forWhom ?? "them"} privately (Signal, iMessage, in person). It works once, until ${new Date(expiresAt).toLocaleString()}:\n`);
-      console.log(`  ${bold(link)}\n`);
-      console.log(dim("They open it with their own Cardboard on this server, or run: cardboard join <link>"));
+      console.log(`  ${bold(link)}`);
+      printQr(link, !values["no-qr"]);
+      console.log(dim("They open it (or scan it) with their own Cardboard on this server, or run: cardboard join <link>"));
       console.log(dim("The secret is after the #, so it never reaches the server. Whoever opens it first gets in."));
       console.log(dim(values["read-only"] ? "They'll be able to read it, not change it." : "They'll be able to read and change it (add --read-only to stop that)."));
       return;
@@ -824,6 +852,65 @@ async function main() {
       await confirm(`Leave ${boxName}? You'd need a new link to come back.\nType the box name to confirm: `, boxName, values.yes);
       await acct.leaveBox(boxName);
       return console.log(`You left ${boxName}.`);
+    }
+
+    // ── If something happens to you ──────────────────────────────────────
+
+    case "emergency": {
+      const acct = await account();
+      const sub = args[0];
+      if (!sub || sub === "list") {
+        const links = await acct.emergencyLinks();
+        if (links.length === 0) return console.log("No emergency access yet. Give someone you trust a way in: cardboard emergency add --for Anna");
+        for (const l of links) {
+          const status = l.readyAt ? `${bold("being used")}: they get in ${new Date(l.readyAt).toLocaleString()} unless you stop it (cardboard emergency stop ${l.label ?? l.id})` : dim(`waits ${describeDuration(l.waitMs)} · made ${relativeTime(l.createdAt, Date.now())}`);
+          console.log(`${l.label ?? l.id}  ${status}`);
+        }
+        return;
+      }
+      if (sub === "add") {
+        const { link, info } = await acct.addEmergencyLink({ label: values.for, as: values.as, message: values.message, wait: values.wait });
+        console.log(`\nGive this to ${values.for ?? "the person you trust"}: print it, or put it in their password manager.\n`);
+        console.log(`  ${bold(link)}`);
+        printQr(link, !values["no-qr"]);
+        console.log(dim(`If they ever open it and ask for access, every one of your devices is told. Unless you stop it, they get in after ${describeDuration(info.waitMs)}.`));
+        console.log(dim("The secret is after the #, so the server can't use it. Keep it as safe as a house key."));
+        return;
+      }
+      const which = need(args[1], `Which one? cardboard emergency ${sub} <name>`);
+      if (sub === "stop") {
+        await acct.stopEmergency(which);
+        return console.log("Stopped. Nobody gets in. (The link still works: if it's used again, you'll hear about it. Remove it with: cardboard emergency remove.)");
+      }
+      if (sub === "allow") {
+        await acct.allowEmergency(which);
+        return console.log("Done: they can get in now.");
+      }
+      if (sub === "remove") {
+        await acct.removeEmergency(which);
+        return console.log("Removed. That link doesn't work any more.");
+      }
+      return die(`Unknown: emergency ${sub}`, "Try: cardboard emergency [add|stop|allow|remove]");
+    }
+
+    case "invite": {
+      const acct = await account();
+      if (args[0] === "cancel") {
+        await acct.cancelInvite(need(args[1], "Which one? cardboard invite list shows them"));
+        return console.log("Cancelled.");
+      }
+      if (args[0] === "list") {
+        const { invites } = await acct.invites();
+        if (invites.length === 0) return console.log("No invites waiting to be used.");
+        for (const i of invites) console.log(`${i.id}  ${dim(`made ${relativeTime(i.createdAt, Date.now())} · works until ${new Date(i.expiresAt).toLocaleString()}`)}`);
+        return;
+      }
+      const { link, expiresAt } = await acct.inviteFriend({ expires: values.expires });
+      console.log(`\nAn invite for a friend to make their own Cardboard account here. It works once, until ${new Date(expiresAt).toLocaleString()}:\n`);
+      console.log(`  ${bold(link)}`);
+      printQr(link, !values["no-qr"]);
+      console.log(dim("Their account is theirs alone: you can't see into it, and they can't see into yours. Share a box with them afterwards: cardboard share <box>"));
+      return;
     }
 
     case "set": {

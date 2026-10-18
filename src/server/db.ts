@@ -306,6 +306,30 @@ const MIGRATIONS: string[] = [
   );
   CREATE INDEX members_account ON members(account_id);
   `,
+  `
+  -- Emergency access: a link you give someone you trust. If they use it, every
+  -- one of your devices is told, and after wait_ms (unless you stop it, or say
+  -- yes sooner) they can open your Cardboard. The link's secret never reaches
+  -- the server: envelope (the account key) and note (who it's from, and your
+  -- message) are sealed by keys made from it, lookup is a hash of another.
+  -- label is your own note on who it's for, sealed by your meta key.
+  CREATE TABLE emergency (
+    id           TEXT PRIMARY KEY,
+    account_id   TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    lookup       BLOB NOT NULL UNIQUE,
+    envelope     BLOB NOT NULL,
+    note         BLOB NOT NULL,
+    label        BLOB,
+    wait_ms      INTEGER NOT NULL,
+    created_at   INTEGER NOT NULL,
+    requested_at INTEGER,
+    approved_at  INTEGER
+  );
+  CREATE INDEX emergency_account ON emergency(account_id);
+
+  -- Who made an invite: an account (when the host lets people invite friends), or NULL for the host.
+  ALTER TABLE invites ADD COLUMN created_by TEXT;
+  `,
 ];
 
 export function openDb(path: string): DB {

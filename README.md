@@ -4,7 +4,7 @@
 
 Every app you build gets its own **box**. Apps open their box with a **tape**. Everything is sealed on your devices and inside your apps before it leaves them, so the Cardboard server only ever stores bytes it can't open: not your data, not your key names, not even your box names. Cardboard still remembers every version, tells you in plain English who touched what, and attacks itself to prove the locks hold.
 
-It's one small Node server with **zero runtime dependencies** and a single SQLite file, so it runs on a laptop, a Raspberry Pi, or a $5 VPS, for you alone or for your family and friends: each person has their own keys, can lock their phone's copy with **Face ID**, and can **share a box** with someone else (a family shopping list, a shared trip) without the server ever seeing inside.
+It's one small Node server with **zero runtime dependencies** and a single SQLite file, so it runs on a laptop, a Raspberry Pi, or a $5 VPS, for you alone or for your family and friends: each person has their own keys, can lock their phone's copy with **Face ID**, can **share a box** with someone else (a family shopping list, a shared trip) without the server ever seeing inside, and can leave **emergency access** for someone they trust.
 
 ```ts
 import { open } from "cardboard";
@@ -44,7 +44,7 @@ That's the whole setup. `open()` reads `.env` by itself. (Don't use `npx cardboa
 
 > Requires Node 22.18+. To use the SDK from another project: `npm install github:gosinn/cardboard`.
 >
-> Putting it on a server for real (HTTPS, backups, your family's phones)? `docker compose up -d` does it: see [docs/DEPLOY.md](docs/DEPLOY.md).
+> Putting it on a server for real (HTTPS, backups, your family's phones)? Railway in a browser, or `docker compose up -d` on your own server: see [docs/DEPLOY.md](docs/DEPLOY.md). Connecting a website like LORE: [docs/APPS.md](docs/APPS.md).
 
 ---
 
@@ -72,7 +72,7 @@ So the smart parts moved to where your keys are. Search, the sensitive-data rada
 
 There are no passwords to forget or leak. **Each device is signed in with its own key.**
 
-- **A new device:** on it, choose *Use a device I have* (or run `cardboard pair <url>`). It shows a code like `K7Q2M-9XMA2-R7G08`. Type it on a device you already have (*You → Devices → Add a device*, or `cardboard devices add <code>`). The code never reaches the server, and it's what lets your device check it's sealing your account key to the right device, so not even a malicious server can slip its own device in.
+- **A new device:** on it, choose *Use a device I have* (or run `cardboard pair <url>`). It shows a QR code and a code like `K7Q2M-9XMA2-R7G08`. Scan the QR code with your phone's camera, or type the code on a device you already have (*You → Devices → Add a device*, or `cardboard devices add <code>`). The code never reaches the server, and it's what lets your device check it's sealing your account key to the right device, so not even a malicious server can slip its own device in.
 - **Lost a device?** Remove it from any other (`cardboard devices remove <id>`). Its token stops working and its sealed copy of your account key is deleted.
 
 **If you lose every device**, you choose how you get back in (*You → If you lose every device*, or `cardboard recovery`):
@@ -160,9 +160,17 @@ Plain OpenID Connect apps (without the Cardboard SDK) work too: they get your pr
 
 Under the hood it follows OAuth 2.1: PKCE is required, redirect URIs must match exactly, codes work once (a replayed code revokes what it produced), refresh tokens rotate (a copied one disconnects the app), ID tokens are ES256-signed, and the issuer is sent back with every response. The shake test attacks all of it.
 
+### If something happens to you
+
+*You → If something happens to you* (or `cardboard emergency add --for Anna`) makes a link, with a QR code you can print, for someone you trust. Add a message for them if you like ("the house papers are in the documents box"); only they can read it.
+
+If they ever open it and choose *Ask for access*, every one of your devices shows a red warning, and a waiting period starts (7 days unless you pick otherwise). **Stop it**, and nothing happens. **Let them in now**, and they're in. Do nothing (because you can't), and when the wait is over they open your Cardboard with the same link: their browser becomes one of your devices, and the link is used up.
+
+The account key is sealed by a key only the link can make, and the link's secret never reaches the server. The server keeps the clock. That means a server you don't trust could cut the wait short for whoever holds the link, but it still couldn't get in itself.
+
 ## Sharing a box with people
 
-A box can belong to more than one person: the family shopping list, a shared trip, a couple's budget. On the box's page, *People → Share with someone* (or `cardboard share shopping --for Anna`) makes a link like `https://cardboard.example.com/#share=K7Q2-…`. Send it privately; the person opens it with their own Cardboard account on the same server, says what to call them, and they're in. Their apps can use the box too, and when they *Sign in with Cardboard* to an app, they can pick the shared box so you both see the same data, live.
+A box can belong to more than one person: the family shopping list, a shared trip, a couple's budget. On the box's page, *People → Share with someone* (or `cardboard share shopping --for Anna`) makes a link like `https://cardboard.example.com/#share=K7Q2-…`, with a QR code. Send it privately, or let them scan it; the person opens it with their own Cardboard account on the same server, says what to call them, and they're in. No account yet? *You → Invite a friend* makes one an invite link (the host can turn that off). Their apps can use the box too, and when they *Sign in with Cardboard* to an app, they can pick the shared box so you both see the same data, live.
 
 - **The server never gets the key.** The link's secret is after the `#`, which browsers never send anywhere. A key made from it seals the box key for whoever opens it; they re-seal it with their own account key, and the link is used up. One use, then it's gone (3 days by default, 30 at most), and you can cancel it before then.
 - **Read-only or read-and-change.** A read-only person can't write from their devices or from any tape they make.
@@ -198,7 +206,7 @@ Hosted AI connectors (like adding a URL in Claude on the web) would need the ser
 - **Only hashes of tokens are stored.** Guessing is rate-limited, per address.
 - **Crypto-shredding.** `shred` deletes a box's sealed key with everything else, overwriting the freed pages (`secure_delete`) and truncating the WAL. Old backups still hold the sealed bytes, but nothing can open them.
 - **Expired means gone.** When an item expires, its history goes with it.
-- **The shake test.** On every start, Cardboard attacks itself through its real API *and* its real client code, with throwaway accounts: it scans its own database for a canary it just wrote (the server can't read anyone's data), tries cross-box and cross-account reads, revoked and expired tapes, foreign websites, tampering and swapping, a swapped pairing key, wrong recovery codes, a stolen Face-ID-locked device, reused share links and people taken off a box, a hostile app smuggling a booby-trapped parcel past its own customs, and every Sign in with Cardboard trick. It reports what held (`cardboard host shake`, and the *Security* page for everyone).
+- **The shake test.** On every start, Cardboard attacks itself through its real API *and* its real client code, with throwaway accounts: it scans its own database for a canary it just wrote (the server can't read anyone's data), tries cross-box and cross-account reads, revoked and expired tapes, foreign websites, tampering and swapping, a swapped pairing key, wrong recovery codes, a stolen Face-ID-locked device, reused share links and people taken off a box, emergency access before its wait is over, a hostile app smuggling a booby-trapped parcel past its own customs, and every Sign in with Cardboard trick. It reports what held (`cardboard host shake`, and the *Security* page for everyone).
 
 ### Honest threat model
 
@@ -207,6 +215,7 @@ Cardboard **protects you against:**
 - one leaky app (it only holds its own box's key, can be revoked in one click, and shows you its blast radius)
 - a stolen device (lock it with Face ID, and remove it from any other: its copy of your account key is deleted)
 - a share link someone reads after it was used (it works once)
+- someone finding your emergency access link (you're warned on every device and can stop it)
 - a buggy app wrecking its data (history, undo, rewind)
 - tampering with stored data (caught when it's opened)
 
@@ -245,6 +254,8 @@ cardboard profile --name "…" --email …   sealed; apps get it only if you say
 cardboard assistant add <name> [--see a,b] [--change c] | assistant list | assistant remove <name> | mcp <name>
 cardboard share <box> [--for Anna] [--read-only] [--expires 3d] | shares | share cancel <link-id>
 cardboard join <link> [--as "Anna"] | people remove <box> <name> | leave <box>
+cardboard invite [list|cancel <id>]       an invite link (and QR code) for a friend
+cardboard emergency add --for Anna [--wait 7d] [--message "…"] | emergency | emergency stop|allow|remove <name>
 cardboard signout | delete-account
 
 cardboard host [invite|invites|accounts|delete|quota|shake|backup|log|login]   running the server
@@ -267,11 +278,11 @@ cardboard reset-host                    new host token (on the server)
 | `collection(name)` | `add`, `get`, `set`, `update`, `remove`, `find`, `findOne`, `count`, `all`, `watch` with time-ordered ids |
 | `dock(name)` | `send(body, { to })`, `reply(parcel, body)`, `receive({ ack })`, `ack(parcel)`, `status()`, `on(handler, { onWaiting, onRefused })` |
 | `introduce({ title, description, url, version })` | tell Cardboard who this app is (sealed) |
-| `registerApp`, `startSignIn`, `finishSignIn`, `resumeSession` | Sign in with Cardboard from any app (Node or browser) |
+| `registerApp`, `startSignIn`, `finishSignIn`, `resumeSession` | Sign in with Cardboard from any app (Node or browser). Pass `storage` (e.g. localStorage) and the session saves itself after every refresh, shared by all your tabs. See [docs/APPS.md](docs/APPS.md) |
 
 Errors are `CardboardError`s with a `code`, a plain message and a `hint`. Everything runs in Node and in browsers (WebCrypto), with zero dependencies. Querying opens every item under the prefix, which is fine at personal scale (tens of thousands of items).
 
-**Your own tools:** `cardboard/account` is the library the CLI and dashboard are built on: `signUp`, `unlock`, `startPairing`, `recoverWithKit`, and an `Account` with boxes, tapes, docks, apps, sharing (`shareBox`, `joinShare`, `removeMember`, `leaveBox`), Face ID locks (`lockWithPasskey`, `removeLock`), the log, insights and search, all opened on the device.
+**Your own tools:** `cardboard/account` is the library the CLI and dashboard are built on: `signUp`, `unlock`, `startPairing`, `recoverWithKit`, and an `Account` with boxes, tapes, docks, apps, sharing (`shareBox`, `joinShare`, `removeMember`, `leaveBox`), Face ID locks (`lockWithPasskey`, `removeLock`), emergency access (`addEmergencyLink`, `stopEmergency`, and `viewEmergency`/`requestEmergency`/`claimEmergency` for the person holding the link), friend invites, the log, insights and search, all opened on the device.
 
 ## The wire
 
@@ -279,7 +290,7 @@ Every call is `POST /v1/<operation>` with a JSON body. The token decides who you
 
 ## Running it for real (the host)
 
-The easy way is Docker with Caddy in front for HTTPS, on any small VPS: **[docs/DEPLOY.md](docs/DEPLOY.md)** walks through it in about ten minutes.
+**[docs/DEPLOY.md](docs/DEPLOY.md)** walks through it in about ten minutes: on Railway from your browser (nothing to look after), or with Docker and Caddy (automatic HTTPS) on any small server.
 
 ```bash
 echo CARDBOARD_DOMAIN=cardboard.example.com > .env
@@ -305,7 +316,7 @@ Coming from Cardboard 0.1 (keys on the server)? 0.2 and later start from a new d
 ## Roadmap
 
 - **Key rotation**: a fresh account key, box key or dock key after you remove a device, an app or a person
-- **When you're gone**: someone you trust can ask for your Cardboard (or parts of it); it opens for them only after a waiting period you can cancel from any of your devices
+- **Emergency access for parts of your Cardboard** (chosen boxes only), and warnings by email or push, not just on your devices
 - **Signed dashboard releases**, so a turned server can't quietly serve you different code
 - **Courier**: Cardboard holds your third-party API keys and makes calls for your apps, so apps never see the keys
 - **Files** next to JSON, offline sync, a Python SDK

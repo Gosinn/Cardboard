@@ -19,6 +19,8 @@ export interface ServerInfo {
   startedAt: number;
   publicUrl: string;
   signup: "invite" | "open";
+  /** Who may make invite links: everyone with an account here, or only the host. */
+  invites: "everyone" | "host";
 }
 
 export interface HostInsightInput {

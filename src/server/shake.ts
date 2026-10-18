@@ -2,8 +2,8 @@ import { createHash, randomBytes } from "node:crypto";
 import { readFileSync, statSync } from "node:fs";
 import { CardboardError } from "../shared/errors.ts";
 import { ctx } from "../shared/contexts.ts";
-import { signUp, recoverWithKit, startPairing, unlock, type Account } from "../client/account.ts";
-import { fromB64u, keyPair, open, openWith, random, sealJson, toB64u, utf8 } from "../client/crypto.ts";
+import { claimEmergency, requestEmergency, signUp, recoverWithKit, startPairing, unlock, viewEmergency, type Account } from "../client/account.ts";
+import { fromB64u, keyPair, open, openWith, random, sealJson, toB64u, toCode, utf8 } from "../client/crypto.ts";
 import { MemoryStore } from "../client/device.ts";
 import { dockIndex, dockKeys, newClientId, readBundle } from "../client/keys.ts";
 import { Box } from "../sdk/index.ts";
@@ -283,6 +283,25 @@ export async function runShake(api: Api): Promise<ShakeReport> {
       return oldTokenDead && noToken && !deviceKeyAlone && withoutFace && wrongFace && rightFace
         ? pass("A device locked with a passkey kept no usable token; its old token stopped working; its key alone opened nothing, and neither did a wrong passkey. Only the right one did.")
         : failed("A locked device could be opened without its passkey.");
+    });
+
+    await check("emergency-wait", "Emergency access waits, and can be stopped", async () => {
+      const { link } = await me.addEmergencyLink({ label: canary, message: canary, wait: "1d" });
+      const sealed = !dbBytes().includes(Buffer.from(canary));
+      const heir = () => claimEmergency({ url, link, store: new MemoryStore(), kind: "other", fetch: inProcess });
+      await requestEmergency({ url, link, fetch: inProcess });
+      const early = await rejects(heir, "emergency_waiting");
+      await me.stopEmergency(canary);
+      const stopped = await rejects(heir, "not_requested");
+      const guessed = await rejects(() => viewEmergency({ url, link: toCode(random(16)), fetch: inProcess }), "no_such_emergency_link");
+      await requestEmergency({ url, link, fetch: inProcess });
+      await me.allowEmergency(canary);
+      const allowed = (await heir()).id === me.id;
+      const usedUp = await rejects(heir, "no_such_emergency_link");
+      api.limiter.reset(PROBE_IP);
+      return sealed && early && stopped && guessed && allowed && usedUp
+        ? pass("Its message and the account key were sealed past the server; someone with the link couldn't get in during the wait, nor after it was stopped; a made-up link found nothing; once allowed it worked exactly once.")
+        : failed("Emergency access let someone in before the wait was over, after it was stopped, or twice.");
     });
 
     // ── Sharing between people ──

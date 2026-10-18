@@ -6,13 +6,15 @@ import { ctx } from "../shared/contexts.ts";
 import { DEVICE_KINDS, DEVICE_LOCKS, RECOVERY_PLANS, type Account, type Accounts, type Device, type DeviceKind, type DeviceLock, type RecoveryPlan } from "./accounts.ts";
 import type { Audit, LogInput, Outcome } from "./audit.ts";
 import { newId, sameBytes, sha256 } from "./crypto.ts";
-import { getMeta, setMeta, type DB } from "./db.ts";
+import { getMeta, setMeta, transaction, type DB } from "./db.ts";
 import type { Berth, Dock, Docks } from "./docks.ts";
 import type { Hub } from "./hub.ts";
 import { hostInsights, type ServerInfo } from "./insights.ts";
 import { OAuthError, type OAuth } from "./oauth.ts";
 import { runShake, type ShakeReport } from "./shake.ts";
 import { noShare, type Member, type Sharing } from "./sharing.ts";
+import type { Emergency, EmergencyLink } from "./emergency.ts";
+import { describeDuration } from "../shared/duration.ts";
 import { tapeView, type Tape, type Tapes } from "./tapes.ts";
 import type { Box, Sealed, StoredItem, Vault } from "./vault.ts";
 import {
@@ -75,6 +77,7 @@ export interface Context {
   docks: Docks;
   oauth: OAuth;
   sharing: Sharing;
+  emergency: Emergency;
   info: ServerInfo;
 }
 
@@ -270,7 +273,10 @@ export class Api {
     }
     let cors: Record<string, string> = {};
     if (req.origin) {
-      if (!box.settings.origins.includes(req.origin)) {
+      // A website that signed you in (Sign in with Cardboard) may use its box from its own pages.
+      const grant = tape.grantId ? this.ctx.oauth.grant(tape.grantId) : undefined;
+      const fromApp = grant ? this.ctx.oauth.clientOrigins(grant.clientId).includes(req.origin) : false;
+      if (!fromApp && !box.settings.origins.includes(req.origin)) {
         this.log(req, { accountId: box.accountId, boxId: box.id, actor, action: "auth", outcome: "denied", note: `${req.origin} isn't an allowed origin` });
         throw fail(
           "origin_not_allowed",
@@ -305,10 +311,10 @@ export class Api {
     }
   }
 
-  /** Browsers ask before cross-origin calls. Say yes only to origins some box allows. */
+  /** Browsers ask before cross-origin calls. Say yes only to origins some box (or some app's sign-in page) allows. */
   preflightAllowed(origin: string): boolean {
     const rows = this.ctx.db.prepare("SELECT settings FROM boxes WHERE settings LIKE ?").all(`%${JSON.stringify(origin).slice(1, -1)}%`) as Array<{ settings: string }>;
-    return rows.some((r) => (JSON.parse(r.settings) as { origins?: string[] }).origins?.includes(origin) ?? false);
+    return rows.some((r) => (JSON.parse(r.settings) as { origins?: string[] }).origins?.includes(origin) ?? false) || this.ctx.oauth.isClientOrigin(origin);
   }
 
   // ── Dispatch ─────────────────────────────────────────────────────────────
@@ -589,6 +595,43 @@ export class Api {
         return { accountId: found.account.id, deviceId: found.device.id, envelope: b64(found.envelope) };
       },
 
+      // ── Emergency access, from the side of the person holding the link (they may have no account here) ──
+
+      "emergency.view": (body, req) => {
+        const link = this.emergencyLink(body, req);
+        return { note: b64(link.note), waitMs: link.waitMs, requestedAt: link.requestedAt, readyAt: this.ctx.emergency.readyAt(link), open: this.ctx.emergency.isOpen(link) };
+      },
+
+      "emergency.request": (body, req) => {
+        const before = this.emergencyLink(body, req);
+        const link = this.ctx.emergency.request(before);
+        if (before.requestedAt === null) {
+          this.log(req, {
+            accountId: link.accountId,
+            actor: "anonymous",
+            action: "alarm",
+            outcome: "denied",
+            note: `Someone used an emergency access link to your Cardboard. Unless you stop it (on your You page), they get in after ${describeDuration(link.waitMs)}`,
+          });
+        }
+        return { requestedAt: link.requestedAt, readyAt: this.ctx.emergency.readyAt(link), open: this.ctx.emergency.isOpen(link) };
+      },
+
+      "emergency.claim": (body, req) => {
+        const link = this.emergencyLink(body, req);
+        if (link.requestedAt === null) throw fail("not_requested", 409, "Ask for access first: that starts the waiting period.", "Open the link and choose “Ask for access”.");
+        if (!this.ctx.emergency.isOpen(link)) {
+          throw fail("emergency_waiting", 403, `Not yet: you can get in from ${new Date(this.ctx.emergency.readyAt(link)!).toISOString()}.`, "The owner has been told. They can stop it, or let you in sooner.");
+        }
+        const device = transaction(this.ctx.db, () => {
+          const added = accounts.addDeviceFor(link.accountId, newDevice(body["device"]));
+          this.ctx.emergency.remove(link.id);
+          return added;
+        });
+        this.log(req, { accountId: link.accountId, actor: `device:${device.id}`, action: "alarm", outcome: "denied", note: "Your emergency access was used: a new device signed in to your Cardboard" });
+        return { accountId: link.accountId, deviceId: device.id, envelope: b64(link.envelope) };
+      },
+
       // A sign-in can always be turned down, even from a browser with no Cardboard device.
       "oauth.cancel": (body) => {
         const id = requireString(body, "id", 64);
@@ -760,7 +803,15 @@ export class Api {
             current: d.id === a.device.id,
           })),
           alarms: audit.alarmsSince(a.account.id, since),
-          server: { version: info.version, issuer: info.publicUrl, signup: info.signup, shake: this.lastShake ? { ok: this.lastShake.ok, summary: this.lastShake.summary, at: this.lastShake.at } : null },
+          // Someone using an emergency access link: shown on every device until it's stopped or over.
+          emergency: this.ctx.emergency.list(a.account.id).filter((l) => l.requestedAt !== null).map((l) => this.emergencyView(l)),
+          server: {
+            version: info.version,
+            issuer: info.publicUrl,
+            signup: info.signup,
+            invites: info.invites,
+            shake: this.lastShake ? { ok: this.lastShake.ok, summary: this.lastShake.summary, at: this.lastShake.at } : null,
+          },
         };
       },
 
@@ -1003,6 +1054,63 @@ export class Api {
         return { ok: true };
       },
 
+      // ── Emergency access (if something happens to you) ──
+
+      emergency: (a) => ({ links: this.ctx.emergency.list(a.account.id).map((l) => this.emergencyView(l)) }),
+
+      "emergency.create": (a, body, req) => {
+        const label = optBlob(body, "label", MAX_LABEL) ?? null;
+        const link = this.ctx.emergency.create(a.account.id, {
+          lookup: requireBlob(body, "lookup", 32, 32),
+          envelope: requireBlob(body, "envelope", MAX_KEY_BLOB),
+          note: requireBlob(body, "note", MAX_PROFILE),
+          label,
+          waitMs: optDuration(body, "wait"),
+        });
+        record(a, req, "emergency.create", { ref: label ? { sealed: label, ctx: ctx.emergencyLabel } : null, note: `they wait ${describeDuration(link.waitMs)}` });
+        return { link: this.emergencyView(link) };
+      },
+
+      "emergency.stop": (a, body, req) => {
+        const link = this.ctx.emergency.own(a.account.id, requireString(body, "id", 64));
+        this.ctx.emergency.stop(link);
+        record(a, req, "emergency.stop", { ref: link.label ? { sealed: link.label, ctx: ctx.emergencyLabel } : null });
+        return { link: this.emergencyView(this.ctx.emergency.own(a.account.id, link.id)) };
+      },
+
+      "emergency.approve": (a, body, req) => {
+        const link = this.ctx.emergency.approve(this.ctx.emergency.own(a.account.id, requireString(body, "id", 64)));
+        record(a, req, "emergency.approve", { ref: link.label ? { sealed: link.label, ctx: ctx.emergencyLabel } : null });
+        return { link: this.emergencyView(link) };
+      },
+
+      "emergency.remove": (a, body, req) => {
+        const link = this.ctx.emergency.own(a.account.id, requireString(body, "id", 64));
+        this.ctx.emergency.remove(link.id);
+        record(a, req, "emergency.remove", { ref: link.label ? { sealed: link.label, ctx: ctx.emergencyLabel } : null });
+        return { removed: link.id };
+      },
+
+      // ── Inviting friends (when the host allows it) ──
+
+      invites: (a) => ({ invites: accounts.invitesBy(a.account.id).map((i) => ({ id: i.id, createdAt: i.createdAt, expiresAt: i.expiresAt })), allowed: info.invites === "everyone" }),
+
+      "invite.create": (a, body, req) => {
+        if (info.invites !== "everyone") throw fail("invites_host_only", 403, "Only whoever runs this Cardboard can invite people here.", "Ask them for an invite link for your friend.");
+        if (accounts.invitesBy(a.account.id).length >= 5) throw fail("too_many_invites", 409, "You have 5 invites nobody has used yet.", "Cancel one first, or wait for them to be used.");
+        const ttl = optDuration(body, "ttl");
+        const { code, invite } = accounts.createInvite({ createdBy: a.account.id, ttlMs: ttl ?? undefined });
+        record(a, req, "invite.create");
+        this.log(req, { accountId: null, actor: a.actor, action: "invite.create", note: "by someone with an account" });
+        return { code, link: `${info.publicUrl}/#invite=${code}`, invite: { id: invite.id, createdAt: invite.createdAt, expiresAt: invite.expiresAt } };
+      },
+
+      "invite.revoke": (a, body, req) => {
+        if (!accounts.revokeInvite(requireString(body, "id", 40), a.account.id)) throw fail("no_such_invite", 404, "You don't have an unused invite with that id.");
+        record(a, req, "invite.revoke");
+        return { revoked: true };
+      },
+
       docks: (a) => ({
         docks: docks.list(a.account.id).map((d) => this.dockSummary(d)),
         pending: docks.pending(a.account.id).map(({ dock, berth }) => ({
@@ -1215,12 +1323,33 @@ export class Api {
     };
   }
 
-  /** Guessing pairing codes or share links counts as failing, like guessing tokens. */
+  /** The emergency access link a secret (a key made from the link) points to. Guesses count as failures. */
+  private emergencyLink(body: Body, req: ApiRequest): EmergencyLink {
+    return this.countMisses(req, () => {
+      const link = this.ctx.emergency.find(sha256(requireBlob(body, "secret", 32, 32)));
+      if (!link) throw fail("no_such_emergency_link", 404, "That emergency access link doesn't work.", "It may have been removed, replaced, or already used. Check you have the newest one.");
+      return link;
+    });
+  }
+
+  private emergencyView(link: EmergencyLink) {
+    return {
+      id: link.id,
+      label: b64(link.label),
+      waitMs: link.waitMs,
+      createdAt: link.createdAt,
+      requestedAt: link.requestedAt,
+      approvedAt: link.approvedAt,
+      readyAt: this.ctx.emergency.readyAt(link),
+    };
+  }
+
+  /** Guessing pairing codes, share links or emergency links counts as failing, like guessing tokens. */
   private countMisses<T>(req: ApiRequest, fn: () => T): T {
     try {
       return fn();
     } catch (err) {
-      if (err instanceof CardboardError && (err.code === "no_such_pairing" || err.code === "no_such_share")) this.limiter.fail(req.ip, this.now());
+      if (err instanceof CardboardError && ["no_such_pairing", "no_such_share", "no_such_emergency_link"].includes(err.code)) this.limiter.fail(req.ip, this.now());
       throw err;
     }
   }

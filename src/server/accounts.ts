@@ -67,6 +67,8 @@ export interface Invite {
   expiresAt: number;
   usedAt: number | null;
   accountId: string | null;
+  /** The account that made it, or null for the host. */
+  createdBy: string | null;
 }
 
 interface AccountRow {
@@ -117,13 +119,21 @@ export class Accounts {
 
   // ── Invites ──────────────────────────────────────────────────────────────
 
-  createInvite(options: { note?: string; ttlMs?: number } = {}): { code: string; invite: Invite } {
+  /** An invite from the host, or (with `createdBy`) from someone already here inviting a friend. */
+  createInvite(options: { note?: string; ttlMs?: number; createdBy?: string } = {}): { code: string; invite: Invite } {
     const code = newSecret("cbi");
     const now = this.now();
     const note = options.note?.trim().slice(0, 80) || null;
     const expiresAt = now + (options.ttlMs ?? INVITE_TTL);
-    this.db.prepare("INSERT INTO invites (hash, note, created_at, expires_at) VALUES (?, ?, ?, ?)").run(sha256(code), note, now, expiresAt);
-    return { code, invite: { id: inviteId(sha256(code)), note, createdAt: now, expiresAt, usedAt: null, accountId: null } };
+    this.db
+      .prepare("INSERT INTO invites (hash, note, created_at, expires_at, created_by) VALUES (?, ?, ?, ?, ?)")
+      .run(sha256(code), note, now, expiresAt, options.createdBy ?? null);
+    return { code, invite: { id: inviteId(sha256(code)), note, createdAt: now, expiresAt, usedAt: null, accountId: null, createdBy: options.createdBy ?? null } };
+  }
+
+  /** Invites one account made that are still waiting to be used. */
+  invitesBy(accountId: string): Invite[] {
+    return this.invites().filter((i) => i.createdBy === accountId && i.usedAt === null && i.expiresAt > this.now());
   }
 
   invites(): Invite[] {
@@ -134,6 +144,7 @@ export class Accounts {
       expires_at: number;
       used_at: number | null;
       account_id: string | null;
+      created_by: string | null;
     }>;
     return rows.map((r) => ({
       id: inviteId(r.hash),
@@ -142,12 +153,15 @@ export class Accounts {
       expiresAt: r.expires_at,
       usedAt: r.used_at,
       accountId: r.account_id,
+      createdBy: r.created_by,
     }));
   }
 
-  revokeInvite(id: string): boolean {
-    for (const row of this.db.prepare("SELECT hash FROM invites WHERE used_at IS NULL").all() as Array<{ hash: Uint8Array }>) {
-      if (inviteId(row.hash) === id) {
+  /** Cancels an unused invite (only the account's own, when `createdBy` is given). */
+  revokeInvite(id: string, createdBy?: string): boolean {
+    const rows = this.db.prepare("SELECT hash, created_by FROM invites WHERE used_at IS NULL").all() as Array<{ hash: Uint8Array; created_by: string | null }>;
+    for (const row of rows) {
+      if (inviteId(row.hash) === id && (createdBy === undefined || row.created_by === createdBy)) {
         this.db.prepare("DELETE FROM invites WHERE hash = ?").run(row.hash);
         return true;
       }
@@ -334,6 +348,11 @@ export class Accounts {
    * key derived from it. If it matches, a new device is added and gets the
    * sealed copy, which only the code can open.
    */
+  /** A new device on an account whose key it will get some other way (emergency access). */
+  addDeviceFor(accountId: string, device: NewDevice): Device {
+    return this.addDevice(accountId, { ...device, envelope: null });
+  }
+
   recover(kind: "kit" | "friends", secret: Uint8Array, device: NewDevice): { account: Account; device: Device; envelope: Buffer } | null {
     const row = this.db.prepare("SELECT * FROM recovery WHERE lookup = ? AND kind = ?").get(sha256(secret), kind) as
       | { account_id: string; envelope: Uint8Array }

@@ -65,8 +65,37 @@ export interface Me {
   device: { id: string; kind: DeviceKind; lock: "passkey" | null };
   devices: Array<{ id: string; kind: DeviceKind; lock: "passkey" | null; name: string; createdAt: number; lastSeenAt: number | null; current: boolean }>;
   alarms: Array<{ at: number; text: string }>;
-  server: { version: string; issuer: string; signup: "invite" | "open"; shake: { ok: boolean; summary: string; at: number } | null };
+  /** Emergency access links someone is using right now: stop them, or let them in. */
+  emergency: EmergencyLinkInfo[];
+  server: { version: string; issuer: string; signup: "invite" | "open"; invites: "everyone" | "host"; shake: { ok: boolean; summary: string; at: number } | null };
 }
+
+/** An emergency access link you gave someone. */
+export interface EmergencyLinkInfo {
+  id: string;
+  /** Your note on who it's for. */
+  label: string | null;
+  waitMs: number;
+  createdAt: number;
+  /** When they used it (the waiting period started), or null. */
+  requestedAt: number | null;
+  approvedAt: number | null;
+  /** When they can get in, or null if they haven't asked. */
+  readyAt: number | null;
+}
+
+/** What the person holding an emergency access link sees. */
+export interface EmergencyPreview {
+  from: string;
+  message: string | null;
+  waitMs: number;
+  requestedAt: number | null;
+  readyAt: number | null;
+  /** The wait is over (or the owner said yes): they can get in now. */
+  open: boolean;
+}
+
+type WireEmergency = Omit<EmergencyLinkInfo, "label"> & { label: string | null };
 
 export interface TapeInfo {
   id: string;
@@ -160,6 +189,7 @@ interface WireMe {
   envelope: string | null;
   devices: Array<{ id: string; kind: DeviceKind; lock: "passkey" | null; label: string | null; createdAt: number; lastSeenAt: number | null; current: boolean }>;
   alarms: Array<{ at: number; text: string }>;
+  emergency: WireEmergency[];
   server: Me["server"];
 }
 
@@ -236,6 +266,7 @@ const KIT_BYTES = 16;
 const PAIR_BYTES = 8;
 const FRIEND_BYTES = 16;
 const SHARE_BYTES = 16;
+const EMERGENCY_BYTES = 16;
 /** A locked device locks itself again after this long without use, unless you pick otherwise. */
 export const DEFAULT_LOCK_IDLE_MS = 15 * 60 * 1000;
 
@@ -365,6 +396,42 @@ export async function unlock(store: DeviceStore, options: UnlockOptions = {}): P
   return new Account(rpc, record, await accountKeys(root), store);
 }
 
+// ── Emergency access, for the person holding the link ───────────────────────
+
+async function emergencyKeys(link: string) {
+  const code = /#emergency=([^&\s]+)/.exec(link)?.[1] ?? link;
+  const secret = fromCode(decodeURIComponent(code), EMERGENCY_BYTES);
+  const [auth, wrap, note] = await Promise.all([derive(secret, "emergency-auth"), derive(secret, "emergency-wrap"), derive(secret, "emergency-note")]);
+  return { auth: toB64u(auth), wrap, note };
+}
+
+/** What an emergency access link is (who it's from, their message, how long the wait is). Doesn't start anything. */
+export async function viewEmergency(options: { url: string; link: string; fetch?: typeof fetch }): Promise<EmergencyPreview> {
+  const keys = await emergencyKeys(options.link);
+  const res = await new Rpc(options.url, null, options.fetch).call<{ note: string; waitMs: number; requestedAt: number | null; readyAt: number | null; open: boolean }>("emergency.view", { secret: keys.auth });
+  const note = await openJson<{ v: 1; from: string; message?: string }>(keys.note, fromB64u(res.note), ctx.emergencyNote);
+  return { from: note.from, message: note.message ?? null, waitMs: res.waitMs, requestedAt: res.requestedAt, readyAt: res.readyAt, open: res.open };
+}
+
+/** Asks for access: the owner is told on every device, and the waiting period starts. */
+export async function requestEmergency(options: { url: string; link: string; fetch?: typeof fetch }): Promise<{ readyAt: number; open: boolean }> {
+  const keys = await emergencyKeys(options.link);
+  return new Rpc(options.url, null, options.fetch).call("emergency.request", { secret: keys.auth });
+}
+
+/** After the wait (or once the owner says yes): this device joins their Cardboard. The link is used up. */
+export async function claimEmergency(options: GetInOptions & { link: string }): Promise<Account> {
+  const keys = await emergencyKeys(options.link);
+  const rpc = new Rpc(options.url, null, options.fetch);
+  const token = newDeviceToken();
+  const res = await rpc.call<{ accountId: string; deviceId: string; envelope: string }>("emergency.claim", {
+    secret: keys.auth,
+    device: { tokenHash: await hashOf(token), kind: options.kind },
+  });
+  const root = await open(keys.wrap, fromB64u(res.envelope), ctx.accountKey("emergency"));
+  return finishDevice(options, rpc, root, res, token);
+}
+
 export interface PendingPairing {
   /** Show this on the new device; type it on one you already have. */
   code: string;
@@ -487,8 +554,83 @@ export class Account {
         me.devices.map(async (d) => ({ ...d, label: undefined, name: await this.openMeta(d.label, ctx.deviceLabel, defaultDeviceName(d.kind)) })),
       ),
       alarms: me.alarms,
+      emergency: await Promise.all(me.emergency.map((l) => this.openEmergency(l))),
       server: me.server,
     };
+  }
+
+  private async openEmergency(l: WireEmergency): Promise<EmergencyLinkInfo> {
+    return { ...l, label: l.label ? (await this.openMeta(l.label, ctx.emergencyLabel, "")) || null : null };
+  }
+
+  // ── If something happens to you ──────────────────────────────────────────
+
+  /**
+   * An emergency access link for someone you trust (print it as a QR code, or
+   * put it in their password manager). If they use it, every one of your
+   * devices is told; stop it, or after `wait` (7 days unless you choose) they
+   * get into your Cardboard. The account key is sealed by a key only the link
+   * can make; the server just keeps the clock. `as` is your name as they'll
+   * see it, `message` is for them, `label` is your note on who it's for.
+   */
+  async addEmergencyLink(options: { label?: string; as?: string; message?: string; wait?: string } = {}): Promise<{ link: string; code: string; info: EmergencyLinkInfo }> {
+    const me = await this.me();
+    const from = (options.as ?? me.profile.name ?? "").trim().slice(0, 60) || "Someone";
+    const message = options.message?.trim().slice(0, 1000) || undefined;
+    const label = options.label?.trim().slice(0, 60) || undefined;
+    const secret = random(EMERGENCY_BYTES);
+    const [auth, wrap, noteKey] = await Promise.all([derive(secret, "emergency-auth"), derive(secret, "emergency-wrap"), derive(secret, "emergency-note")]);
+    const res = await this.rpc.call<{ link: WireEmergency }>("emergency.create", {
+      lookup: toB64u(await sha256(auth)),
+      envelope: toB64u(await seal(wrap, this.keys.root, ctx.accountKey("emergency"))),
+      note: toB64u(await sealJson(noteKey, { v: 1, from, ...(message ? { message } : {}) }, ctx.emergencyNote)),
+      label: label ? await this.sealMeta(label, ctx.emergencyLabel) : undefined,
+      wait: options.wait,
+    });
+    const code = toCode(secret);
+    return { link: `${me.server.issuer || this.url}/#emergency=${code}`, code, info: { ...res.link, label: label ?? null } };
+  }
+
+  async emergencyLinks(): Promise<EmergencyLinkInfo[]> {
+    const { links } = await this.rpc.call<{ links: WireEmergency[] }>("emergency");
+    return Promise.all(links.map((l) => this.openEmergency(l)));
+  }
+
+  private async findEmergency(which: string): Promise<EmergencyLinkInfo> {
+    const links = await this.emergencyLinks();
+    const found = links.find((l) => l.id === which || l.label === which);
+    if (!found) throw fail("no_such_emergency_link", 404, `There's no emergency access link for ${which}.`, "See them with: cardboard emergency");
+    return found;
+  }
+
+  /** Stops someone using an emergency access link. The link still works; you'd hear again if it's used. */
+  async stopEmergency(which: string) {
+    await this.rpc.call("emergency.stop", { id: (await this.findEmergency(which)).id });
+  }
+
+  /** Lets them in now, without waiting. */
+  async allowEmergency(which: string) {
+    await this.rpc.call("emergency.approve", { id: (await this.findEmergency(which)).id });
+  }
+
+  async removeEmergency(which: string) {
+    await this.rpc.call("emergency.remove", { id: (await this.findEmergency(which)).id });
+  }
+
+  // ── Inviting friends ─────────────────────────────────────────────────────
+
+  /** An invite link for a friend to make their own account here (when the host allows it). One use, 7 days. */
+  async inviteFriend(options: { expires?: string } = {}): Promise<{ link: string; code: string; expiresAt: number }> {
+    const res = await this.rpc.call<{ code: string; link: string; invite: { expiresAt: number } }>("invite.create", { ttl: options.expires });
+    return { link: res.link, code: res.code, expiresAt: res.invite.expiresAt };
+  }
+
+  async invites(): Promise<{ allowed: boolean; invites: Array<{ id: string; createdAt: number; expiresAt: number }> }> {
+    return this.rpc.call("invites");
+  }
+
+  async cancelInvite(id: string) {
+    await this.rpc.call("invite.revoke", { id });
   }
 
   /** Your name and email, sealed. Apps only get them when you say so, sealed to the app. */

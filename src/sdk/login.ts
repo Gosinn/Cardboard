@@ -10,6 +10,9 @@
  *   session.user.id                                 // your private ID for this person
  *   await session.box().put("prefs", { theme: "dark" });  // stored, sealed, in THEIR Cardboard
  *   saveSomewhereSafe(session.save());              // later: resumeSession(config, saved)
+ *
+ * In a browser, pass `storage` (e.g. localStorage) instead of saving by hand:
+ * the session stays up to date after every refresh, and tabs share it.
  */
 import { ctx } from "../shared/contexts.ts";
 import { exportPrivateKey, fromB64u, importPrivateKey, keyPair, openWith, toB64u, utf8 } from "../client/crypto.ts";
@@ -17,6 +20,12 @@ import { readBundle } from "../client/keys.ts";
 import { Box, CardboardError } from "./index.ts";
 
 export type SignInScope = "openid" | "profile" | "email" | "box";
+
+/** Somewhere the session lives between page loads, e.g. localStorage. Holds the box key: keep it like a password. */
+export interface SessionStorage {
+  get(): string | null | Promise<string | null>;
+  set(value: string): void | Promise<void>;
+}
 
 export interface SignInConfig {
   /** The person's Cardboard, e.g. https://cardboard.example.com */
@@ -27,6 +36,12 @@ export interface SignInConfig {
   redirectUri: string;
   /** Defaults to ["openid", "box"]: recognise them, and keep your data about them in their Cardboard. */
   scopes?: SignInScope[];
+  /**
+   * Where to keep the session (e.g. `{ get: () => localStorage.getItem("cardboard"), set: (v) => localStorage.setItem("cardboard", v) }`).
+   * It's rewritten after every refresh, and tabs take turns refreshing through it: refresh tokens
+   * work once, and Cardboard disconnects an app that reuses one (that's how copied tokens get caught).
+   */
+  storage?: SessionStorage;
   fetch?: typeof fetch;
 }
 
@@ -76,6 +91,45 @@ interface SessionKeys {
   box: Uint8Array;
   names: Uint8Array;
 }
+
+interface SessionState {
+  accessToken: string;
+  refreshToken: string;
+  expiresAt: number;
+  scopes: string[];
+  user: CardboardUser;
+}
+
+/** What session.save() writes (older saves had only refreshToken, keys and profile; a bare refresh token works too). */
+interface SavedSession {
+  refreshToken: string;
+  accessToken?: string;
+  expiresAt?: number;
+  scopes?: string[];
+  user?: CardboardUser;
+  keys?: { boxId: string; box: string; names: string } | null;
+  profile?: { name?: string; email?: string };
+}
+
+function parseSaved(raw: string | null | undefined): SavedSession | null {
+  const text = raw?.trim();
+  if (!text) return null;
+  if (!text.startsWith("{")) return { refreshToken: text };
+  try {
+    const saved = JSON.parse(text) as SavedSession;
+    return typeof saved.refreshToken === "string" ? saved : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Only one tab refreshes at a time (Web Locks, where the browser has them). */
+function oneAtATime<T>(name: string, fn: () => Promise<T>): Promise<T> {
+  const locks = (globalThis as { navigator?: { locks?: { request(name: string, fn: () => Promise<T>): Promise<T> } } }).navigator?.locks;
+  return locks ? locks.request(name, fn) : fn();
+}
+
+const EARLY_MS = 30_000;
 
 const discoveries = new Map<string, Promise<Discovery>>();
 
@@ -174,24 +228,26 @@ export async function finishSignIn(config: SignInConfig, callbackUrl: string | U
     if (typeof sealed.profile?.name === "string") profile.name = sealed.profile.name;
     if (typeof sealed.profile?.email === "string") profile.email = sealed.profile.email;
   }
-  return makeSession(config, discovery, fetchImpl, tokens, pending.nonce, keys, profile);
+  const session = makeSession(config, discovery, fetchImpl, stateFrom(config, discovery, tokens, pending.nonce, profile), keys);
+  await config.storage?.set(session.save());
+  return session;
 }
 
-/** Picks up where session.save() left off (e.g. after your server restarts). */
-export async function resumeSession(config: SignInConfig, saved: string): Promise<CardboardSession> {
+/**
+ * Picks up where session.save() left off (after a page load, or your server
+ * restarting). With `storage` in the config, `saved` can be left out. Uses the
+ * saved access token while it's good, and refreshes only when it isn't.
+ */
+export async function resumeSession(config: SignInConfig, saved?: string | null): Promise<CardboardSession> {
   const fetchImpl = config.fetch ?? globalThis.fetch.bind(globalThis);
   const discovery = await discover(config.issuer, fetchImpl);
-  let refreshToken = saved;
-  let keys: SessionKeys | null = null;
-  let profile: { name?: string; email?: string } = {};
-  if (saved.trim().startsWith("{")) {
-    const data = JSON.parse(saved) as { refreshToken: string; keys?: { boxId: string; box: string; names: string } | null; profile?: { name?: string; email?: string } };
-    refreshToken = data.refreshToken;
-    if (data.keys) keys = { boxId: data.keys.boxId, box: fromB64u(data.keys.box), names: fromB64u(data.keys.names) };
-    profile = data.profile ?? {};
-  }
-  const tokens = await tokenRequest(config, discovery, fetchImpl, { grant_type: "refresh_token", refresh_token: refreshToken });
-  return makeSession(config, discovery, fetchImpl, tokens, null, keys, profile);
+  const data = parseSaved(saved ?? (await config.storage?.get()) ?? null);
+  if (!data) throw new CardboardError("not_signed_in", 0, "There's no saved Cardboard session.", "Sign in with Cardboard again.");
+  const keys = data.keys ? { boxId: data.keys.boxId, box: fromB64u(data.keys.box), names: fromB64u(data.keys.names) } : null;
+  const user: CardboardUser = data.user ?? { id: "", ...data.profile };
+  const session = makeSession(config, discovery, fetchImpl, { accessToken: data.accessToken ?? "", refreshToken: data.refreshToken, expiresAt: data.expiresAt ?? 0, scopes: data.scopes ?? [], user }, keys);
+  if (!data.accessToken || !user.id || session.expiresAt <= Date.now() + EARLY_MS) await session.refresh();
+  return session;
 }
 
 interface Tokens {
@@ -214,15 +270,8 @@ async function tokenRequest(config: SignInConfig, discovery: Discovery, fetchImp
   return data;
 }
 
-function makeSession(
-  config: SignInConfig,
-  discovery: Discovery,
-  fetchImpl: typeof fetch,
-  tokens: Tokens,
-  nonce: string | null,
-  keys: SessionKeys | null,
-  profile: { name?: string; email?: string },
-): CardboardSession {
+/** Fresh tokens into session state, checking the ID token (if any) is really for this app. */
+function stateFrom(config: SignInConfig, discovery: Discovery, tokens: Tokens, nonce: string | null, profile: { name?: string; email?: string }, previous?: CardboardUser): SessionState {
   const claims = tokens.id_token ? decodeJwt(tokens.id_token) : {};
   if (tokens.id_token) {
     // Received straight from the token endpoint over TLS, so the claims are what matter (OIDC Core 3.1.3.7).
@@ -230,17 +279,30 @@ function makeSession(
     if (claims["aud"] !== config.clientId) throw new CardboardError("bad_id_token", 0, "The ID token is for a different app.");
     if (nonce && claims["nonce"] !== nonce) throw new CardboardError("bad_id_token", 0, "The ID token's nonce doesn't match.");
   }
-  let inflight: Promise<CardboardSession> | null = null;
-  let box: Box | null = null;
-  const name = profile.name ?? (typeof claims["name"] === "string" ? claims["name"] : undefined);
-  const email = profile.email ?? (typeof claims["email"] === "string" ? claims["email"] : undefined);
-
-  const session: CardboardSession = {
-    user: { id: String(claims["sub"] ?? ""), ...(name ? { name } : {}), ...(email ? { email } : {}) },
+  const name = profile.name ?? previous?.name ?? (typeof claims["name"] === "string" ? claims["name"] : undefined);
+  const email = profile.email ?? previous?.email ?? (typeof claims["email"] === "string" ? claims["email"] : undefined);
+  return {
     accessToken: tokens.access_token,
     refreshToken: tokens.refresh_token,
     expiresAt: Date.now() + tokens.expires_in * 1000,
     scopes: tokens.scope.split(" "),
+    user: { id: typeof claims["sub"] === "string" ? claims["sub"] : (previous?.id ?? ""), ...(name ? { name } : {}), ...(email ? { email } : {}) },
+  };
+}
+
+function makeSession(config: SignInConfig, discovery: Discovery, fetchImpl: typeof fetch, state: SessionState, keys: SessionKeys | null): CardboardSession {
+  let inflight: Promise<CardboardSession> | null = null;
+  let box: Box | null = null;
+  const adopt = (next: SessionState) => {
+    session.accessToken = next.accessToken;
+    session.refreshToken = next.refreshToken;
+    session.expiresAt = next.expiresAt;
+    if (next.scopes.length) session.scopes = next.scopes;
+    if (next.user.id) session.user = next.user;
+  };
+
+  const session: CardboardSession = {
+    ...state,
     box() {
       if (!keys) {
         throw new CardboardError("no_box_scope", 0, "This sign-in didn't get a box.", 'Add "box" to scopes (the person can still say no).');
@@ -249,16 +311,22 @@ function makeSession(
       return box;
     },
     refresh() {
-      inflight ??= tokenRequest(config, discovery, fetchImpl, { grant_type: "refresh_token", refresh_token: session.refreshToken })
-        .then((fresh) => {
-          session.accessToken = fresh.access_token;
-          session.refreshToken = fresh.refresh_token;
-          session.expiresAt = Date.now() + fresh.expires_in * 1000;
-          return session;
-        })
-        .finally(() => {
-          inflight = null;
-        });
+      inflight ??= oneAtATime(`cardboard-refresh:${config.issuer}:${config.clientId}`, async () => {
+        if (config.storage) {
+          // Another tab may have refreshed already: carry on with its tokens rather than reusing ours.
+          const latest = parseSaved(await config.storage.get());
+          if (latest?.accessToken && latest.refreshToken !== session.refreshToken) {
+            adopt({ accessToken: latest.accessToken, refreshToken: latest.refreshToken, expiresAt: latest.expiresAt ?? 0, scopes: latest.scopes ?? [], user: latest.user ?? session.user });
+            if (session.expiresAt > Date.now() + EARLY_MS) return session;
+          }
+        }
+        const fresh = await tokenRequest(config, discovery, fetchImpl, { grant_type: "refresh_token", refresh_token: session.refreshToken });
+        adopt(stateFrom(config, discovery, fresh, null, {}, session.user));
+        await config.storage?.set(session.save());
+        return session;
+      }).finally(() => {
+        inflight = null;
+      });
       return inflight;
     },
     async signOut() {
@@ -267,13 +335,18 @@ function makeSession(
         headers: { "content-type": "application/x-www-form-urlencoded" },
         body: new URLSearchParams({ token: session.refreshToken, client_id: config.clientId }).toString(),
       });
+      await config.storage?.set("");
     },
     save() {
-      return JSON.stringify({
+      const saved: SavedSession = {
         refreshToken: session.refreshToken,
+        accessToken: session.accessToken,
+        expiresAt: session.expiresAt,
+        scopes: session.scopes,
+        user: session.user,
         keys: keys ? { boxId: keys.boxId, box: toB64u(keys.box), names: toB64u(keys.names) } : null,
-        profile: { ...(name ? { name } : {}), ...(email ? { email } : {}) },
-      });
+      };
+      return JSON.stringify(saved);
     },
   };
   return session;

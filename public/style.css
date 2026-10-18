@@ -689,11 +689,41 @@ th {
     position: static;
     background: none;
   }
+  /* Printing a kit or an emergency link: just the card, not the page behind it. */
+  body:has(.modal:not([hidden])) main {
+    display: none;
+  }
+  .modal .card {
+    max-height: none;
+    box-shadow: none;
+  }
 }
 
 .login svg {
   width: 64px;
   height: 64px;
+}
+
+svg.qr,
+.login svg.qr {
+  display: block;
+  width: min(220px, 100%);
+  height: auto;
+  aspect-ratio: 1;
+  border-radius: 8px;
+  shape-rendering: crispEdges;
+}
+
+.message {
+  white-space: pre-wrap;
+  border-left: 3px solid var(--kraft);
+  padding: 4px 12px;
+  margin: 0;
+}
+
+.alert {
+  border: 1px solid var(--danger);
+  background: var(--danger-bg);
 }
 
 @media (max-width: 560px) {

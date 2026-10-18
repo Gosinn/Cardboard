@@ -72,7 +72,13 @@ export function insights(facts: AccountFacts): Insight[] {
   const { now } = facts;
 
   for (const alarm of facts.alarms) {
-    out.push({ level: "danger", title: alarm.text, detail: `${describeDuration(now - alarm.at)} ago. If that wasn't you, check your devices and connected apps.`, fix: "cardboard devices" });
+    const emergency = /emergency access/i.test(alarm.text);
+    out.push({
+      level: "danger",
+      title: alarm.text,
+      detail: `${describeDuration(now - alarm.at)} ago. ${emergency ? "If you didn't expect that, stop it now, and remove that link." : "If that wasn't you, check your devices and connected apps."}`,
+      fix: emergency ? "cardboard emergency" : "cardboard devices",
+    });
   }
 
   if (facts.url.startsWith("http://") && !isLocal(facts.url)) {

@@ -7,6 +7,8 @@ import { accountKeys, boxKeys, itemIndex } from "../src/client/keys.ts";
 import { mergePatch } from "../src/shared/data.ts";
 import { describeCounts, luhn, scan, validIban, validKennitala } from "../src/shared/detect.ts";
 import { matches, sortItems } from "../src/shared/query.ts";
+import { qrEncode, qrPath } from "../src/shared/qr.ts";
+import { createHash } from "node:crypto";
 
 describe("durations and sizes", () => {
   it("parses the ways people write durations", () => {
@@ -194,5 +196,44 @@ describe("queries", () => {
     assert.equal(Object.getPrototypeOf(sneaky), Object.prototype);
     assert.equal(JSON.stringify(sneaky), '{"__proto__":{"polluted":true}}');
     assert.equal(({} as Record<string, unknown>)["polluted"], undefined);
+  });
+});
+
+describe("QR codes", () => {
+  const bits = (m: boolean[][]) => m.map((r) => r.map((d) => (d ? 1 : 0)).join("")).join("\n");
+
+  it("draws the same code a real decoder read (checked against zxing when written)", () => {
+    const m = qrEncode("https://cardboard.example.com/#share=K7Q2-MXA2-R7G0-8ABC");
+    assert.equal(m.length, 33, "version 4");
+    assert.equal(createHash("sha256").update(bits(m)).digest("hex"), "413e356d7e2f27d852d45255e773124c3601303677d4acc5ff27cf1c9e56baf6");
+  });
+
+  it("picks the smallest size that fits, up to 412 bytes", () => {
+    assert.equal(qrEncode("x".repeat(14)).length, 21);
+    assert.equal(qrEncode("x".repeat(15)).length, 25);
+    assert.equal(qrEncode("x".repeat(412)).length, 77);
+    assert.throws(() => qrEncode("x".repeat(413)), /too long/);
+  });
+
+  it("has finder patterns in three corners and level-M format bits that check out", () => {
+    for (const mask of [0, 3, 7]) {
+      const m = qrEncode("hello", { mask });
+      const finder = (x: number, y: number) => [0, 6].every((d) => m[y + d]![x]! && m[y]![x + d]!) && m[y + 1]![x + 1] === false && m[y + 3]![x + 3] === true;
+      assert.ok(finder(0, 0) && finder(14, 0) && finder(0, 14));
+      let format = 0;
+      for (let i = 0; i <= 5; i++) format |= (m[i]![8] ? 1 : 0) << i;
+      format |= (m[7]![8] ? 1 : 0) << 6;
+      format |= (m[8]![8] ? 1 : 0) << 7;
+      format |= (m[8]![7] ? 1 : 0) << 8;
+      for (let i = 9; i < 15; i++) format |= (m[8]![14 - i] ? 1 : 0) << i;
+      const data = (format ^ 0x5412) >>> 10;
+      assert.equal(data >>> 3, 0b00, "level M");
+      assert.equal(data & 7, mask);
+    }
+  });
+
+  it("renders to an SVG path with a quiet zone", () => {
+    const path = qrPath([[true, false], [false, true]], 4);
+    assert.equal(path, "M4 4h1v1h-1zM5 5h1v1h-1z");
   });
 });
