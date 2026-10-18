@@ -40,6 +40,8 @@ const PROBE_IP = "198.51.100.77";
  */
 export async function runShake(api: Api): Promise<ShakeReport> {
   const { tapes, db, info, oauth, accounts } = api.ctx;
+  // The probe address is never a real person's: start every run with a clean slate, so running it twice in an hour works.
+  for (const limiter of [api.limiter, api.pairings, api.signups]) limiter.reset(PROBE_IP);
   const results: ShakeResult[] = [];
   const check = async (id: string, title: string, run: () => Promise<Omit<ShakeResult, "id" | "title">> | Omit<ShakeResult, "id" | "title">) => {
     try {
@@ -229,7 +231,8 @@ export async function runShake(api: Api): Promise<ShakeReport> {
 
     // ── Ways in ──
     await check("recovery-kit", "Only your recovery kit gets you back in", async () => {
-      const wrong = await rejects(() => recoverWithKit({ url, code: kit.replace(/^(.)(.)/, "$2$1"), store: new MemoryStore(), kind: "other", fetch: inProcess }));
+      // A well-formed kit that isn't this account's (swapping characters of the real one could give the real one back).
+      const wrong = await rejects(() => recoverWithKit({ url, code: toCode(random(16)), store: new MemoryStore(), kind: "other", fetch: inProcess }), "bad_recovery");
       api.limiter.reset(PROBE_IP);
       const back = await recoverWithKit({ url, code: kit, store: new MemoryStore(), kind: "other", fetch: inProcess });
       const sees = (await back.boxes()).some((x) => x.name === boxA.name);
@@ -526,6 +529,7 @@ export async function runShake(api: Api): Promise<ShakeReport> {
     db.prepare("DELETE FROM log WHERE account_id IS NULL AND (note LIKE 'acct_%' OR note = 'shake')").run();
     api.limiter.reset(PROBE_IP);
     api.pairings.reset(PROBE_IP);
+    api.signups.reset(PROBE_IP);
   }
 
   await check("key-file", "Server key file is private", () => {

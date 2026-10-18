@@ -4,7 +4,8 @@ import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
-import { cloudflareUrl, funnelUrl, openTunnel } from "../src/node/tunnel.ts";
+import { readFileSync } from "node:fs";
+import { cloudflareUrl, openTunnel, pickFunnelPort } from "../src/node/tunnel.ts";
 import { CardboardError } from "../src/sdk/index.ts";
 
 // Stand-ins for cloudflared and tailscale, printing what the real ones print.
@@ -15,17 +16,27 @@ echo "INF |  Your quick Tunnel has been created! Visit it at (it may take some t
 echo "INF |  https://quiet-river-lamp-fox.trycloudflare.com                                             |" >&2
 exec sleep 300
 `;
+// Records every command; FAKE_TS_SERVE is what `tailscale serve status --json` answers.
 const FAKE_TAILSCALE = `#!/bin/sh
-if [ "$1" = "status" ]; then echo '{"BackendState":"Running","Self":{"DNSName":"laptop.tail1234.ts.net."}}'; exit 0; fi
-if [ "$1" = "funnel" ]; then printf 'Available on the internet:\\n\\nhttps://laptop.tail1234.ts.net/\\n|-- proxy http://127.0.0.1:%s\\n\\nPress Ctrl+C to exit.\\n' "$2"; exec sleep 300; fi
-exit 1
+echo "$*" >> "$FAKE_TS_LOG"
+case "$1" in
+  status) echo '{"BackendState":"Running","Self":{"DNSName":"Laptop.tail1234.ts.net."}}' ;;
+  serve) cat "$FAKE_TS_SERVE" 2>/dev/null || echo '{}' ;;
+  funnel) [ "$2" = "--bg" ] && [ -n "$FAKE_TS_FUNNEL_SAY" ] && printf '%b\\n' "$FAKE_TS_FUNNEL_SAY"; exit "\${FAKE_TS_FUNNEL_EXIT:-0}" ;;
+esac
 `;
+const HOST = "laptop.tail1234.ts.net";
 
 describe("putting Cardboard online from your own computer", () => {
   let bin: string;
   let path: string | undefined;
+  const log = () => readFileSync(process.env["FAKE_TS_LOG"]!, "utf8");
+  const serving = (config: unknown) => writeFileSync(process.env["FAKE_TS_SERVE"]!, JSON.stringify(config));
   before(() => {
     bin = mkdtempSync(join(tmpdir(), "cardboard-tunnel-"));
+    process.env["FAKE_TS_LOG"] = join(bin, "log");
+    process.env["FAKE_TS_SERVE"] = join(bin, "serve.json");
+    writeFileSync(process.env["FAKE_TS_LOG"], "");
     for (const [name, body] of [
       ["cloudflared", FAKE_CLOUDFLARED],
       ["tailscale", FAKE_TAILSCALE],
@@ -44,8 +55,18 @@ describe("putting Cardboard online from your own computer", () => {
   it("finds the tunnel's address, and never the API address cloudflared mentions in errors", () => {
     assert.equal(cloudflareUrl('failed to request quick Tunnel: Post "https://api.trycloudflare.com/tunnel": dial tcp'), null);
     assert.equal(cloudflareUrl("INF |  https://quiet-river-lamp-fox.trycloudflare.com   |"), "https://quiet-river-lamp-fox.trycloudflare.com");
-    assert.equal(funnelUrl("To enable, visit: https://login.tailscale.com/f/funnel?node=abc"), null);
-    assert.equal(funnelUrl("Available on the internet:\n\nhttps://Laptop.tail1234.ts.net/\n"), "https://laptop.tail1234.ts.net");
+  });
+
+  it("never takes a Funnel port you already use for something else", () => {
+    const yours = { TCP: { "443": { HTTPS: true } }, Web: { [`${HOST}:443`]: { Handlers: { "/": { Proxy: "http://127.0.0.1:3000" } } } } };
+    assert.deepEqual(pickFunnelPort({}, HOST, 8787), { port: 443, reuse: false });
+    assert.deepEqual(pickFunnelPort(yours, HOST, 8787), { port: 8443, reuse: false });
+    const leftover = { ...yours, Web: { ...yours.Web, [`${HOST}:8443`]: { Handlers: { "/": { Proxy: "http://127.0.0.1:8787" } } } }, TCP: { ...yours.TCP, "8443": { HTTPS: true } } };
+    assert.deepEqual(pickFunnelPort(leftover, HOST, 8787), { port: 8443, reuse: true }, "Cardboard's own setting from an earlier run");
+    const full = { TCP: { "443": {}, "8443": {}, "10000": {} } };
+    assert.equal(pickFunnelPort(full, HOST, 8787), null);
+    const foreground = { Foreground: { session: { TCP: { "443": { HTTPS: true } } } } };
+    assert.deepEqual(pickFunnelPort(foreground, HOST, 8787), { port: 8443, reuse: false });
   });
 
   it("opens a Cloudflare quick tunnel", async () => {
@@ -55,10 +76,49 @@ describe("putting Cardboard online from your own computer", () => {
     tunnel.close();
   });
 
-  it("opens a Tailscale Funnel at the machine's fixed address", async () => {
+  it("opens a Tailscale Funnel at the machine's fixed address, and switches it off when Cardboard stops", async () => {
+    serving({});
     const tunnel = await openTunnel("tailscale", 8787);
-    assert.equal(tunnel.url, "https://laptop.tail1234.ts.net");
-    tunnel.close();
+    assert.equal(tunnel.url, `https://${HOST}`);
+    assert.match(log(), /^funnel --bg --https=443 8787$/m);
+    await tunnel.close();
+    assert.match(log(), /^funnel --https=443 off$/m);
+  });
+
+  it("moves to port 8443 when your Tailscale already shares something on 443 (and leaves it alone)", async () => {
+    writeFileSync(process.env["FAKE_TS_LOG"]!, "");
+    serving({ TCP: { "443": { HTTPS: true } }, Web: { [`${HOST}:443`]: { Handlers: { "/": { Proxy: "http://127.0.0.1:3000" } } } }, AllowFunnel: { [`${HOST}:443`]: true } });
+    const tunnel = await openTunnel("tailscale", 8787);
+    assert.equal(tunnel.url, `https://${HOST}:8443`);
+    assert.match(tunnel.note, /already uses 443/);
+    assert.match(log(), /^funnel --bg --https=8443 8787$/m);
+    await tunnel.close();
+    assert.doesNotMatch(log(), /--https=443/, "443 was never touched");
+  });
+
+  it("shows the link when Tailscale wants Funnel switched on, and what it said when it refuses", async () => {
+    serving({});
+    process.env["FAKE_TS_FUNNEL_SAY"] = "Funnel is not enabled on your tailnet.\\nTo enable, visit:\\n\\n         https://login.tailscale.com/f/funnel?node=abc123\\n";
+    const said: string[] = [];
+    try {
+      const tunnel = await openTunnel("tailscale", 8787, { say: (line) => said.push(line) });
+      assert.equal(tunnel.url, `https://${HOST}`);
+      assert.match(said.join("\n"), /switch Funnel on[\s\S]*https:\/\/login\.tailscale\.com\/f\/funnel\?node=abc123/);
+      process.env["FAKE_TS_FUNNEL_SAY"] = "error: some problem with the tailnet";
+      process.env["FAKE_TS_FUNNEL_EXIT"] = "1";
+      await assert.rejects(openTunnel("tailscale", 8787), (err: unknown) => err instanceof CardboardError && err.code === "tunnel_failed" && /some problem with the tailnet/.test(err.hint ?? ""));
+    } finally {
+      delete process.env["FAKE_TS_FUNNEL_SAY"];
+      delete process.env["FAKE_TS_FUNNEL_EXIT"];
+    }
+  });
+
+  it("picks up where it left off if Cardboard was stopped without switching Funnel off", async () => {
+    writeFileSync(process.env["FAKE_TS_LOG"]!, "");
+    serving({ TCP: { "443": { HTTPS: true } }, Web: { [`${HOST}:443`]: { Handlers: { "/": { Proxy: "http://127.0.0.1:8787" } } } }, AllowFunnel: { [`${HOST}:443`]: true } });
+    const tunnel = await openTunnel("tailscale", 8787);
+    assert.equal(tunnel.url, `https://${HOST}`);
+    assert.doesNotMatch(log(), /--bg/, "nothing to change");
   });
 
   it("says how to install a missing tunnel", async () => {

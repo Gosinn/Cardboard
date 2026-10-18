@@ -285,8 +285,13 @@ export async function startServer(options: StartOptions = {}): Promise<RunningCa
   info.publicUrl = (options.publicUrl ?? process.env["CARDBOARD_PUBLIC_URL"] ?? localUrl).replace(/\/+$/, "");
 
   // The very first start makes one invite, so whoever runs Cardboard can make their own account right away.
+  // Until someone has made an account, every start shows a fresh invite (and the previous one stops
+  // working), so stopping Cardboard before you used it can't lock you out.
   let firstInvite: string | undefined;
-  if (hostToken && info.signup === "invite") firstInvite = `${info.publicUrl}/#invite=${accounts.createInvite({ note: "first account" }).code}`;
+  if (info.signup === "invite" && accounts.list().length === 0) {
+    for (const old of accounts.invites()) if (old.usedAt === null && old.createdBy === null && old.note === "first account") accounts.revokeInvite(old.id);
+    firstInvite = `${info.publicUrl}/#invite=${accounts.createInvite({ note: "first account" }).code}`;
+  }
 
   const sweeper = setInterval(() => {
     try {

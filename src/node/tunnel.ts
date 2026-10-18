@@ -9,7 +9,8 @@ import { CardboardError } from "../shared/errors.ts";
  *
  *   tailscale   Tailscale Funnel (a free Tailscale account). A fixed address
  *               like https://laptop.tail1234.ts.net. HTTPS ends on this
- *               computer, so Tailscale only relays encrypted bytes.
+ *               computer, so Tailscale only relays encrypted bytes. Never
+ *               touches ports you already share with Tailscale.
  *   cloudflare  A Cloudflare quick tunnel (no account at all). A new random
  *               address every time, and HTTPS ends at Cloudflare. For a quick
  *               try-out only.
@@ -24,7 +25,8 @@ export interface Tunnel {
   url: string;
   /** Something worth telling the person about this kind of tunnel. */
   note: string;
-  close(): void;
+  /** Takes the address offline. */
+  close(): Promise<void>;
 }
 
 /** A quick tunnel's address in cloudflared's output (never its API's address, which shows up in errors). */
@@ -32,9 +34,33 @@ export function cloudflareUrl(text: string): string | null {
   return /https:\/\/(?!api\.)[a-z0-9-]+\.trycloudflare\.com/.exec(text)?.[0] ?? null;
 }
 
-/** The address `tailscale funnel` prints once it's live. */
-export function funnelUrl(text: string): string | null {
-  return /https:\/\/[a-z0-9.-]+\.ts\.net/i.exec(text)?.[0]?.toLowerCase() ?? null;
+/** What `tailscale serve status --json` says Tailscale is already sharing. */
+export interface ServeConfig {
+  TCP?: Record<string, unknown>;
+  Web?: Record<string, { Handlers?: Record<string, { Proxy?: string }> }>;
+  AllowFunnel?: Record<string, boolean>;
+  Foreground?: Record<string, ServeConfig>;
+}
+
+/** The three ports Funnel can use. 443 makes the plainest address. */
+export const FUNNEL_PORTS = [443, 8443, 10000] as const;
+
+/**
+ * Which Funnel port to use: the first one that's free, or one already sending
+ * everything to Cardboard (left from an earlier run). Ports you use for other
+ * things are never touched.
+ */
+export function pickFunnelPort(config: ServeConfig, host: string, localPort: number): { port: number; reuse: boolean } | null {
+  const all = [config, ...Object.values(config.Foreground ?? {})];
+  for (const port of FUNNEL_PORTS) {
+    const used = all.some((c) => c.TCP?.[String(port)] !== undefined || Object.keys(c.Web ?? {}).some((key) => key.endsWith(`:${port}`)));
+    if (!used) return { port, reuse: false };
+    const handlers = config.Web?.[`${host}:${port}`]?.Handlers ?? {};
+    const proxy = handlers["/"]?.Proxy ?? "";
+    const ours = Object.keys(handlers).length === 1 && new RegExp(`^(https?://)?(127\\.0\\.0\\.1|localhost):${localPort}/?$`).test(proxy);
+    if (ours) return { port, reuse: true };
+  }
+  return null;
 }
 
 export async function openTunnel(kind: TunnelKind, port: number, options: { say?: (line: string) => void; timeoutMs?: number } = {}): Promise<Tunnel> {
@@ -95,7 +121,9 @@ async function cloudflare(port: number, options: { say?: (line: string) => void;
     kind: "cloudflare",
     url,
     note: "A quick tunnel gets a new address every time it starts (devices then sign back in with a recovery kit or by pairing), live updates may not get through, and HTTPS ends at Cloudflare. Fine for a try-out; use --tunnel tailscale for anything longer.",
-    close: () => child.kill(),
+    close: async () => {
+      child.kill();
+    },
   };
 }
 
@@ -111,6 +139,39 @@ function run(bin: string, args: string[]): Promise<string> {
   );
 }
 
+/** Runs a tailscale command that finishes, showing any link it asks you to open, and waiting while you do. */
+function finish(child: ChildProcess, options: { say?: (line: string) => void; timeoutMs: number }): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let seen = "";
+    let asked = false;
+    const timer = setTimeout(() => {
+      child.kill();
+      reject(new CardboardError("tunnel_timeout", 0, "Tailscale was still waiting after 5 minutes.", `If it asked you to turn Funnel on, open that link, say yes, and run this again.${seen ? `\nWhat it said:\n${seen.slice(-1500)}` : ""}`));
+    }, options.timeoutMs);
+    const onData = (chunk: Buffer) => {
+      seen += chunk.toString();
+      const link = /https:\/\/login\.tailscale\.com\/\S+/.exec(seen)?.[0];
+      if (link && !asked) {
+        asked = true;
+        options.say?.("Tailscale needs you to switch Funnel on, once. Open this link in your browser and click Enable:");
+        options.say?.(`  ${link}`);
+        options.say?.("Then come back here: it carries on by itself.");
+      }
+    };
+    child.stdout?.on("data", onData);
+    child.stderr?.on("data", onData);
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    child.on("exit", (code) => {
+      clearTimeout(timer);
+      if (code === 0) resolve(seen);
+      else reject(new CardboardError("tunnel_failed", 0, `Tailscale couldn't turn Funnel on (exit code ${code}).`, `What it said:\n${seen.slice(-1500).trim()}`));
+    });
+  });
+}
+
 async function tailscale(port: number, options: { say?: (line: string) => void; timeoutMs?: number }): Promise<Tunnel> {
   const bin = tailscaleBinary();
   const install = "Install Tailscale (free) from tailscale.com/download, log in, and try again.";
@@ -121,21 +182,37 @@ async function tailscale(port: number, options: { say?: (line: string) => void; 
     if ((err as NodeJS.ErrnoException).code === "ENOENT") throw missing("tailscale", install);
     throw new CardboardError("tailscale_off", 0, "Tailscale isn't running, or isn't logged in.", "Open Tailscale and log in, then try again.");
   }
-  if (status.BackendState !== "Running") throw new CardboardError("tailscale_off", 0, "Tailscale isn't running, or isn't logged in.", "Open Tailscale and log in, then try again.");
-  // Runs in the foreground, so the address goes away when Cardboard stops.
-  const child = spawn(bin, ["funnel", String(port)], { stdio: ["ignore", "pipe", "pipe"] });
-  const url = await watchFor(child, funnelUrl, {
-    say: options.say,
-    // The first time, Tailscale asks you to turn Funnel on in your browser: give that time.
-    timeoutMs: options.timeoutMs ?? 5 * 60_000,
-    what: "Tailscale Funnel",
-    hint: "The first time, Tailscale shows a link to turn Funnel on for your account: open it, say yes, then try again.",
-  });
-  const fixed = status.Self?.DNSName ? `https://${status.Self.DNSName.replace(/\.$/, "")}` : url.replace(/\/$/, "");
+  const host = status.Self?.DNSName?.replace(/\.$/, "").toLowerCase();
+  if (status.BackendState !== "Running" || !host) throw new CardboardError("tailscale_off", 0, "Tailscale isn't running, or isn't logged in.", "Open Tailscale and log in, then try again.");
+
+  let config: ServeConfig = {};
+  try {
+    config = JSON.parse((await run(bin, ["serve", "status", "--json"])).trim() || "{}") as ServeConfig;
+  } catch {
+    // Older Tailscale, or nothing shared yet: treat it as nothing shared.
+  }
+  const pick = pickFunnelPort(config, host, port);
+  if (!pick) {
+    throw new CardboardError(
+      "funnel_ports_taken",
+      0,
+      "Your Tailscale already uses all three Funnel ports (443, 8443 and 10000) for other things.",
+      "See what's on them with: tailscale serve status. Free one up, then try again.",
+    );
+  }
+  // In the background, so it behaves the same on Windows, Mac and Linux; Cardboard turns it off when it stops.
+  if (!pick.reuse || !config.AllowFunnel?.[`${host}:${pick.port}`]) {
+    const child = spawn(bin, ["funnel", "--bg", `--https=${pick.port}`, String(port)], { stdio: ["ignore", "pipe", "pipe"] });
+    await finish(child, { say: options.say, timeoutMs: options.timeoutMs ?? 5 * 60_000 });
+  }
   return {
     kind: "tailscale",
-    url: fixed.toLowerCase(),
-    note: "This address stays the same every time. HTTPS ends here on this computer; Tailscale only relays encrypted bytes.",
-    close: () => child.kill(),
+    url: pick.port === 443 ? `https://${host}` : `https://${host}:${pick.port}`,
+    note: `This address stays the same every time${pick.port === 443 ? "" : ` (port ${pick.port}, because your Tailscale already uses 443 for something else)`}. HTTPS ends here on this computer; Tailscale only relays encrypted bytes.`,
+    close: async () => {
+      await run(bin, ["funnel", `--https=${pick.port}`, "off"]).catch(() => {
+        options.say?.(`Couldn't switch Tailscale Funnel off. Do it with: tailscale funnel --https=${pick.port} off`);
+      });
+    },
   };
 }

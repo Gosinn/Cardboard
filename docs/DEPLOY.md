@@ -10,28 +10,42 @@ Three ways, all with real HTTPS (which Face ID needs) and phones that open it li
 
 ## A. Free, on your own computer
 
-Your computer runs Cardboard, and a free tunnel gives it an `https://` address anyone can reach. Cardboard itself only listens on your computer: nothing on your network is opened up.
+Your computer runs Cardboard, and Tailscale Funnel (free) gives it an `https://` address anyone can reach. Cardboard itself only listens on your computer: nothing else on your network is opened up, and HTTPS ends on your computer (Tailscale only passes encrypted traffic along).
 
-1. Install **Node.js** (the LTS version, from [nodejs.org](https://nodejs.org)) and **Tailscale** (from [tailscale.com/download](https://tailscale.com/download)). Open Tailscale and sign in: it's free, with your Google, Microsoft, Apple or GitHub account.
-2. In a terminal:
+You need **Node.js** (nodejs.org, the LTS version) and **Tailscale** (tailscale.com/download), installed, with Tailscale signed in.
 
-   ```bash
-   git clone https://github.com/Gosinn/Cardboard.git && cd Cardboard
-   node src/cli.ts start --tunnel tailscale
-   ```
+**1. Get Cardboard** (once). In PowerShell (Windows) or Terminal (Mac):
 
-   The first time, Tailscale prints a link to turn on **Funnel** (what lets people outside your own devices reach this one address). Open it and say yes; Cardboard carries on by itself.
-3. It prints your address (like `https://laptop.tail1234.ts.net`, the same every time), the host token, and a **QR code of your invite: scan it with your phone** to make your account.
+```
+git clone https://github.com/Gosinn/Cardboard.git
+cd Cardboard
+```
 
-Use the `https://` address everywhere, on this computer too (`http://127.0.0.1:8787` is a different address to your browser, with its own sign-in). Keep the terminal open: Cardboard is online while it runs. On a Mac, start it as `caffeinate -i node src/cli.ts start --tunnel tailscale` so the computer doesn't sleep (keep it plugged in). Next time, run the same command in the same folder: same address, same data (it lives in `cardboard-data/` there).
+**2. Start it:**
 
-HTTPS ends on your own computer: Tailscale only relays encrypted bytes. On Linux, let your user set up Funnel once with `sudo tailscale set --operator=$USER`.
+```
+node src/cli.ts start --tunnel tailscale
+```
 
-**No account at all, just for an afternoon?** `node src/cli.ts start --tunnel cloudflare` (install `cloudflared` first: `brew install cloudflared` on a Mac, `winget install Cloudflare.cloudflared` on Windows). You get a random `https://….trycloudflare.com` address with no sign-up, but:
+**3. Only the very first time:** the window may say *"Tailscale needs you to switch Funnel on"* and show a link starting with `https://login.tailscale.com/…`. Copy that link into your browser, sign in to Tailscale if it asks, and click **Enable**. Go back to the window: it carries on by itself.
 
-- it's a **new address every time** it starts, and then everyone signs back in (recovery kit or pairing);
-- live updates (`watch()`) may not get through;
-- HTTPS ends at Cloudflare's servers, not yours.
+**4. When it's running**, the window shows:
+
+- `Cardboard is online at https://….ts.net` (or `…ts.net:8443` if your Tailscale already uses the usual port for something else). That's your Cardboard's address, the same every time.
+- **A square QR code drawn in the window itself**, made of black and white blocks. Point your phone's camera at it and tap the link that pops up: that opens *Welcome to Cardboard* on your phone. Tap **Make my account**.
+
+**5. Leave the window open.** Cardboard is online while it runs. Ctrl+C stops it (and takes the address offline).
+
+To start it again later: open PowerShell, `cd Cardboard`, and run the same `node src/cli.ts start --tunnel tailscale`. Same address, same data (it's kept in the `cardboard-data` folder inside `Cardboard`).
+
+Good to know:
+
+- **Use the `https://` address everywhere, on this computer too.** `http://127.0.0.1:8787` counts as a different place to your browser, with its own sign-in.
+- **Keep the computer awake.** Windows: Settings → System → Power → *when plugged in, put my device to sleep after*: **Never**. Mac: start it with `caffeinate -i node src/cli.ts start --tunnel tailscale`.
+- **Linux:** let your user set up Funnel once: `sudo tailscale set --operator=$USER`.
+- **Updating:** stop it (Ctrl+C), run `git pull`, start it again.
+
+**No account at all, just for an afternoon?** `node src/cli.ts start --tunnel cloudflare` (install `cloudflared` first: `winget install Cloudflare.cloudflared` on Windows, `brew install cloudflared` on a Mac). No sign-up, but it's a **new address every time** it starts (then everyone signs back in with their recovery kit or by pairing), live updates may not get through, and HTTPS ends at Cloudflare rather than on your computer.
 
 **Always on, still free:** the same command on an old laptop or a Raspberry Pi that stays on at home. (Free cloud servers exist too, such as Oracle Cloud's Always Free tier, but they usually ask for a card at sign-up to check you're real.)
 

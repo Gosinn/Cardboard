@@ -309,15 +309,16 @@ async function main() {
         openSignup: values["open-signup"],
         invites: values.invites === "host" || values.invites === "everyone" ? values.invites : undefined,
         backupEveryMs: values["backup-every"] ? (values["backup-every"] === "never" ? null : parseDuration(values["backup-every"])) : undefined,
-      }).catch((err: NodeJS.ErrnoException) => {
-        tunnel?.close();
+      }).catch(async (err: NodeJS.ErrnoException) => {
+        await tunnel?.close();
         if (err.code === "EADDRINUSE") die(`Port ${values.port ?? 8787} is already in use.`, "Is Cardboard already running? Or pick another port with --port 8788.");
         throw err;
       });
       if (tunnel) {
         console.log(`\n  ${bold("Cardboard is online")} at ${bold(tunnel.url)}  ${dim(`(and ${cb.url} on this computer)`)}`);
         console.log(dim(`  ${tunnel.note}`));
-        console.log(dim("  It's up while this computer is on and awake (Mac: run it with caffeinate -i to stop it sleeping)."));
+        console.log(dim("  It's up while this window stays open and the computer is awake. Stop it with Ctrl+C."));
+        console.log(dim(process.platform === "win32" ? "  So Windows doesn't sleep: Settings → System → Power → when plugged in, sleep after: Never." : process.platform === "darwin" ? "  So the Mac doesn't sleep, start it as: caffeinate -i node src/cli.ts start --tunnel tailscale" : "  Keep the computer from sleeping while it runs."));
       } else console.log(`\n  ${bold("Cardboard is open")} at ${cb.url}`);
       console.log(dim(`  Data: ${cb.paths.dataDir} (sealed by people's own devices: the server can't read it)`));
       console.log(dim(`  Server key: ${cb.paths.keyFile}`));
@@ -327,24 +328,33 @@ async function main() {
         console.log(`\n  ${bold("Host token")} (shown once; saved to ${HOST_FILE}):`);
         console.log(`  ${cb.hostToken}`);
         console.log(dim("  It runs the server (invites, backups, the shake test). It can't open anyone's data."));
-        if (cb.firstInvite) {
-          console.log(`\n  ${bold("Make your account:")} open ${cb.firstInvite}`);
-          printQr(cb.firstInvite, !values["no-qr"]);
-          console.log(`  (scan it with your phone) or run: ${bold("cardboard signup")}`);
-        }
-      } else if (tunnel) printQr(tunnel.url, !values["no-qr"]);
+      }
+      if (cb.firstInvite) {
+        console.log(`\n  ${bold("Make your account:")} scan this with your phone's camera, or open ${cb.firstInvite}`);
+        printQr(cb.firstInvite, !values["no-qr"]);
+        console.log(dim("  (Or make it on this computer with: node src/cli.ts signup)"));
+      } else if (tunnel) {
+        console.log(`\n  ${bold("Open it on your phone:")} scan this with the camera`);
+        printQr(tunnel.url, !values["no-qr"]);
+      }
       if (cb.shake) {
         console.log(`\n  ${cb.shake.ok ? "✓" : "✗"} Shake test: ${cb.shake.summary}`);
         for (const r of cb.shake.results.filter((r) => r.status !== "pass")) console.log(`    ${STATUS[r.status]} ${r.title}: ${r.detail}`);
       }
       console.log("");
+      let stopping = false;
       const stop = async () => {
-        tunnel?.close();
+        if (stopping) return;
+        stopping = true;
+        if (tunnel) console.log(dim("\n  Taking Cardboard offline…"));
+        await tunnel?.close();
         await cb.close();
         process.exit(0);
       };
       process.on("SIGINT", stop);
       process.on("SIGTERM", stop);
+      // Closing the window (Windows and Mac/Linux terminals alike).
+      process.on("SIGHUP", stop);
       return;
     }
 

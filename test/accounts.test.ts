@@ -216,3 +216,29 @@ describe("open sign-up", () => {
     }
   });
 });
+
+describe("the first invite", () => {
+  it("is fresh on every start until someone has made an account, so stopping early can't lock you out", async () => {
+    const { mkdtempSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { startServer } = await import("../src/server/index.ts");
+    const dir = mkdtempSync(join(tmpdir(), "cardboard-first-"));
+    const start = () => startServer({ dataDir: join(dir, "data"), port: 0, shake: false });
+    try {
+      const first = await start();
+      const old = first.firstInvite!;
+      await first.close();
+      const second = await start();
+      assert.ok(second.firstInvite && second.firstInvite !== old);
+      await rejectsWith(signUp({ url: second.url, invite: old, store: new MemoryStore(), kind: "cli" }), "invite_required");
+      await signUp({ url: second.url, invite: second.firstInvite, store: new MemoryStore(), kind: "cli" });
+      await second.close();
+      const third = await start();
+      assert.equal(third.firstInvite, undefined, "once there's an account, invites come from the host or from people here");
+      await third.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
