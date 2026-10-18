@@ -59,3 +59,49 @@ export async function startTestServer(options: StartOptions = {}): Promise<TestS
   };
   return server;
 }
+
+/** Just enough of a browser: keeps cookies, doesn't follow redirects, sends Origin on posts. */
+export class Browser {
+  private readonly cookies = new Map<string, string>();
+  private readonly origin: string;
+  constructor(origin: string) {
+    this.origin = origin;
+  }
+
+  private remember(res: Response) {
+    for (const c of res.headers.getSetCookie()) {
+      const [pair] = c.split(";");
+      const [name, ...value] = pair!.split("=");
+      this.cookies.set(name!, value.join("="));
+    }
+  }
+
+  cookieHeader() {
+    return [...this.cookies].filter(([, v]) => v).map(([k, v]) => `${k}=${v}`).join("; ");
+  }
+
+  async get(url: string) {
+    const res = await fetch(url, { redirect: "manual", headers: { cookie: this.cookieHeader() } });
+    this.remember(res);
+    return { status: res.status, location: res.headers.get("location"), html: await res.text() };
+  }
+
+  async post(url: string, form: Record<string, string>, origin = this.origin) {
+    const res = await fetch(url, {
+      method: "POST",
+      redirect: "manual",
+      headers: { cookie: this.cookieHeader(), origin, "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams(form).toString(),
+    });
+    this.remember(res);
+    return { status: res.status, location: res.headers.get("location"), html: await res.text() };
+  }
+}
+
+export function hiddenFields(html: string): Record<string, string> {
+  const fields: Record<string, string> = {};
+  for (const m of html.matchAll(/<input type="hidden" name="([^"]+)" value="([^"]*)" \/>/g)) {
+    fields[m[1]!] = m[2]!.replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">");
+  }
+  return fields;
+}

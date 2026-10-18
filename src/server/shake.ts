@@ -345,6 +345,56 @@ export function runShake(api: Api): ShakeReport {
         ? pass("Reusing an old refresh token disconnected the app, so a copied token is worthless.")
         : failed("An old refresh token kept working after it was rotated.");
     });
+
+    // ── AI assistants (MCP) ──
+    const mcp = api.mcp;
+    if (mcp) {
+      const boxD = vault.createBox(`__shake-${tag}-d`, { system: true });
+      shakeBoxes.push(boxD.id);
+      vault.put(boxD.id, "private/plan", { note: canary }, {}, "system");
+      const ai = register("shake-ai.example");
+      const aiGrant = oauth.consent({ client: ai, redirectUri: ai.redirectUris[0]!, scopes: ["mcp"] }, { internal: true, shared: [] });
+      if (aiGrant.boxId) shakeBoxes.push(aiGrant.boxId);
+      const tool = (name: string, args: Record<string, unknown>) => {
+        const access = { ...mcp.accessForGrant(aiGrant.id), internal: true };
+        const reply = mcp.handle(access, { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } }) as {
+          result: { isError?: boolean; structuredContent?: Record<string, any> };
+        };
+        return reply.result;
+      };
+
+      check("mcp-unshared", "AI assistants only see what you share", () => {
+        const boxes = (tool("list_boxes", {}).structuredContent?.["boxes"] as unknown[]) ?? [];
+        const peek = tool("read_item", { box: boxD.name, key: "private/plan" });
+        const found = (tool("search", { text: canary }).structuredContent?.["results"] as unknown[]) ?? [];
+        return boxes.length === 1 && peek.isError === true && found.length === 0
+          ? pass("An assistant saw only its own box: it couldn't read, list or search a box you didn't share.")
+          : failed("An assistant reached a box that wasn't shared with it.");
+      });
+
+      check("mcp-readonly", "Shared boxes stay read-only unless you allow changes", () => {
+        oauth.setShared(aiGrant.id, [{ boxId: boxD.id, write: false }]);
+        const read = tool("read_item", { box: boxD.name, key: "private/plan" });
+        const write = tool("save_item", { box: boxD.name, key: "private/plan", value: "overwritten" });
+        return read.isError === undefined && write.isError === true
+          ? pass("An assistant could read a box shared read-only, but not change it.")
+          : failed("An assistant changed a box it was only allowed to read.");
+      });
+
+      check("mcp-auth", "The AI door needs a key", () => {
+        const refused = (token: string | null) => {
+          try {
+            mcp.accessFor(token, PROBE_IP);
+            return false;
+          } catch {
+            return true;
+          }
+        };
+        const ok = refused(null) && refused(`cbt_${randomBytes(32).toString("base64url")}`);
+        api.limiter.reset(PROBE_IP);
+        return ok ? pass("The MCP endpoint refused requests with no key or a made-up one.") : failed("The MCP endpoint let a request in without a valid key.");
+      });
+    }
   } catch (err) {
     results.push({ id: "setup", title: "Shake test setup", status: "fail", detail: (err as Error).message });
   } finally {

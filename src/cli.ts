@@ -52,6 +52,8 @@ Cardboard ${VERSION}: a smart, private deposit box for your apps.
     cardboard apps add <name> --redirect <url>[,url] [--public]   Register an app by hand
     cardboard apps disconnect <app> [--shred]   Cut an app off (and shred what it kept)
     cardboard apps forget <client-id>       Remove an app's registration
+    cardboard apps share <assistant> <box>[:change] ...   What an AI assistant may see (and change)
+    cardboard mcp                           How to connect Claude and other AI assistants
     cardboard profile [--name "Gosinn"] [--email you@example.com]   What apps may see, if you allow it
 
   Boxes
@@ -473,8 +475,11 @@ async function main() {
         console.log(`${bold("Sign in with Cardboard")}  ${dim(`issuer ${data.issuer}`)}`);
         if (data.connected.length === 0) console.log(dim("  No apps connected yet."));
         for (const a of data.connected) {
-          console.log(`\n  ${bold(a.name)} ${dim(a.site)}`);
+          console.log(`\n  ${bold(a.name)} ${dim(a.site)}${a.assistant ? "  (AI assistant)" : ""}`);
           console.log(`    may: ${a.scopes.join(", ")}${a.box ? `  ·  data in box ${a.box}` : ""}`);
+          if (a.assistant) {
+            console.log(`    can see: ${a.shared.length ? a.shared.map((s) => `${s.box}${s.write ? " (can change)" : ""}`).join(", ") : "only its own box"}`);
+          }
           console.log(dim(`    knows you as ${a.privateId} · connected ${relativeTime(a.connectedAt, Date.now())} · grant ${a.grant}`));
         }
         if (data.registered.length) {
@@ -501,11 +506,44 @@ async function main() {
         const r = await admin<{ disconnected: string; shredded: string | null }>("apps.disconnect", { grant: match.grant, shred: values.shred });
         return console.log(`✓ Disconnected ${r.disconnected}.${r.shredded ? ` Shredded its box ${r.shredded}.` : match.box ? ` Its box ${match.box} is still yours.` : ""}`);
       }
+      if (action === "share") {
+        const which = need(target, "Usage: cardboard apps share <assistant> <box>[:change] ...");
+        const { connected } = await admin<AppsView>("apps");
+        const match = connected.find((a) => a.grant === which || a.name.toLowerCase() === which.toLowerCase());
+        if (!match) die(`No connected app called ${which}.`, "See them with: cardboard apps");
+        const shared = args.slice(2).map((spec) => {
+          const [box, mode] = spec.split(":");
+          return { box: box!, write: mode === "change" };
+        });
+        await admin("apps.share", { grant: match.grant, shared });
+        return console.log(
+          `✓ ${match.name} can now see: ${shared.length ? shared.map((s) => `${s.box}${s.write ? " (can change)" : ""}`).join(", ") : "only its own box"}.`,
+        );
+      }
       if (action === "forget") {
         const r = await admin<{ forgotten: string }>("apps.forget", { client: need(target, "Which client id? cardboard apps forget <client-id>") });
         return console.log(`✓ Forgot ${r.forgotten}.`);
       }
       return die("Usage: cardboard apps [add|disconnect|forget]", "See: cardboard help");
+    }
+
+    case "mcp": {
+      const { issuer } = await admin<AppsView>("apps");
+      const url = `${issuer}/mcp`;
+      console.log(`\n  ${bold("Connect an AI assistant")} to ${url}\n`);
+      console.log(`  Claude (web/desktop): Settings → Connectors → Add custom connector → ${url}`);
+      console.log(`  Claude Code:          claude mcp add --transport http cardboard ${url}`);
+      console.log(`  Anything else:        the URL above; it signs in with OAuth on its own.`);
+      console.log(dim(`\n  It gets its own box to remember things for you and sees nothing else until you share it:`));
+      console.log(dim(`  cardboard apps share Claude notes recipes:change`));
+      if (!/^https:/.test(issuer) && !/127\.0\.0\.1|localhost/.test(issuer)) {
+        console.log(dim(`\n  Note: web assistants need https. Start Cardboard with --public-url https://…`));
+      } else if (!/^https:/.test(issuer)) {
+        console.log(dim(`\n  Note: Claude on the web connects from the internet, so it needs a public https address (--public-url).`));
+        console.log(dim(`  Claude Code and other local assistants can use this local address as is.`));
+      }
+      console.log("");
+      return;
     }
 
     case "profile": {
@@ -631,7 +669,17 @@ async function main() {
 interface AppsView {
   issuer: string;
   profile: { name?: string; email?: string };
-  connected: Array<{ grant: string; name: string; site: string; scopes: string[]; box: string | null; privateId: string; connectedAt: number }>;
+  connected: Array<{
+    grant: string;
+    name: string;
+    site: string;
+    scopes: string[];
+    box: string | null;
+    privateId: string;
+    connectedAt: number;
+    assistant: boolean;
+    shared: Array<{ box: string; write: boolean }>;
+  }>;
   registered: Array<{ client: string; name: string; redirectUris: string[] }>;
 }
 

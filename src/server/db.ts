@@ -179,6 +179,15 @@ const MIGRATIONS: string[] = [
     last_seen_at INTEGER
   ) WITHOUT ROWID;
   `,
+  `
+  -- Boxes you shared with an AI assistant (MCP). Read-only unless can_write.
+  CREATE TABLE oauth_grant_boxes (
+    grant_id  TEXT NOT NULL REFERENCES oauth_grants(id) ON DELETE CASCADE,
+    box_id    TEXT NOT NULL REFERENCES boxes(id) ON DELETE CASCADE,
+    can_write INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (grant_id, box_id)
+  ) WITHOUT ROWID;
+  `,
 ];
 
 export function openDb(path: string): DB {

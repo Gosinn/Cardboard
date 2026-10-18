@@ -47,6 +47,8 @@ export class Audit {
   private readonly db: DB;
   private readonly vault: Vault;
   private readonly tapes: Tapes;
+  /** Names actors this module doesn't know about (e.g. "grant:…" for AI assistants). */
+  resolveActor: (actor: string) => string | null = () => null;
 
   constructor(db: DB, vault: Vault, tapes: Tapes) {
     this.db = db;
@@ -150,6 +152,8 @@ export class Audit {
     if (actor === "owner") return "You";
     if (actor === "system") return "Cardboard";
     if (actor === "anonymous") return "Someone without a valid tape";
+    const resolved = this.resolveActor(actor);
+    if (resolved) return resolved;
     if (actor.startsWith("tape:")) {
       const tape = this.tapes.get(actor.slice(5));
       if (!tape) return "A tape that no longer exists";
@@ -257,6 +261,8 @@ function describe(who: string, action: string, outcome: Outcome, d: LogDetail, b
       return `${who} turned down ${d.name ?? "an app"}`;
     case "app.disconnect":
       return `${who} disconnected ${d.name ?? "an app"}${d.note ? ` ${d.note}` : ""}`;
+    case "app.share":
+      return `${who} changed what ${d.name ?? "an assistant"} can see: ${d.note ?? ""}`;
     case "app.forget":
       return `${who} forgot the app ${d.name ?? ""}`;
     default:

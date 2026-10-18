@@ -871,10 +871,41 @@ function newDockCard(boxes) {
   return form;
 }
 
-const SCOPE_LABEL = { openid: "knows you (private ID)", profile: "your name", email: "your email", box: "keeps data in your Cardboard", offline_access: "stays connected" };
+const SCOPE_LABEL = { openid: "knows you (private ID)", profile: "your name", email: "your email", box: "keeps data in your Cardboard", mcp: "AI assistant", offline_access: "stays connected" };
+
+/** Which boxes an AI assistant may see (and change). Ticking "change" also means "see". */
+function shareEditor(a, boxes) {
+  const rows = boxes
+    .filter((b) => b.name !== a.box)
+    .map((b) => {
+      const current = a.shared.find((s) => s.box === b.name);
+      return { name: b.name, see: h("input", { type: "checkbox", checked: Boolean(current) }), change: h("input", { type: "checkbox", checked: Boolean(current?.write) }) };
+    });
+  const status = h("div");
+  const form = h(
+    "form",
+    { class: "stack" },
+    rows.length
+      ? h("div", { class: "table-wrap" }, h("table", {}, h("thead", {}, h("tr", {}, h("th", {}, "Box"), h("th", {}, "See"), h("th", {}, "Change"))), h("tbody", {}, rows.map((r) => h("tr", {}, h("td", { class: "mono" }, r.name), h("td", {}, r.see), h("td", {}, r.change))))))
+      : h("p", { class: "muted small" }, "You have no other boxes to share."),
+    rows.length ? h("div", {}, h("button", { type: "submit", class: "secondary tiny" }, "Save")) : null,
+    status,
+  );
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    try {
+      const shared = rows.filter((r) => r.see.checked || r.change.checked).map((r) => ({ box: r.name, write: r.change.checked }));
+      await api("apps.share", { grant: a.grant, shared });
+      status.replaceChildren(h("span", { class: "chip ok" }, "Saved. It applies to its next request."));
+    } catch (err) {
+      status.replaceChildren(errorBox(err));
+    }
+  });
+  return h("details", {}, h("summary", { class: "small" }, a.shared.length ? `Can see: ${a.shared.map((s) => `${s.box}${s.write ? " (can change)" : ""}`).join(", ")}` : "Can see: only its own box"), form);
+}
 
 async function renderApps() {
-  const data = await api("apps");
+  const [data, { boxes }] = await Promise.all([api("apps"), api("boxes")]);
   const connected = data.connected.map((a) => {
     const disconnect = h("button", { type: "button", class: "secondary tiny" }, "Disconnect");
     const shred = a.box ? h("button", { type: "button", class: "danger tiny" }, "Disconnect & shred its data") : null;
@@ -900,6 +931,7 @@ async function renderApps() {
         a.box ? [" · data in ", h("a", { href: `#/box/${encodeURIComponent(a.box)}` }, a.box)] : null,
       ),
       h("div", { class: "muted small mono" }, `knows you as ${a.privateId}`),
+      a.assistant ? shareEditor(a, boxes) : null,
     );
   });
 
@@ -927,7 +959,7 @@ async function renderApps() {
         h("section", { class: "card" }, h("h2", {}, "Connected"), connected.length ? h("ul", { class: "list" }, connected) : h("p", { class: "muted" }, "No apps yet. When an app shows “Sign in with Cardboard”, this is where it lands.")),
         registered.length ? h("section", { class: "card" }, h("h2", {}, "Registered, not connected"), h("ul", { class: "list" }, registered)) : null,
       ),
-      h("div", {}, profileCard(data.profile), connectCard(data.issuer)),
+      h("div", {}, profileCard(data.profile), assistantCard(data.issuer), connectCard(data.issuer)),
     ),
   );
 }
@@ -956,6 +988,20 @@ function profileCard(profile) {
     }
   });
   return form;
+}
+
+function assistantCard(issuer) {
+  const url = `${issuer}/mcp`;
+  const cmd = `claude mcp add --transport http cardboard ${url}`;
+  return h(
+    "section",
+    { class: "card stack" },
+    h("h2", {}, "Connect an AI assistant"),
+    h("p", { class: "small" }, "Cardboard is an MCP server. Add this address as a connector in Claude (or any assistant that supports MCP). It signs in through the same consent screen, gets its own box to remember things for you, and sees only the boxes you tick."),
+    h("div", { class: "row" }, h("code", { class: "secret" }, url), copyButton(url)),
+    h("p", { class: "muted small" }, "Claude Code:"),
+    h("div", { class: "row" }, h("code", { class: "secret" }, cmd), copyButton(cmd)),
+  );
 }
 
 function connectCard(issuer) {

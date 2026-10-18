@@ -114,6 +114,23 @@ Under the hood it follows OAuth 2.1 and current security advice: PKCE is require
 
 Set `--public-url https://cardboard.example.com` (or `CARDBOARD_PUBLIC_URL`) so apps reach you at your real address. Manage everything on the dashboard's **Apps** page or with `cardboard apps`.
 
+## AI assistants (MCP)
+
+Cardboard is an **MCP server**, so Claude and other AI assistants can connect to it:
+
+```
+Claude (web/desktop): Settings → Connectors → Add custom connector → https://your-cardboard/mcp
+Claude Code:          claude mcp add --transport http cardboard https://your-cardboard/mcp
+```
+
+The assistant signs in through the same Sign in with Cardboard consent screen, and you decide what it gets:
+
+- **Its own box.** A memory *you* own, for remembering things for you across conversations. You can read it, edit it or shred it.
+- **Only the boxes you tick.** Nothing is shared by default. Each shared box is read-only unless you tick "change". Change it any time on the Apps page or with `cardboard apps share Claude notes recipes:change`.
+- **Everything on the record.** The log says *"Claude (AI assistant) read “notes/groceries”"*. Every change it makes is a new version, so it can be undone.
+
+The assistant gets 9 tools: `list_boxes`, `list_keys`, `read_item`, `find_items`, `search`, `save_item`, `delete_item`, `undo_change` and `item_history`. MCP clients that take a header can also connect with a plain tape (`Authorization: Bearer cbt_…`) and see just that tape's box. Claude on the web connects from the internet, so it needs Cardboard at a public https address (`--public-url`). Local assistants can use `http://127.0.0.1`.
+
 ## What makes it private
 
 - **Everything is encrypted at rest** with AES-256-GCM, including key names. Each box has its own random key, wrapped by a master key that lives in a separate file.
@@ -142,6 +159,7 @@ It **doesn't (yet) protect against:**
 - plain HTTP across a network. Put it behind HTTPS (Cardboard warns you if you don't).
 - exports, which are plain JSON by design ("moving day"). Backups are encrypted.
 - backups made *before* a shred, which still contain that box.
+- an AI assistant being tricked by what it reads. Data in a shared box was written by apps, and could contain text written to manipulate an assistant (prompt injection). Cardboard tells assistants to treat values as data, keeps shared boxes read-only by default, and logs and versions everything, but the safest share is the smallest one.
 
 ---
 
@@ -212,7 +230,6 @@ CARDBOARD_DATA=/srv/cardboard CARDBOARD_KEY_FILE=/root/cardboard.key cardboard s
 
 ## Roadmap
 
-- **MCP server**: the connector standard AI assistants use. Let Claude and other AI apps work with your boxes, with the same consent screen and the same OAuth underneath
 - **Passkeys**: sign in to your Cardboard with Face ID or a fingerprint instead of the owner token
 - **Accounts for people you trust**: host Cardboards for family and friends on one server, each with their own keys
 

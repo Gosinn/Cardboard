@@ -8,6 +8,7 @@ import { sameBytes, sha256 } from "./crypto.ts";
 import { getMeta, setMeta, type DB } from "./db.ts";
 import type { Berth, Dock, Docks } from "./docks.ts";
 import type { Hub } from "./hub.ts";
+import type { Mcp } from "./mcp.ts";
 import type { OAuth } from "./oauth.ts";
 import { insights, type BoxFacts, type ServerInfo } from "./insights.ts";
 import { inventory, type Inventory } from "./labels.ts";
@@ -96,6 +97,8 @@ export class Api {
   readonly ctx: Context;
   readonly limiter = new FailureLimiter();
   lastShake: ShakeReport | null = null;
+  /** Set by the HTTP layer; the shake test uses it to attack the MCP tools. */
+  mcp: Mcp | null = null;
   private readonly inventories = new Map<string, Inventory>();
   private readonly appOps: Record<string, AppOp>;
   private readonly adminOps: Record<string, AdminOp>;
@@ -804,6 +807,11 @@ export class Api {
           scopes: g.scopes,
           box: g.boxId ? (vault.getBox(g.boxId)?.name ?? null) : null,
           privateId: this.ctx.oauth.subjectFor(g.sector),
+          assistant: g.scopes.includes("mcp"),
+          shared: this.ctx.oauth.shared(g.id).flatMap((s) => {
+            const b = vault.getBox(s.boxId);
+            return b ? [{ box: b.name, write: s.write }] : [];
+          }),
           connectedAt: g.createdAt,
           lastUsedAt: g.lastUsedAt,
           selfRegistered: g.client.registeredBy === "self",
@@ -846,6 +854,26 @@ export class Api {
         }
         audit.record(shredded ? null : grant.boxId, owner, "app.disconnect", "ok", { name: client?.name, note: shredded ? `and shredded ${shredded}` : undefined });
         return { disconnected: client?.name ?? grant.clientId, shredded };
+      },
+
+      "apps.share": (body) => {
+        const grant = this.ctx.oauth.grant(requireString(body, "grant"));
+        if (!grant || grant.revokedAt !== null) throw fail("no_such_app", 404, "That app isn't connected.");
+        if (!grant.scopes.includes("mcp")) throw fail("not_assistant", 400, "Only AI assistants (MCP) can be given other boxes.");
+        const list = body["shared"];
+        if (!Array.isArray(list)) throw fail("bad_request", 400, '`shared` is a list like [{ "box": "notes", "write": false }].');
+        const shared = list.map((entry) => {
+          const e = asBody(entry);
+          const box = vault.requireBox(requireString(e, "box"));
+          return { boxId: box.id, write: optBoolean(e, "write") ?? false };
+        });
+        this.ctx.oauth.setShared(grant.id, shared);
+        const client = this.ctx.oauth.client(grant.clientId);
+        audit.record(null, owner, "app.share", "ok", {
+          name: client?.name,
+          note: shared.map((s) => `${vault.getBox(s.boxId)?.name}${s.write ? " (change)" : ""}`).join(", ") || "nothing",
+        });
+        return { shared: shared.map((s) => ({ box: vault.getBox(s.boxId)?.name, write: s.write })) };
       },
 
       "apps.forget": (body) => {

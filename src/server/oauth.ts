@@ -19,7 +19,7 @@ import type { Box, Vault } from "./vault.ts";
  *    rotating refresh tokens with reuse detection, ES256-signed ID tokens.
  */
 
-export const SCOPES = ["openid", "profile", "email", "box", "offline_access"] as const;
+export const SCOPES = ["openid", "profile", "email", "box", "mcp", "offline_access"] as const;
 export type Scope = (typeof SCOPES)[number];
 
 const ACCESS_TTL = 60 * 60 * 1000;
@@ -363,7 +363,14 @@ export class OAuth {
     if (!challenge || params.get("code_challenge_method") !== "S256" || !/^[A-Za-z0-9_-]{43}$/.test(challenge)) {
       return back("invalid_request", "PKCE is required: send code_challenge with code_challenge_method=S256.");
     }
-    const requested = (params.get("scope") ?? "openid").split(/\s+/).filter(Boolean);
+    // RFC 8707: MCP clients name the server they want a token for. Asking for /mcp means asking for the mcp scope.
+    const resource = params.get("resource");
+    const mcpResource = this.mcpResource();
+    if (resource !== null && resource !== mcpResource && resource !== this.issuer()) {
+      return back("invalid_target", `Cardboard only issues tokens for ${this.issuer()} and ${mcpResource}.`);
+    }
+    const requested = (params.get("scope") ?? (resource === mcpResource ? "mcp" : "openid")).split(/\s+/).filter(Boolean);
+    if (resource === mcpResource && !requested.includes("mcp")) requested.push("mcp");
     const scopes = SCOPES.filter((s) => requested.includes(s));
     if (scopes.length === 0) return back("invalid_scope", `Ask for at least one of: ${SCOPES.join(", ")}.`);
     return {
@@ -379,6 +386,11 @@ export class OAuth {
         prompt: params.get("prompt"),
       },
     };
+  }
+
+  /** The MCP endpoint, as a resource indicator (RFC 8707 / RFC 9728). */
+  mcpResource(): string {
+    return `${this.issuer()}/mcp`;
   }
 
   redirectWith(redirectUri: string, params: Record<string, string | null | undefined>): string {
@@ -399,7 +411,10 @@ export class OAuth {
    * You said yes. Creates or widens the grant, and for the `box` scope gives the
    * app a box (the same one again if this app has been connected before).
    */
-  consent(request: Pick<AuthRequest, "client" | "redirectUri" | "scopes">, options: { internal?: boolean } = {}): Grant {
+  consent(
+    request: Pick<AuthRequest, "client" | "redirectUri" | "scopes">,
+    options: { internal?: boolean; shared?: Array<{ boxId: string; write: boolean }> } = {},
+  ): Grant {
     const { client, redirectUri, scopes } = request;
     const sector = new URL(redirectUri).origin === "null" ? redirectUri.split(":")[0]! : new URL(redirectUri).origin;
     return transaction(this.db, () => {
@@ -416,12 +431,30 @@ export class OAuth {
           .prepare("INSERT INTO oauth_grants (id, client_id, sector, scopes, created_at) VALUES (?, ?, ?, ?, ?)")
           .run(grant.id, client.id, sector, scopes.join(" "), now);
       }
-      if (grant.scopes.includes("box") && !(grant.boxId && this.vault.getBox(grant.boxId))) {
+      if (ownsBox(grant) && !(grant.boxId && this.vault.getBox(grant.boxId))) {
         const box = this.previousBox(sector) ?? this.newAppBox(client, options.internal);
         this.db.prepare("UPDATE oauth_grants SET box_id = ? WHERE id = ?").run(box.id, grant.id);
         grant = { ...grant, boxId: box.id };
       }
+      if (options.shared && grant.scopes.includes("mcp")) this.setShared(grant.id, options.shared);
       return grant;
+    });
+  }
+
+  /** Boxes (besides its own) an AI assistant may see, and whether it may change them. */
+  shared(grantId: string): Array<{ boxId: string; write: boolean }> {
+    const rows = this.db.prepare("SELECT box_id, can_write FROM oauth_grant_boxes WHERE grant_id = ?").all(grantId) as Array<{
+      box_id: string;
+      can_write: number;
+    }>;
+    return rows.map((r) => ({ boxId: r.box_id, write: r.can_write === 1 }));
+  }
+
+  setShared(grantId: string, shared: Array<{ boxId: string; write: boolean }>) {
+    transaction(this.db, () => {
+      this.db.prepare("DELETE FROM oauth_grant_boxes WHERE grant_id = ?").run(grantId);
+      const insert = this.db.prepare("INSERT OR REPLACE INTO oauth_grant_boxes (grant_id, box_id, can_write) VALUES (?, ?, ?)");
+      for (const s of shared) insert.run(grantId, s.boxId, s.write ? 1 : 0);
     });
   }
 
@@ -518,7 +551,7 @@ export class OAuth {
   private issueTokens(grant: Grant, client: Client, ctx: { nonce: string | null; authTime: number | null }): TokenSet {
     const now = this.now();
     let box = grant.boxId ? this.vault.getBox(grant.boxId) : undefined;
-    if (!box && grant.scopes.includes("box")) {
+    if (!box && ownsBox(grant)) {
       // You shredded its box but kept it connected: it starts over with an empty one.
       box = this.newAppBox(client, client.registeredBy === "shake");
       this.db.prepare("UPDATE oauth_grants SET box_id = ? WHERE id = ?").run(box.id, grant.id);
@@ -680,6 +713,11 @@ export class OAuth {
       .run(now - UNUSED_CLIENT_TTL);
     this.tapes.sweepGrantTapes();
   }
+}
+
+/** Apps with the box scope, and AI assistants (mcp), get a box of their own. */
+function ownsBox(grant: Grant): boolean {
+  return grant.scopes.includes("box") || grant.scopes.includes("mcp");
 }
 
 /** https anywhere, http only on this machine, or a native app scheme with a dot (RFC 8252). */

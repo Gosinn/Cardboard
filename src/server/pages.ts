@@ -62,6 +62,10 @@ const PERMISSIONS: Record<Scope, (ctx: { profile: OwnerProfile; boxName: string 
     "Keep its data about you in your Cardboard",
     `${boxName ? `In the box “${boxName}”.` : "In a box of its own."} Not in its own database. You can look inside, take it with you, or shred it whenever you like.`,
   ],
+  mcp: ({ boxName }) => [
+    "Work with your Cardboard as an AI assistant",
+    `It gets its own box${boxName ? ` (“${boxName}”)` : ""} to remember things for you. It sees only the boxes you tick below, changes only the ones you allow, and every change it makes is logged and can be undone.`,
+  ],
   offline_access: () => null,
 };
 
@@ -71,6 +75,9 @@ export function consentPage(options: {
   boxName: string | null;
   csrf: string;
   now: number;
+  /** Your boxes, for choosing what an AI assistant may see. */
+  boxes?: Array<{ name: string; summary: string }>;
+  shared?: Array<{ name: string; write: boolean }>;
 }): string {
   const { request, profile, boxName, csrf, now } = options;
   const { client } = request;
@@ -95,10 +102,11 @@ export function consentPage(options: {
     `<h1>Let <span class="mono">${esc(client.name)}</span> in?</h1>
 <p class="muted">It's asking to:</p>
 <ul class="list perms">${permissions}</ul>
+${request.scopes.includes("mcp") ? shareList(options.boxes ?? [], options.shared ?? []) : ""}
 <p class="small">It stays connected until you disconnect it from your Cardboard, or until it goes unused for 30 days.</p>
 ${unverified(client, now)}
 <p class="small muted">After you choose, you'll go back to <strong>${esc(destination)}</strong>.</p>
-<form method="post" action="/oauth/authorize" class="row">
+<form method="post" action="/oauth/authorize" class="row" id="consent">
 ${Object.entries(hidden)
   .filter(([, v]) => v !== null && v !== undefined)
   .map(([k, v]) => `<input type="hidden" name="${esc(k)}" value="${esc(v)}" />`)
@@ -107,6 +115,22 @@ ${Object.entries(hidden)
 <button type="submit" name="decision" value="deny" class="secondary">No thanks</button>
 </form>`,
   );
+}
+
+/** Checkboxes live outside the form element, so they point at it with form="consent". */
+function shareList(boxes: Array<{ name: string; summary: string }>, shared: Array<{ name: string; write: boolean }>): string {
+  if (boxes.length === 0) return `<p class="small muted">You have no other boxes yet, so it only gets its own.</p>`;
+  const rows = boxes
+    .map((b) => {
+      const current = shared.find((s) => s.name === b.name);
+      return `<tr><td><span class="mono">${esc(b.name)}</span><div class="muted small">${esc(b.summary)}</div></td>
+<td><label class="check"><input type="checkbox" form="consent" name="read" value="${esc(b.name)}"${current ? " checked" : ""} /> see</label></td>
+<td><label class="check"><input type="checkbox" form="consent" name="write" value="${esc(b.name)}"${current?.write ? " checked" : ""} /> change</label></td></tr>`;
+    })
+    .join("\n");
+  return `<div class="share"><strong>Which of your boxes may it see?</strong>
+<div class="table-wrap"><table><tbody>${rows}</tbody></table></div>
+<p class="muted small">Nothing is ticked unless you tick it. “Change” includes “see”. You can change this any time on your Cardboard's Apps page.</p></div>`;
 }
 
 function unverified(client: Client, now: number): string {

@@ -9,6 +9,7 @@ import { Api, errorResponse, type ApiRequest } from "./api.ts";
 import { Audit } from "./audit.ts";
 import { Docks, type Parcel } from "./docks.ts";
 import { Hub } from "./hub.ts";
+import { Mcp } from "./mcp.ts";
 import { OAuth } from "./oauth.ts";
 import { createOAuthHandler } from "./oauth-http.ts";
 import type { ServerInfo } from "./insights.ts";
@@ -103,6 +104,14 @@ export async function startServer(options: StartOptions = {}): Promise<RunningCa
   };
   const oauth = new OAuth(db, vault, tapes, () => info.publicUrl);
   const api = new Api({ db, vault, tapes, audit, hub, docks, oauth, info });
+  const mcp = new Mcp(api);
+  api.mcp = mcp;
+  audit.resolveActor = (actor) => {
+    if (!actor.startsWith("grant:")) return null;
+    const grant = oauth.grant(actor.slice(6));
+    const client = grant ? oauth.client(grant.clientId) : undefined;
+    return client ? `${client.name} (AI assistant)` : "A disconnected assistant";
+  };
   const oauthHandler = createOAuthHandler({
     oauth,
     api,
@@ -124,6 +133,7 @@ export async function startServer(options: StartOptions = {}): Promise<RunningCa
     res.setHeader("referrer-policy", "no-referrer");
     res.setHeader("x-frame-options", "DENY");
     const path = new URL(req.url ?? "/", "http://cardboard.local").pathname;
+    if (await mcp.http(req, res, path, clientIp(req, info.trustProxy))) return;
     if (await oauthHandler(req, res, path)) return;
 
     if (req.method === "GET" || req.method === "HEAD") {

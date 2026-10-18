@@ -104,6 +104,8 @@ describe("cardboard CLI", () => {
     assert.match(added.stdout, /client_secret\s+cbs_/);
     const profile = await cli(["profile", "--name", "Gosinn", "--email", "gosinn@example.is"]);
     assert.match(profile.stdout, /Name:\s+Gosinn/);
+    const mcp = await cli(["mcp"]);
+    assert.match(mcp.stdout, /claude mcp add --transport http cardboard http:\/\/127\.0\.0\.1:\d+\/mcp/);
     const apps = await cli(["apps"]);
     assert.match(apps.stdout, /Registered, not connected/);
     assert.match(apps.stdout, /Notes Web/);

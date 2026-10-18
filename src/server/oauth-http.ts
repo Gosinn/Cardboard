@@ -183,10 +183,32 @@ export function createOAuthHandler(deps: OAuthHttpDeps) {
     if (request.prompt === "none") return redirect(res, 302, oauth.redirectWith(request.redirectUri, { error: "consent_required", state: request.state }));
     const previous = oauth.grantsOf(request.client.id).find((g) => g.boxId);
     const boxName = previous?.boxId ? (api.ctx.vault.getBox(previous.boxId)?.name ?? null) : null;
+    const active = oauth.grantsOf(request.client.id).find((g) => g.revokedAt === null);
+    const { vault } = api.ctx;
+    const boxes = request.scopes.includes("mcp")
+      ? vault
+          .listBoxes()
+          .filter((b) => b.id !== previous?.boxId)
+          .map((b) => ({ name: b.name, summary: api.inventoryFor(b.id).summary }))
+      : [];
+    const shared = active
+      ? oauth.shared(active.id).flatMap((s) => {
+          const box = vault.getBox(s.boxId);
+          return box ? [{ name: box.name, write: s.write }] : [];
+        })
+      : [];
     return html(
       res,
       200,
-      consentPage({ request, profile: oauth.profile(), boxName, csrf: oauth.csrf(session.hash, request.client.id), now: api.ctx.vault.now() }),
+      consentPage({
+        request,
+        profile: oauth.profile(),
+        boxName,
+        csrf: oauth.csrf(session.hash, request.client.id),
+        now: vault.now(),
+        boxes,
+        shared,
+      }),
       [formTarget(request.redirectUri)],
     );
   }
@@ -205,8 +227,16 @@ export function createOAuthHandler(deps: OAuthHttpDeps) {
       log("app.deny", "ok", { name: request.client.name });
       return redirect(res, 303, oauth.redirectWith(request.redirectUri, { error: "access_denied", error_description: "You said no.", state: request.state }));
     }
-    const grant = oauth.consent(request);
-    log("app.connect", "ok", { name: request.client.name, note: grant.scopes.join(" ") }, grant.boxId);
+    // What an AI assistant may see: ticked boxes only ("change" includes "see"), never system boxes.
+    const { vault } = api.ctx;
+    const names = new Set([...form.getAll("read"), ...form.getAll("write")]);
+    const shared = [...names].flatMap((name) => {
+      const box = vault.findBox(name);
+      return box && !box.system ? [{ boxId: box.id, write: form.getAll("write").includes(name) }] : [];
+    });
+    const grant = oauth.consent(request, request.scopes.includes("mcp") ? { shared } : {});
+    const sharedNote = shared.length ? `; shared ${shared.map((s) => `${vault.getBox(s.boxId)?.name}${s.write ? " (change)" : ""}`).join(", ")}` : "";
+    log("app.connect", "ok", { name: request.client.name, note: `${grant.scopes.join(" ")}${sharedNote}` }, grant.boxId);
     return redirect(res, 303, codeRedirect(request, grant, session.createdAt));
   }
 
