@@ -1,32 +1,17 @@
-import {
-  createCipheriv,
-  createDecipheriv,
-  createHash,
-  createHmac,
-  hkdfSync,
-  randomBytes,
-  timingSafeEqual,
-} from "node:crypto";
+import { createCipheriv, createDecipheriv, createHash, createHmac, hkdfSync, randomBytes, timingSafeEqual } from "node:crypto";
 import { fail } from "../shared/errors.ts";
 
 /**
- * Cardboard's crypto, kept deliberately boring: AES-256-GCM, HKDF and HMAC
- * from Node's built-in OpenSSL bindings. No custom primitives.
- *
- *   master key ──HKDF──► wrap key ──AES-GCM──► wrapped box key (stored in DB)
- *   box key    ──HKDF──► enc key   (values, key names, audit details)
- *              └─HKDF──► index key (HMAC blind index, so key names can be looked
- *                                   up without being stored in plain text)
+ * The server's own crypto. Note what's NOT here: nothing in this file can open
+ * anything a person stored. Your data is sealed on your devices with keys the
+ * server never gets (see src/client/crypto.ts); the server only hashes tokens,
+ * computes pseudonyms, signs sign-in tokens, and seals its own few secrets
+ * (the sign-in signing key, names you chose to pass to an app in the clear).
  */
 
 const FORMAT = 1;
 const IV_BYTES = 12;
 const TAG_BYTES = 16;
-
-export interface BoxKeys {
-  enc: Buffer;
-  idx: Buffer;
-}
 
 export function randomKey(): Buffer {
   return randomBytes(32);
@@ -36,15 +21,6 @@ export function derive(key: Buffer, purpose: string): Buffer {
   return Buffer.from(hkdfSync("sha256", key, Buffer.alloc(0), `cardboard/${purpose}/v1`, 32));
 }
 
-export function deriveBoxKeys(boxKey: Buffer): BoxKeys {
-  return { enc: derive(boxKey, "box-enc"), idx: derive(boxKey, "box-idx") };
-}
-
-/**
- * Encrypts `plaintext`. The `context` string is authenticated but not stored:
- * a ciphertext only opens with the same context, so a value can't be moved to
- * another key or another box, even by someone with write access to the DB.
- */
 export function seal(key: Buffer, plaintext: Buffer | string, context: string): Buffer {
   const iv = randomBytes(IV_BYTES);
   const cipher = createCipheriv("aes-256-gcm", key, iv);
@@ -56,14 +32,11 @@ export function seal(key: Buffer, plaintext: Buffer | string, context: string): 
 export function unseal(key: Buffer, sealed: Uint8Array, context: string): Buffer {
   const buf = Buffer.from(sealed.buffer, sealed.byteOffset, sealed.byteLength);
   if (buf.length < 1 + IV_BYTES + TAG_BYTES || buf[0] !== FORMAT) throw tampered();
-  const iv = buf.subarray(1, 1 + IV_BYTES);
-  const tag = buf.subarray(buf.length - TAG_BYTES);
-  const body = buf.subarray(1 + IV_BYTES, buf.length - TAG_BYTES);
-  const decipher = createDecipheriv("aes-256-gcm", key, iv);
+  const decipher = createDecipheriv("aes-256-gcm", key, buf.subarray(1, 1 + IV_BYTES));
   decipher.setAAD(Buffer.from(context));
-  decipher.setAuthTag(tag);
+  decipher.setAuthTag(buf.subarray(buf.length - TAG_BYTES));
   try {
-    return Buffer.concat([decipher.update(body), decipher.final()]);
+    return Buffer.concat([decipher.update(buf.subarray(1 + IV_BYTES, buf.length - TAG_BYTES)), decipher.final()]);
   } catch {
     throw tampered();
   }
@@ -73,22 +46,21 @@ function tampered() {
   return fail(
     "tampered",
     500,
-    "Stored data failed its integrity check, so Cardboard refused to read it.",
-    "The database file was modified outside Cardboard, or it is being opened with the wrong master key.",
+    "A server secret failed its integrity check, so Cardboard refused to use it.",
+    "The database was modified outside Cardboard, or it's being opened with the wrong server key.",
   );
 }
 
-/** Deterministic, keyed fingerprint of a key name. Reveals nothing without the box key. */
-export function blindIndex(idxKey: Buffer, name: string): Buffer {
-  return createHmac("sha256", idxKey).update(name).digest();
+export function hmac(key: Buffer, data: string): Buffer {
+  return createHmac("sha256", key).update(data).digest();
 }
 
-export function sha256(input: string): Buffer {
+export function sha256(input: string | Uint8Array): Buffer {
   return createHash("sha256").update(input).digest();
 }
 
-export function base64url(input: Buffer | string): string {
-  return Buffer.from(input).toString("base64url");
+export function base64url(input: Buffer | Uint8Array | string): string {
+  return (typeof input === "string" ? Buffer.from(input) : Buffer.from(input.buffer, input.byteOffset, input.byteLength)).toString("base64url");
 }
 
 export function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
@@ -96,18 +68,15 @@ export function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
 }
 
 /**
- * Secrets look like `cbt_…` (app tape), `cbo_…` (owner), `cbr_…` (refresh token),
- * `cbs_…` (client secret) or `cbk_…` (browser session), so scanners can spot them.
+ * Secrets carry a prefix so scanners (and Cardboard's own radar) can spot them:
+ * cbt_ app tape, cbd_ device, cbh_ host, cbi_ invite, cbr_ refresh token, cbs_ client secret.
  */
-export function newSecret(prefix: "cbt" | "cbo" | "cbr" | "cbs" | "cbk"): string {
+export type SecretKind = "cbt" | "cbd" | "cbh" | "cbi" | "cbr" | "cbs";
+
+export function newSecret(prefix: SecretKind): string {
   return `${prefix}_${randomBytes(32).toString("base64url")}`;
 }
 
 export function newId(prefix: string): string {
   return `${prefix}_${randomBytes(9).toString("base64url").replace(/[-_]/g, "x")}`;
-}
-
-/** Time-sortable id for collection documents: creation order == key order. */
-export function sortableId(now: number): string {
-  return now.toString(36).padStart(9, "0") + randomBytes(6).toString("hex");
 }

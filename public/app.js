@@ -1,18 +1,20 @@
-"use strict";
-// Cardboard dashboard. No framework, no build step. Everything that came from an
-// app (key names, values, labels) is inserted with textContent, never as HTML.
+// Cardboard dashboard. No framework, no build step. Your keys live in this
+// browser, so everything is opened right here: the server only ever sends
+// sealed bytes. Anything that came from an app (key names, values, labels) is
+// inserted with textContent, never as HTML.
+import { cleanInvite, recoverWithFriends, recoverWithKit, signUp, startPairing, unlock } from "/lib/client/account.ts";
+import { Rpc } from "/lib/client/rpc.ts";
+import { browserName, browserStore, makeKey } from "/device.js";
 
 const app = document.getElementById("app");
 const nav = document.getElementById("nav");
 const modal = document.getElementById("modal");
-const TOKEN_KEY = "cardboard.owner";
+const ORIGIN = location.origin;
 
-let token = null;
-try {
-  token = sessionStorage.getItem(TOKEN_KEY);
-} catch {
-  token = null;
-}
+/** The opened account, while this page is open. */
+let account = null;
+/** A sign-in request from an app, waiting for this browser to be signed in. */
+let pendingConnect = null;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -35,25 +37,6 @@ function h(tag, attrs, ...children) {
 /** replaceChildren, but flattening arrays and skipping null/false like h() does. */
 function fill(el, ...children) {
   el.replaceChildren(...children.flat(Infinity).filter((c) => c !== null && c !== undefined && c !== false));
-}
-
-async function api(op, body = {}) {
-  const res = await fetch(`/v1/admin/${op}`, {
-    method: "POST",
-    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  const data = await res.json().catch(() => ({}));
-  if (res.status === 401) {
-    signOut();
-    throw new Error(data.error?.message || "Signed out.");
-  }
-  if (!res.ok) {
-    const err = new Error(data.error?.message || `Cardboard answered with HTTP ${res.status}.`);
-    err.hint = data.error?.hint;
-    throw err;
-  }
-  return data;
 }
 
 function plural(n, word) {
@@ -104,7 +87,7 @@ function sensitiveChips(sensitive) {
 }
 
 function errorBox(err) {
-  return h("div", { class: "error" }, err.message, err.hint ? h("div", { class: "small" }, err.hint) : null);
+  return h("div", { class: "error" }, err.reason || err.message, err.hint ? h("div", { class: "small" }, err.hint) : null);
 }
 
 function copyButton(text, label = "Copy") {
@@ -123,6 +106,10 @@ function copyButton(text, label = "Copy") {
 
 function fixLine(fix) {
   return fix ? h("div", { class: "fix" }, h("code", {}, fix), copyButton(fix)) : null;
+}
+
+function insightCard(i) {
+  return h("div", { class: `insight ${i.level}` }, h("div", { class: "title" }, i.title), h("div", { class: "detail" }, i.detail), fixLine(i.fix));
 }
 
 let onModalClose = null;
@@ -144,24 +131,11 @@ function closeModal(notify = true) {
 }
 
 modal.addEventListener("click", (e) => {
-  if (e.target === modal) closeModal();
+  if (e.target === modal && !modal.dataset.sticky) closeModal();
 });
 document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape" && !modal.hidden) closeModal();
+  if (e.key === "Escape" && !modal.hidden && !modal.dataset.sticky) closeModal();
 });
-
-function showSecret(title, secret, box, extra, onDone) {
-  openModal(
-    onDone,
-    h("h2", {}, title),
-    h("p", {}, "This is the only time Cardboard will show this tape. Put it in your app's ", h("code", {}, ".env"), ":"),
-    h("code", { class: "secret" }, `CARDBOARD_TAPE=${secret}`),
-    h("div", { class: "row" }, copyButton(`CARDBOARD_TAPE=${secret}`, "Copy line"), copyButton(secret, "Copy tape only")),
-    extra ? h("p", { class: "muted small" }, extra) : null,
-    h("p", { class: "muted small" }, "Or skip all this: in the app's folder run ", h("code", {}, `cardboard connect ${box}`), "."),
-    h("div", { class: "row" }, h("button", { type: "button", onclick: () => closeModal() }, "Done")),
-  );
-}
 
 async function withBusy(button, fn) {
   button.disabled = true;
@@ -172,139 +146,331 @@ async function withBusy(button, fn) {
   }
 }
 
-function signOut() {
-  fetch("/oauth/logout", { method: "POST" }).catch(() => {});
-  token = null;
+/** A form whose submit runs `fn` with errors shown in `status`. */
+function onSubmit(form, status, fn) {
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const button = form.querySelector("button[type=submit]");
+    if (button) button.disabled = true;
+    try {
+      await fn();
+    } catch (err) {
+      status.replaceChildren(errorBox(err));
+    } finally {
+      if (button) button.disabled = false;
+    }
+  });
+}
+
+function showSecret(title, secret, box, extra, onDone) {
+  openModal(
+    onDone,
+    h("h2", {}, title),
+    h("p", {}, "This is the only time Cardboard will show this tape. Put it in your app's ", h("code", {}, ".env"), ":"),
+    h("code", { class: "secret" }, `CARDBOARD_TAPE=${secret}`),
+    h("div", { class: "row" }, copyButton(`CARDBOARD_TAPE=${secret}`, "Copy line"), copyButton(secret, "Copy tape only")),
+    h("p", { class: "muted small" }, "The tape carries this box's key, so treat it like a password. ", extra || ""),
+    h("p", { class: "muted small" }, "Or skip all this: in the app's folder run ", h("code", {}, `cardboard connect ${box}`), "."),
+    h("div", { class: "row" }, h("button", { type: "button", onclick: () => closeModal() }, "Done")),
+  );
+}
+
+/** Recovery kit or friends' pieces, shown once. Closing needs a tick that you saved them. */
+function showRecovery(result, onDone) {
+  const saved = h("input", { type: "checkbox" });
+  const done = h("button", { type: "button", disabled: true }, "Done");
+  saved.addEventListener("change", () => (done.disabled = !saved.checked));
+  done.addEventListener("click", () => {
+    delete modal.dataset.sticky;
+    closeModal();
+  });
+  const all = result.kit ? result.kit : result.pieces.map((p, i) => `Piece ${i + 1}: ${p}`).join("\n");
+  const download = h("button", { type: "button", class: "secondary" }, "Download as a text file");
+  download.addEventListener("click", () => {
+    const text = result.kit
+      ? `Cardboard recovery kit\n${ORIGIN}\nAccount: ${account?.id ?? ""}\n\n${result.kit}\n\nKeep this somewhere safe. It's the only way back in if you lose every device.\n`
+      : `Cardboard: trusted friends' pieces\n${ORIGIN}\n\n${all}\n\nAny ${result.threshold} of these open the account. Give one piece to each friend.\n`;
+    const url = URL.createObjectURL(new Blob([text], { type: "text/plain" }));
+    const a = h("a", { href: url, download: result.kit ? "cardboard-recovery-kit.txt" : "cardboard-friends-pieces.txt" });
+    document.body.append(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  });
+  modal.dataset.sticky = "1";
+  openModal(
+    onDone,
+    h("h2", {}, result.kit ? "Your recovery kit" : "Your friends' pieces"),
+    result.kit
+      ? h("p", {}, "If you ever lose every device, this code is the only way back in. Nobody can reset it for you, not even whoever runs Cardboard. That's what keeps your data yours.")
+      : h("p", {}, `Give one piece to each friend. Any ${result.threshold} of them, together, get you back in. One piece alone reveals nothing.`),
+    result.kit ? h("code", { class: "secret big" }, result.kit) : h("div", { class: "stack" }, result.pieces.map((p, i) => h("div", { class: "row" }, h("strong", {}, `Piece ${i + 1}`), h("code", { class: "secret" }, p), copyButton(p)))),
+    h("div", { class: "row" }, copyButton(all, "Copy"), download, h("button", { type: "button", class: "secondary", onclick: () => window.print() }, "Print")),
+    h("p", { class: "muted small" }, "Keep it in a password manager, or printed somewhere safe. Making a new one later retires this one."),
+    h("label", { class: "check" }, saved, result.kit ? "I've saved my recovery kit" : "I've handed out (or saved) the pieces"),
+    h("div", { class: "row" }, done),
+  );
+}
+
+async function signOutHere() {
+  if (!confirm("Sign this browser out? Its copy of your account key is deleted from the server, so you'd pair it again (or use your recovery kit) to come back.")) return;
   try {
-    sessionStorage.removeItem(TOKEN_KEY);
+    await account.signOut();
   } catch {
-    // ignore
+    await browserStore.clear();
   }
+  account = null;
+  location.hash = "#/";
   render();
 }
 
-document.getElementById("signout").addEventListener("click", signOut);
+document.getElementById("signout").addEventListener("click", signOutHere);
 
-// ── Pages ───────────────────────────────────────────────────────────────────
+// ── Getting in ──────────────────────────────────────────────────────────────
 
-function renderLogin() {
+function hashParam(name) {
+  const match = new RegExp(`[#&]${name}=([^&]+)`).exec(location.hash);
+  return match ? decodeURIComponent(match[1]) : null;
+}
+
+function getInOptions(label) {
+  return { url: ORIGIN, store: browserStore, kind: "browser", label: label || browserName(), makeKey };
+}
+
+async function hello() {
+  return new Rpc(ORIGIN, null).call("hello");
+}
+
+function renderWelcome(info) {
   nav.hidden = true;
-  const input = h("input", { type: "password", placeholder: "cbo_…", autocomplete: "current-password", required: true });
+  const invite = hashParam("invite");
+  const logo = document.querySelector(".brand svg").cloneNode(true);
+  const remembers = browserStore.remembers ? null : h("p", { class: "error small" }, "This browser won't remember you (private window?). You'll need to sign in again next time.");
+  const intro = pendingConnect
+    ? h("p", {}, h("strong", {}, pendingConnect.appName ?? "An app"), " wants you to sign in with Cardboard. First, open your Cardboard in this browser.")
+    : h("p", { class: "muted" }, "Your private, end-to-end encrypted deposit box. Your keys live on your devices: whoever runs this server can't read anything you keep here.");
+
+  const panes = {
+    invite: inviteForm(invite),
+    pair: pairPane(),
+    kit: kitForm(),
+    friends: friendsForm(),
+  };
+  const body = h("div", { class: "stack" });
+  const tab = (id, label) => {
+    const b = h("button", { type: "button", class: "secondary tiny" }, label);
+    b.addEventListener("click", () => {
+      for (const other of tabs.children) other.classList.remove("active");
+      b.classList.add("active");
+      fill(body, panes[id]);
+    });
+    return b;
+  };
+  const tabs = h(
+    "div",
+    { class: "row tabs" },
+    tab("invite", invite ? "Make my account" : "I have an invite"),
+    tab("pair", "Use a device I have"),
+    tab("kit", "Recovery kit"),
+    tab("friends", "Friends' pieces"),
+  );
+  (invite ? tabs.children[0] : tabs.children[1]).click();
+  fill(app, 
+    h(
+      "section",
+      { class: "card stack login" },
+      h("div", { class: "row" }, logo, h("h1", {}, invite ? "Welcome to Cardboard" : "Open your Cardboard")),
+      intro,
+      remembers,
+      tabs,
+      body,
+      info?.shake ? h("p", { class: "muted small" }, `This server's self-test: ${info.shake.summary}.`) : null,
+    ),
+  );
+}
+
+function deviceNameField() {
+  return h("input", { value: browserName(), maxlength: 60, "aria-label": "What to call this browser" });
+}
+
+function inviteForm(invite) {
+  const code = h("input", { value: invite ? `${ORIGIN}/#invite=${invite}` : "", placeholder: "https://…/#invite=cbi_…", required: true });
+  const name = deviceNameField();
   const status = h("div");
   const form = h(
     "form",
-    { class: "card stack login" },
-    h("div", { class: "row" }, document.querySelector(".brand svg").cloneNode(true), h("h1", {}, "Open the box")),
-    h("p", { class: "muted" }, "Sign in with your owner token. It was printed the first time Cardboard started."),
-    h("label", { class: "field" }, "Owner token", input),
-    h("button", { type: "submit" }, "Sign in"),
+    { class: "stack" },
+    h("p", { class: "small" }, "Make an account. This browser gets your keys; you'll get a recovery kit to keep safe."),
+    h("label", { class: "field" }, "Invite link or code", code),
+    h("label", { class: "field" }, "What to call this browser", name),
+    h("button", { type: "submit" }, "Make my account"),
     status,
-    h("p", { class: "muted small" }, "Lost it? On the server, run ", h("code", {}, "cardboard reset-owner"), "."),
   );
-  form.addEventListener("submit", async (e) => {
-    e.preventDefault();
-    token = input.value.trim();
-    try {
-      await api("boxes");
-      try {
-        sessionStorage.setItem(TOKEN_KEY, token);
-      } catch {
-        // private mode: stay signed in for this page only
-      }
-      // Also sign this browser in for "Sign in with Cardboard", so apps don't ask for the token again.
-      fetch("/oauth/session", { method: "POST", headers: { authorization: `Bearer ${token}` } }).catch(() => {});
-      render();
-    } catch (err) {
-      token = null;
-      status.replaceChildren(errorBox(err));
-    }
+  onSubmit(form, status, async () => {
+    const { account: opened, kit } = await signUp({ ...getInOptions(name.value.trim()), invite: cleanInvite(code.value) });
+    account = opened;
+    history.replaceState(null, "", pendingConnect ? `#connect=${pendingConnect.id}` : "#/");
+    showRecovery({ kit }, render);
   });
-  app.replaceChildren(form);
-  input.focus();
+  return form;
 }
 
+function pairPane() {
+  const status = h("div");
+  const name = deviceNameField();
+  const start = h("button", { type: "button" }, "Show me a pairing code");
+  const pane = h(
+    "div",
+    { class: "stack" },
+    h("p", { class: "small" }, "Already signed in somewhere else (your laptop, your phone)? Get a code here, then approve it there."),
+    h("label", { class: "field" }, "What to call this browser", name),
+    start,
+    status,
+  );
+  start.addEventListener("click", () =>
+    withBusy(start, async () => {
+      try {
+        const pending = await startPairing(getInOptions(name.value.trim()));
+        fill(
+          status,
+          h("div", { class: "stack" },
+            h("p", {}, "Your pairing code:"),
+            h("code", { class: "secret big" }, pending.code),
+            h("p", { class: "small" }, "On a device that's already signed in, open ", h("strong", {}, "You → Devices → Add a device"), " and type it in, or run:"),
+            h("code", { class: "secret" }, `cardboard devices add ${pending.code}`),
+            h("p", { class: "muted small" }, "Waiting for you to approve it (the code works for 10 minutes)…"),
+          ),
+        );
+        start.hidden = true;
+        account = await pending.wait();
+        render();
+      } catch (err) {
+        status.replaceChildren(errorBox(err));
+        start.hidden = false;
+      }
+    }),
+  );
+  return pane;
+}
+
+function kitForm() {
+  const code = h("input", { placeholder: "XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX", required: true, autocomplete: "off", spellcheck: "false" });
+  const name = deviceNameField();
+  const status = h("div");
+  const form = h(
+    "form",
+    { class: "stack" },
+    h("p", { class: "small" }, "Lost your devices? Your recovery kit opens your account on this browser."),
+    h("label", { class: "field" }, "Recovery kit", code),
+    h("label", { class: "field" }, "What to call this browser", name),
+    h("button", { type: "submit" }, "Open my Cardboard"),
+    status,
+  );
+  onSubmit(form, status, async () => {
+    account = await recoverWithKit({ ...getInOptions(name.value.trim()), code: code.value });
+    render();
+  });
+  return form;
+}
+
+function friendsForm() {
+  const pieces = [0, 1, 2].map((i) => h("input", { placeholder: `Piece ${i + 1}${i === 2 ? " (if it takes three)" : ""}`, autocomplete: "off", spellcheck: "false", required: i < 2 }));
+  const name = deviceNameField();
+  const status = h("div");
+  const form = h(
+    "form",
+    { class: "stack" },
+    h("p", { class: "small" }, "Chose trusted friends? Ask enough of them for their pieces and type them in."),
+    pieces,
+    h("label", { class: "field" }, "What to call this browser", name),
+    h("button", { type: "submit" }, "Open my Cardboard"),
+    status,
+  );
+  onSubmit(form, status, async () => {
+    account = await recoverWithFriends({ ...getInOptions(name.value.trim()), pieces: pieces.map((p) => p.value.trim()).filter(Boolean) });
+    render();
+  });
+  return form;
+}
+
+// ── Shelf ───────────────────────────────────────────────────────────────────
+
 async function renderShelf() {
-  const data = await api("overview");
+  const [boxes, me, docks] = await Promise.all([account.boxes(), account.me(), account.docks()]);
   const searchInput = h("input", { type: "search", placeholder: "Find anything in any box…", "aria-label": "Search every box" });
   const results = h("div");
-  const search = h(
-    "form",
-    { class: "search" },
-    searchInput,
-    h("button", { type: "submit", class: "secondary" }, "Search"),
-  );
-  search.addEventListener("submit", async (e) => {
-    e.preventDefault();
+  const search = h("form", { class: "search" }, searchInput, h("button", { type: "submit", class: "secondary" }, "Search"));
+  onSubmit(search, results, async () => {
     const q = searchInput.value.trim();
     if (q.length < 2) return results.replaceChildren();
-    try {
-      const { results: found } = await api("search", { q });
-      results.replaceChildren(
+    const found = await account.search(q);
+    fill(
+      results,
+      h(
+        "div",
+        { class: "card" },
+        h("h2", {}, found.length ? `Found in ${found.length} place${found.length === 1 ? "" : "s"}` : "Nothing found"),
+        h("p", { class: "muted small" }, "Searched here in your browser. The server can't search what it can't read."),
         h(
-          "div",
-          { class: "card" },
-          h("h2", {}, found.length ? `Found in ${found.length} place${found.length === 1 ? "" : "s"}` : "Nothing found"),
-          h(
-            "ul",
-            { class: "list" },
-            found.map((r) =>
-              h(
-                "li",
-                {},
-                h("a", { href: `#/box/${encodeURIComponent(r.box)}/${encodeURIComponent(r.key)}` }, h("strong", {}, r.box), " · ", h("span", { class: "mono" }, r.key)),
-                r.snippet ? h("div", { class: "muted small mono" }, `…${r.snippet}…`) : null,
-              ),
+          "ul",
+          { class: "list" },
+          found.map((r) =>
+            h(
+              "li",
+              {},
+              h("a", { href: `#/box/${encodeURIComponent(r.box)}/${encodeURIComponent(r.key)}` }, h("strong", {}, r.box), " · ", h("span", { class: "mono" }, r.key)),
+              r.snippet ? h("div", { class: "muted small mono" }, `…${r.snippet}…`) : null,
             ),
           ),
         ),
-      );
-    } catch (err) {
-      results.replaceChildren(errorBox(err));
-    }
+      ),
+    );
   });
 
-  const shake = data.shake;
-  const shakeChip = shake
-    ? h("a", { href: "#/shake", class: `chip ${shake.ok ? "ok" : "danger"}` }, `${shake.ok ? "✓" : "✗"} Shake test: ${shake.summary}`)
-    : h("a", { href: "#/shake", class: "chip" }, "Run the shake test");
+  const shake = me.server.shake;
+  const shakeChip = shake ? h("a", { href: "#/security", class: `chip ${shake.ok ? "ok" : "danger"}` }, `${shake.ok ? "✓" : "✗"} Server self-test: ${shake.summary}`) : null;
 
-  const shelfInsights = data.insights.filter((i) => !(i.fix || "").startsWith("cardboard dock approve"));
-  const insights = shelfInsights.length
-    ? h(
-        "section",
-        { class: "card" },
-        h("h2", {}, "Worth a look"),
-        shelfInsights.map((i) =>
-          h("div", { class: `insight ${i.level}` }, h("div", { class: "title" }, i.title), h("div", { class: "detail" }, i.detail), fixLine(i.fix)),
-        ),
-      )
-    : h("section", { class: "card" }, h("h2", {}, "All good"), h("p", { class: "muted" }, "Nothing needs fixing right now."));
-
-  const cards = data.boxes.map((b) =>
-    h(
+  const insightsBox = h("section", { class: "card" }, h("h2", {}, "Worth a look"), h("p", { class: "muted small" }, "Looking through your boxes…"));
+  const cards = boxes.map((b) => {
+    const summary = h("div", { class: "muted" }, "…");
+    const chips = h("div", { class: "row" });
+    account
+      .inventory(b)
+      .then((inv) => {
+        summary.textContent = inv.summary;
+        fill(chips, sensitiveChips(inv.sensitive));
+      })
+      .catch((err) => (summary.textContent = err.message));
+    return h(
       "a",
       { class: "boxcard", href: `#/box/${encodeURIComponent(b.name)}` },
       h("h3", {}, b.name),
       b.profile.description ? h("div", { class: "muted small" }, b.profile.description, b.profile.version ? ` · v${b.profile.version}` : "") : null,
-      h("div", {}, b.summary),
-      b.docks.length ? h("div", { class: "row" }, b.docks.map((d) => h("span", { class: `chip ${d.waiting ? "warn" : ""}` }, `⚓ ${d.dock}`))) : null,
-      h("div", { class: "row" }, sensitiveChips(b.sensitive)),
-      h("div", { class: "stats" }, `${plural(b.items, "item")} · ${bytes(b.bytes)} · ${plural(b.tapes, "tape")} · ${b.lastActivity ? `active ${ago(b.lastActivity)}` : "never used"}`),
-    ),
-  );
+      summary,
+      b.docks.length ? h("div", { class: "row" }, b.docks.map((d) => h("span", { class: `chip ${d.waiting ? "warn" : ""}` }, `⚓ ${docks.docks.find((x) => x.id === d.dock)?.name ?? "dock"}`))) : null,
+      chips,
+      h("div", { class: "stats" }, `${plural(b.items, "item")} · ${bytes(b.bytes)} · ${plural(b.tapes.filter((t) => t.state === "active").length, "tape")} · ${b.lastActivity ? `active ${ago(b.lastActivity)}` : "never used"}`),
+    );
+  });
 
-  app.replaceChildren(
+  fill(app, 
     h(
       "div",
       { class: "page-head" },
-      h("div", {}, h("h1", {}, "Your shelf"), h("div", { class: "muted" }, `${data.boxes.length} box${data.boxes.length === 1 ? "" : "es"} · Cardboard ${data.version}`)),
+      h("div", {}, h("h1", {}, me.profile.name ? `${me.profile.name}'s shelf` : "Your shelf"), h("div", { class: "muted" }, `${plural(boxes.length, "box").replace("boxs", "boxes")} · ${bytes(me.quota.used)} of ${bytes(me.quota.limit)}`)),
       shakeChip,
     ),
     search,
     results,
-    pendingCard(data.pendingDocks),
-    insights,
+    pendingCard(docks.pending),
+    insightsBox,
     h("div", { class: "grid" }, cards, newBoxCard()),
+  );
+
+  const insights = (await account.insights({ boxes, me, docks })).filter((i) => !(i.fix || "").startsWith("cardboard dock approve"));
+  fill(
+    insightsBox,
+    insights.length ? [h("h2", {}, "Worth a look"), insights.map(insightCard)] : [h("h2", {}, "All good"), h("p", { class: "muted" }, "Nothing needs fixing right now.")],
   );
 }
 
@@ -320,22 +486,19 @@ function newBoxCard() {
     h("button", { type: "submit" }, "Make box + tape"),
     status,
   );
-  form.addEventListener("submit", async (e) => {
-    e.preventDefault();
-    try {
-      const result = await api("box.create", { name: name.value.trim(), label: "dashboard" });
-      showSecret(`${result.box.name} is ready`, result.secret, result.box.name, null, render);
-    } catch (err) {
-      status.replaceChildren(errorBox(err));
-    }
+  onSubmit(form, status, async () => {
+    const box = await account.createBox(name.value.trim());
+    const { secret } = await account.createTape(box.name, { label: "dashboard" });
+    showSecret(`${box.name} is ready`, secret, box.name, null, render);
   });
   return form;
 }
 
-async function renderBox(name, openKey) {
-  const data = await api("box.get", { name });
-  const { box, inventory } = data;
+// ── One box ─────────────────────────────────────────────────────────────────
 
+async function renderBox(name, openKey) {
+  const box = await account.box(name);
+  const [inventory, log] = await Promise.all([account.inventory(box), account.log({ box: name, limit: 30 })]);
   const head = h(
     "div",
     { class: "page-head" },
@@ -354,9 +517,7 @@ async function renderBox(name, openKey) {
     h("h2", {}, "What's inside"),
     h("p", {}, inventory.summary),
     h("div", { class: "row" }, sensitiveChips(inventory.sensitive)),
-    inventory.secretPaths.length
-      ? h("p", { class: "small muted" }, "Secrets found at: ", inventory.secretPaths.slice(0, 5).map((p, i) => [i ? ", " : "", h("code", {}, p)]))
-      : null,
+    inventory.secretPaths.length ? h("p", { class: "small muted" }, "Secrets found at: ", inventory.secretPaths.slice(0, 5).map((p, i) => [i ? ", " : "", h("code", {}, p)])) : null,
     inventory.collections.map((c) =>
       h(
         "div",
@@ -391,32 +552,35 @@ async function renderBox(name, openKey) {
     ),
   );
 
-  app.replaceChildren(
+  fill(app, 
     head,
-    h("div", { class: "two" }, h("div", {}, inside, browser(box.name, openKey)), h("div", {}, tapesSection(data), activitySection(data.log))),
+    h("div", { class: "two" }, h("div", {}, inside, await browser(box, openKey)), h("div", {}, await tapesSection(box), activitySection(log))),
     h("div", { class: "two" }, settingsSection(box), timeMachine(box.name)),
-    dangerZone(box.name),
+    dangerZone(box),
   );
 }
 
-function browser(boxName, openKey) {
+async function browser(info, openKey) {
+  const box = await account.open(info);
   const prefix = h("input", { type: "search", placeholder: "Filter by prefix, e.g. notes/", "aria-label": "Prefix" });
   const list = h("div", { class: "keys" });
   const detail = h("div", { class: "stack" });
   let active = null;
+  let all = null;
 
   async function load() {
     try {
-      const { items, next } = await api("box.items", { name: boxName, prefix: prefix.value, limit: 200 });
+      all ??= await box.list();
+      const items = all.filter((it) => it.key.startsWith(prefix.value));
       fill(
         list,
         items.length === 0 ? h("p", { class: "muted small" }, "Nothing here.") : null,
-        items.map((it) => {
+        items.slice(0, 300).map((it) => {
           const btn = h("button", { type: "button", title: it.key }, it.key);
           btn.addEventListener("click", () => show(it.key, btn));
           return btn;
         }),
-        next ? h("p", { class: "muted small" }, "Showing the first 200. Narrow it with a prefix.") : null,
+        items.length > 300 ? h("p", { class: "muted small" }, "Showing the first 300. Narrow it with a prefix.") : null,
       );
     } catch (err) {
       list.replaceChildren(errorBox(err));
@@ -428,24 +592,29 @@ function browser(boxName, openKey) {
     active = btn || null;
     active?.classList.add("active");
     try {
-      const { item, history } = await api("box.item", { name: boxName, key });
+      const [item, versions] = await Promise.all([box.getItem(key), box.history(key)]);
+      const undo = h("button", { type: "button", class: "secondary tiny" }, "Undo last change");
+      undo.addEventListener("click", () =>
+        withBusy(undo, async () => {
+          await box.undo(key);
+          all = null;
+          await load();
+          await show(key);
+        }),
+      );
       fill(
         detail,
-        h("h3", { class: "mono" }, key),
+        h("div", { class: "row spread" }, h("h3", { class: "mono" }, key), versions.length > 1 ? undo : null),
         item
-          ? h("div", { class: "muted small" }, `version ${item.version} · ${bytes(item.size)} · changed ${ago(item.updatedAt)}${item.expiresAt ? ` · expires ${new Date(item.expiresAt).toLocaleString()}` : ""}`)
+          ? h("div", { class: "muted small" }, `version ${item.version} · ${bytes(item.size)} sealed · changed ${ago(item.updatedAt)}${item.expiresAt ? ` · expires ${new Date(item.expiresAt).toLocaleString()}` : ""}`)
           : h("div", { class: "muted small" }, "Deleted (still in history)."),
         item ? h("pre", {}, JSON.stringify(item.value, null, 2)) : null,
-        history.length > 1
+        versions.length > 1
           ? h(
               "details",
               {},
-              h("summary", { class: "small" }, `${history.length} versions`),
-              h(
-                "ul",
-                { class: "list small" },
-                history.map((v) => h("li", {}, `v${v.version} · ${ago(v.at)} · `, v.deleted ? "deleted" : bytes(v.size))),
-              ),
+              h("summary", { class: "small" }, `${versions.length} versions`),
+              h("ul", { class: "list small" }, versions.map((v) => h("li", {}, `v${v.version} · ${ago(v.at)} · `, v.deleted ? "deleted" : bytes(v.size)))),
             )
           : null,
       );
@@ -456,51 +625,51 @@ function browser(boxName, openKey) {
 
   prefix.addEventListener("input", () => {
     clearTimeout(prefix._t);
-    prefix._t = setTimeout(load, 250);
+    prefix._t = setTimeout(load, 150);
   });
   load();
   if (openKey) show(openKey);
   return h("section", { class: "card stack" }, h("h2", {}, "Browse"), prefix, list, detail);
 }
 
-function tapesSection(data) {
-  const boxName = data.box.name;
-  const tapes = data.tapes.map((t) => {
-    const perms = [t.read && "read", t.write && "write"].filter(Boolean).join(" + ");
-    const active = t.state === "active";
-    const revoke = active ? h("button", { class: "secondary tiny", type: "button" }, "Revoke") : null;
-    revoke?.addEventListener("click", () =>
-      withBusy(revoke, async () => {
-        if (!confirm(`Revoke “${t.label}”? Anything using it is locked out immediately.`)) return;
-        await api("tape.revoke", { id: t.id });
-        render();
-      }),
-    );
-    return h(
-      "li",
-      { class: "stack" },
-      h(
-        "div",
-        { class: "row spread" },
+async function tapesSection(box) {
+  const tapes = await Promise.all(
+    box.tapes.map(async (t) => {
+      const perms = [t.read && "read", t.write && "write"].filter(Boolean).join(" + ");
+      const active = t.state === "active";
+      const revoke = active ? h("button", { class: "secondary tiny", type: "button" }, "Revoke") : null;
+      revoke?.addEventListener("click", () =>
+        withBusy(revoke, async () => {
+          if (!confirm(`Revoke “${t.label}”? Anything using it is locked out immediately.`)) return;
+          await account.revokeTape(t.id);
+          render();
+        }),
+      );
+      return h(
+        "li",
+        { class: "stack" },
         h(
           "div",
-          { class: "row" },
-          h("strong", {}, `“${t.label}”`),
-          h("span", { class: "chip" }, perms),
-          t.prefix ? h("span", { class: "chip mono" }, t.prefix) : null,
-          h("span", { class: `chip ${active ? "ok" : ""}` }, active ? "active" : "off"),
+          { class: "row spread" },
+          h(
+            "div",
+            { class: "row" },
+            h("strong", {}, `“${t.label}”`),
+            h("span", { class: "chip" }, perms),
+            t.kind === "assistant" ? h("span", { class: "chip" }, "AI assistant") : null,
+            h("span", { class: `chip ${active ? "ok" : ""}` }, active ? "active" : "off"),
+          ),
+          revoke,
         ),
-        revoke,
-      ),
-      h("div", { class: "small" }, t.blast.summary),
-      h("div", { class: "muted small mono" }, `${t.id} · last used ${ago(t.lastUsedAt)}`),
-    );
-  });
+        h("div", { class: "small" }, (await account.blast(t, box)).summary),
+        h("div", { class: "muted small mono" }, `${t.id} · last used ${ago(t.lastUsedAt)}`),
+      );
+    }),
+  );
 
   const label = h("input", { placeholder: "phone, laptop, ci…", "aria-label": "Label" });
   const read = h("input", { type: "checkbox", checked: true });
   const write = h("input", { type: "checkbox", checked: true });
-  const prefix = h("input", { placeholder: "optional, e.g. public/", "aria-label": "Prefix" });
   const idle = h("select", {}, h("option", { value: "90d" }, "90 days unused"), h("option", { value: "30d" }, "30 days unused"), h("option", { value: "7d" }, "7 days unused"), h("option", { value: "never" }, "never (not recommended)"));
   const expires = h("select", {}, h("option", { value: "" }, "no fixed end"), h("option", { value: "1d" }, "in 1 day"), h("option", { value: "7d" }, "in 7 days"), h("option", { value: "30d" }, "in 30 days"));
   const status = h("div");
@@ -508,28 +677,21 @@ function tapesSection(data) {
     "form",
     { class: "stack" },
     h("h3", {}, "New tape"),
-    h("div", { class: "two" }, h("label", { class: "field" }, "Label", label), h("label", { class: "field" }, "Only keys starting with", prefix)),
+    h("label", { class: "field" }, "Label", label),
     h("div", { class: "row" }, h("label", { class: "check" }, read, "can read"), h("label", { class: "check" }, write, "can write")),
     h("div", { class: "two" }, h("label", { class: "field" }, "Switches off after", idle), h("label", { class: "field" }, "Expires", expires)),
     h("button", { type: "submit" }, "Make tape"),
     status,
   );
-  form.addEventListener("submit", async (e) => {
-    e.preventDefault();
-    try {
-      const result = await api("tape.create", {
-        box: boxName,
-        label: label.value.trim() || "dashboard",
-        read: read.checked,
-        write: write.checked,
-        prefix: prefix.value.trim() || undefined,
-        idle: idle.value,
-        expires: expires.value || undefined,
-      });
-      showSecret(`New tape for ${boxName}`, result.secret, boxName, result.blast.summary, render);
-    } catch (err) {
-      status.replaceChildren(errorBox(err));
-    }
+  onSubmit(form, status, async () => {
+    const { tape, secret } = await account.createTape(box.name, {
+      label: label.value.trim() || "dashboard",
+      read: read.checked,
+      write: write.checked,
+      idle: idle.value,
+      expires: expires.value || undefined,
+    });
+    showSecret(`New tape for ${box.name}`, secret, box.name, (await account.blast(tape, await account.box(box.name))).summary, render);
   });
 
   return h("section", { class: "card stack" }, h("h2", {}, "Tapes"), h("ul", { class: "list" }, tapes), h("details", {}, h("summary", {}, "Make a new tape"), form));
@@ -539,14 +701,7 @@ function logLines(entries) {
   return h(
     "ul",
     { class: "list" },
-    entries.map((e) =>
-      h(
-        "li",
-        { class: `log-line ${e.outcome}` },
-        h("time", { title: new Date(e.at).toLocaleString() }, ago(e.at)),
-        h("div", {}, h("span", { class: "text" }, e.text), e.detail.ip ? h("span", { class: "muted small" }, ` · ${e.detail.ip}`) : null),
-      ),
-    ),
+    entries.map((e) => h("li", { class: `log-line ${e.outcome}` }, h("time", { title: new Date(e.at).toLocaleString() }, ago(e.at)), h("div", {}, h("span", { class: "text" }, e.text)))),
   );
 }
 
@@ -564,7 +719,7 @@ function settingsSection(box) {
   const secrets = h("select", {}, h("option", { value: "warn", selected: s.secrets === "warn" }, "Store them, but warn me"), h("option", { value: "block", selected: s.secrets === "block" }, "Refuse to store them"));
   const ttlText = !s.defaultTtlMs ? "" : s.defaultTtlMs % 86400000 === 0 ? `${s.defaultTtlMs / 86400000}d` : `${Math.round(s.defaultTtlMs / 3600000)}h`;
   const ttl = h("input", { value: ttlText, placeholder: "keep forever, or e.g. 30d" });
-  const history = h("input", { type: "number", min: 0, max: 3650, value: s.historyDays });
+  const historyDays = h("input", { type: "number", min: 0, max: 3650, value: s.historyDays });
   const quota = h("input", { value: bytes(s.quotaBytes).replace(" ", "") });
   const origins = h("input", { value: s.origins.join(", "), placeholder: "https://myapp.example.com" });
   const status = h("div");
@@ -574,29 +729,21 @@ function settingsSection(box) {
     h("h2", {}, "Settings"),
     h("label", { class: "field" }, "API keys, passwords and other secrets", secrets),
     h("label", { class: "field" }, "Things expire after (unless an app says otherwise)", ttl),
-    h("label", { class: "field" }, "Days of history to keep for undo & rewind", history),
+    h("label", { class: "field" }, "Days of history to keep for undo & rewind", historyDays),
     h("label", { class: "field" }, "Space allowed", quota),
     h("label", { class: "field" }, "Websites allowed to call this box from a browser (comma separated)", origins),
     h("button", { type: "submit" }, "Save"),
     status,
   );
-  form.addEventListener("submit", async (e) => {
-    e.preventDefault();
-    try {
-      await api("box.settings", {
-        name: box.name,
-        settings: {
-          secrets: secrets.value,
-          defaultTtl: ttl.value.trim() || null,
-          historyDays: Number(history.value),
-          quotaBytes: quota.value.trim(),
-          origins: origins.value.split(",").map((o) => o.trim()).filter(Boolean),
-        },
-      });
-      status.replaceChildren(h("span", { class: "chip ok" }, "Saved"));
-    } catch (err) {
-      status.replaceChildren(errorBox(err));
-    }
+  onSubmit(form, status, async () => {
+    await account.setBoxSettings(box.name, {
+      secrets: secrets.value,
+      defaultTtl: ttl.value.trim() || null,
+      historyDays: Number(historyDays.value),
+      quotaBytes: quota.value.trim(),
+      origins: origins.value.split(",").map((o) => o.trim()).filter(Boolean),
+    });
+    status.replaceChildren(h("span", { class: "chip ok" }, "Saved"));
   });
   return form;
 }
@@ -607,10 +754,10 @@ function timeMachine(boxName) {
   const button = h("button", { type: "button", class: "secondary" }, "Rewind");
   button.addEventListener("click", () =>
     withBusy(button, async () => {
-      if (!confirm(`Put every key in ${boxName} back the way it was ${when.selectedOptions[0].textContent}? (You can rewind the rewind.)`)) return;
+      if (!confirm(`Put every item in ${boxName} back the way it was ${when.selectedOptions[0].textContent}? (You can rewind the rewind.)`)) return;
       try {
-        const result = await api("box.rewind", { name: boxName, to: when.value });
-        status.replaceChildren(h("span", { class: "chip ok" }, `Done: ${result.changed} key${result.changed === 1 ? "" : "s"} changed`));
+        const result = await account.rewind(boxName, when.value);
+        status.replaceChildren(h("span", { class: "chip ok" }, `Done: ${plural(result.changed, "item")} changed`));
       } catch (err) {
         status.replaceChildren(errorBox(err));
       }
@@ -620,33 +767,33 @@ function timeMachine(boxName) {
     "section",
     { class: "card stack" },
     h("h2", {}, "Time machine"),
-    h("p", { class: "muted small" }, "An app went wrong and wrecked its data? Put the whole box back to an earlier moment. Every key is restored as a new version, so this can be undone too."),
+    h("p", { class: "muted small" }, "An app went wrong and wrecked its data? Put the whole box back to an earlier moment. Every item is restored as a new version, so this can be undone too."),
     h("div", { class: "row" }, when, button),
     status,
   );
 }
 
-function dangerZone(boxName) {
+function dangerZone(box) {
   const exportBtn = h("button", { type: "button", class: "secondary" }, "Export as JSON");
   exportBtn.addEventListener("click", () =>
     withBusy(exportBtn, async () => {
-      const data = await api("box.export", { name: boxName });
+      const data = await account.exportBox(box.name);
       const url = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: "application/json" }));
-      const a = h("a", { href: url, download: `${boxName}-${new Date().toISOString().slice(0, 10)}.json` });
+      const a = h("a", { href: url, download: `${box.name}-${new Date().toISOString().slice(0, 10)}.json` });
       document.body.append(a);
       a.click();
       a.remove();
       setTimeout(() => URL.revokeObjectURL(url), 1000);
     }),
   );
-  const confirmName = h("input", { placeholder: boxName, "aria-label": "Type the box name to confirm" });
+  const confirmName = h("input", { placeholder: box.name, "aria-label": "Type the box name to confirm" });
   const shredBtn = h("button", { type: "button", class: "danger" }, "Shred this box");
   const status = h("div");
   shredBtn.addEventListener("click", () =>
     withBusy(shredBtn, async () => {
+      if (confirmName.value.trim() !== box.name) return status.replaceChildren(errorBox(new Error("Type the box's name to confirm.")));
       try {
-        const result = await api("box.shred", { name: boxName, confirm: confirmName.value.trim() });
-        if (result.note) alert(result.note);
+        await account.shredBox(box.name);
         location.hash = "#/";
       } catch (err) {
         status.replaceChildren(errorBox(err));
@@ -657,12 +804,14 @@ function dangerZone(boxName) {
     "section",
     { class: "card stack danger-zone" },
     h("h2", {}, "Moving day & shredding"),
-    h("div", { class: "row" }, exportBtn, h("span", { class: "muted small" }, "Everything in plain JSON. Keep the file somewhere private.")),
-    h("p", { class: "small" }, "Shredding destroys the box's key, so every item, version, tape and log line becomes unreadable for good. Type the name to confirm."),
+    h("div", { class: "row" }, exportBtn, h("span", { class: "muted small" }, "Everything, opened, in plain JSON. Keep the file somewhere private.")),
+    h("p", { class: "small" }, "Shredding deletes the box's key with everything else, so every item, version, tape and log line is gone for good, backups included. Type the name to confirm."),
     h("div", { class: "row" }, confirmName, shredBtn),
     status,
   );
 }
+
+// ── Docks ───────────────────────────────────────────────────────────────────
 
 function direction(p) {
   return p.send && p.receive ? "send and receive" : p.send ? "send" : "receive";
@@ -682,40 +831,34 @@ function pendingCard(pending) {
       pending.map((p) => {
         const approve = h("button", { type: "button", class: "tiny" }, "Approve");
         const deny = h("button", { type: "button", class: "secondary tiny" }, "Deny");
-        approve.addEventListener("click", () => withBusy(approve, async () => {
-          await api("dock.approve", { dock: p.dock, box: p.box });
-          render();
-        }));
-        deny.addEventListener("click", () => withBusy(deny, async () => {
-          await api("dock.deny", { dock: p.dock, box: p.box });
-          render();
-        }));
-        return h(
-          "li",
-          { class: "row spread" },
-          h("div", {}, h("strong", { class: "mono" }, p.box), ` wants to ${direction(p)} on `, h("strong", { class: "mono" }, p.dock)),
-          h("div", { class: "row" }, approve, deny),
+        approve.addEventListener("click", () =>
+          withBusy(approve, async () => {
+            await account.dockApprove(p.dock, p.box);
+            render();
+          }),
         );
+        deny.addEventListener("click", () =>
+          withBusy(deny, async () => {
+            await account.dockDeny(p.dock, p.box);
+            render();
+          }),
+        );
+        return h("li", { class: "row spread" }, h("div", {}, h("strong", { class: "mono" }, p.box), ` wants to ${direction(p)} on `, h("strong", { class: "mono" }, p.dock)), h("div", { class: "row" }, approve, deny));
       }),
     ),
   );
 }
 
 async function renderDocks() {
-  const [{ docks, pending }, { boxes }] = await Promise.all([api("docks"), api("boxes")]);
-  app.replaceChildren(
+  const [{ docks, pending }, boxes] = await Promise.all([account.docks(), account.boxes()]);
+  fill(app, 
     h(
       "div",
       { class: "page-head" },
-      h(
-        "div",
-        {},
-        h("h1", {}, "Docks"),
-        h("div", { class: "muted" }, "Meeting points where your apps swap data. Each app only ever sees a pseudonym, and every parcel goes through customs."),
-      ),
+      h("div", {}, h("h1", {}, "Docks"), h("div", { class: "muted" }, "Meeting points where your apps swap data. Each app only ever sees a pseudonym, parcels are sealed so only approved apps can open them, and customs runs at both ends.")),
     ),
     pendingCard(pending) || h("span"),
-    h("div", { class: "grid wide" }, docks.map((d) => dockCard(d)), newDockCard(boxes)),
+    h("div", { class: "grid wide" }, docks.filter((d) => d.name).map((d) => dockCard(d)), newDockCard(boxes)),
   );
 }
 
@@ -725,50 +868,51 @@ function dockCard(d) {
     { class: "list" },
     d.berths.length === 0 ? h("li", { class: "muted small" }, "No apps yet. Apps that use this dock will ask to join.") : null,
     d.berths.map((b) => {
-      const role = b.denied ? h("span", { class: "chip danger" }, "refused")
-        : !b.send && !b.receive ? h("span", { class: "chip warn" }, `asking to ${direction(b.waiting)}`)
-        : h("span", { class: "chip ok" }, b.send && b.receive ? "sends + receives" : b.send ? "sends" : "receives");
+      const role = b.denied
+        ? h("span", { class: "chip danger" }, "refused")
+        : !b.send && !b.receive
+          ? h("span", { class: "chip warn" }, `asking to ${direction(b.waiting)}`)
+          : h("span", { class: "chip ok" }, b.send && b.receive ? "sends + receives" : b.send ? "sends" : "receives");
       const remove = h("button", { type: "button", class: "secondary tiny" }, "Remove");
-      remove.addEventListener("click", () => withBusy(remove, async () => {
-        if (!confirm(`Take ${b.box} off ${d.name}? Its live connection closes immediately.`)) return;
-        await api("dock.remove", { dock: d.name, box: b.box });
-        render();
-      }));
-      return h(
-        "li",
-        { class: "row spread" },
-        h("div", { class: "stack" }, h("div", { class: "row" }, h("strong", { class: "mono" }, b.box), role), h("div", { class: "muted small mono" }, `known there as ${b.tag}`)),
-        remove,
+      remove.addEventListener("click", () =>
+        withBusy(remove, async () => {
+          if (!confirm(`Take ${b.box} off ${d.name}? Its live connection closes immediately.`)) return;
+          await account.dockRemove(d.name, b.box);
+          render();
+        }),
       );
+      return h("li", { class: "row spread" }, h("div", { class: "stack" }, h("div", { class: "row" }, h("strong", { class: "mono" }, b.box), role), h("div", { class: "muted small mono" }, `known there as ${b.tag}`)), remove);
     }),
   );
 
   const peek = h("button", { type: "button", class: "secondary tiny" }, "Look inside");
-  peek.addEventListener("click", () => withBusy(peek, async () => {
-    const { parcels } = await api("dock.peek", { dock: d.name });
-    openModal(
-      null,
-      h("h2", {}, `In flight on ${d.name}`),
-      h("p", { class: "muted small" }, "Only you see real names here. Apps only ever see pseudonyms."),
-      parcels.length === 0 ? h("p", {}, "Nothing in flight.") : null,
-      parcels.map((p) =>
-        h(
-          "div",
-          { class: "stack" },
-          h("div", { class: "small" }, h("strong", {}, p.sender), p.to ? ` → ${p.to}` : " → everyone", h("span", { class: "muted" }, ` · ${ago(p.sentAt)}`)),
-          h("pre", {}, JSON.stringify(p.body, null, 2)),
-          p.redacted.length ? h("div", { class: "muted small" }, `Redacted: ${p.redacted.join(", ")}`) : null,
+  peek.addEventListener("click", () =>
+    withBusy(peek, async () => {
+      const parcels = await account.dockPeek(d.name);
+      openModal(
+        null,
+        h("h2", {}, `In flight on ${d.name}`),
+        h("p", { class: "muted small" }, "Opened here, with the dock key. Only you see real names; apps only ever see pseudonyms."),
+        parcels.length === 0 ? h("p", {}, "Nothing in flight.") : null,
+        parcels.map((p) =>
+          h(
+            "div",
+            { class: "stack" },
+            h("div", { class: "small" }, h("strong", {}, p.sender), p.to ? ` → ${p.to}` : " → everyone", h("span", { class: "muted" }, ` · ${ago(p.sentAt)}`)),
+            h("pre", {}, JSON.stringify(p.body, null, 2)),
+            p.redacted.length ? h("div", { class: "muted small" }, `Redacted: ${p.redacted.join(", ")}`) : null,
+          ),
         ),
-      ),
-      h("div", { class: "row" }, h("button", { type: "button", onclick: () => closeModal() }, "Close")),
-    );
-  }));
+        h("div", { class: "row" }, h("button", { type: "button", onclick: () => closeModal() }, "Close")),
+      );
+    }),
+  );
 
   return h(
     "section",
     { class: "card stack" },
     h("div", { class: "row spread" }, h("h2", { class: "mono" }, `⚓ ${d.name}`), peek),
-    h("div", { class: "muted small" }, d.inFlight.count ? `${d.inFlight.count} parcel${d.inFlight.count === 1 ? "" : "s"} in flight (${bytes(d.inFlight.bytes)})` : "Nothing in flight"),
+    h("div", { class: "muted small" }, d.inFlight.count ? `${plural(d.inFlight.count, "parcel")} in flight (${bytes(d.inFlight.bytes)})` : "Nothing in flight"),
     berths,
     h("details", {}, h("summary", { class: "small" }, "Customs & settings"), dockSettings(d)),
   );
@@ -783,12 +927,7 @@ function dockSettings(d) {
     h("option", { value: "block", selected: s.personal === "block" }, "Refuse the parcel"),
     h("option", { value: "allow", selected: s.personal === "allow" }, "Let it through"),
   );
-  const secrets = h(
-    "select",
-    {},
-    h("option", { value: "block", selected: s.secrets === "block" }, "Refuse the parcel"),
-    h("option", { value: "allow", selected: s.secrets === "allow" }, "Let it through (not recommended)"),
-  );
+  const secrets = h("select", {}, h("option", { value: "block", selected: s.secrets === "block" }, "Refuse the parcel"), h("option", { value: "allow", selected: s.secrets === "allow" }, "Let it through (not recommended)"));
   const shape = h("textarea", { rows: 3, placeholder: '{"item": "string", "qty": "number?"}' });
   shape.value = s.shape ? JSON.stringify(s.shape) : "";
   const ttl = h("input", { value: `${Math.round(s.ttlMs / 86400000)}d` });
@@ -796,14 +935,13 @@ function dockSettings(d) {
   const status = h("div");
   const confirmName = h("input", { placeholder: d.name, "aria-label": "Type the dock name to confirm" });
   const shred = h("button", { type: "button", class: "danger tiny" }, "Shred dock");
-  shred.addEventListener("click", () => withBusy(shred, async () => {
-    try {
-      await api("dock.shred", { dock: d.name, confirm: confirmName.value.trim() });
+  shred.addEventListener("click", () =>
+    withBusy(shred, async () => {
+      if (confirmName.value.trim() !== d.name) return status.replaceChildren(errorBox(new Error("Type the dock's name to confirm.")));
+      await account.shredDock(d.name);
       render();
-    } catch (err) {
-      status.replaceChildren(errorBox(err));
-    }
-  }));
+    }),
+  );
   const form = h(
     "form",
     { class: "stack" },
@@ -811,21 +949,14 @@ function dockSettings(d) {
     h("label", { class: "field" }, "Secrets (API keys, passwords, private keys)", secrets),
     h("label", { class: "field" }, "Manifest: only these fields may cross (optional)", shape),
     h("div", { class: "two" }, h("label", { class: "field" }, "Parcels expire after", ttl), h("label", { class: "field" }, "Max parcels per app per minute", rate)),
+    h("p", { class: "muted small" }, "Customs runs inside each app (the server can't see into parcels): the sender's checks what leaves, the receiver's checks what arrives."),
     h("button", { type: "submit" }, "Save"),
     status,
     h("div", { class: "row" }, confirmName, shred),
   );
-  form.addEventListener("submit", async (e) => {
-    e.preventDefault();
-    try {
-      await api("dock.settings", {
-        dock: d.name,
-        settings: { personal: personal.value, secrets: secrets.value, shape: shape.value.trim() || null, ttl: ttl.value.trim(), ratePerMinute: Number(rate.value) },
-      });
-      status.replaceChildren(h("span", { class: "chip ok" }, "Saved"));
-    } catch (err) {
-      status.replaceChildren(errorBox(err));
-    }
+  onSubmit(form, status, async () => {
+    await account.dockSettings(d.name, { personal: personal.value, secrets: secrets.value, shape: shape.value.trim() || null, ttl: ttl.value.trim(), ratePerMinute: Number(rate.value) });
+    status.replaceChildren(h("span", { class: "chip ok" }, "Saved"));
   });
   return form;
 }
@@ -855,101 +986,59 @@ function newDockCard(boxes) {
     h("button", { type: "submit" }, "Open dock"),
     status,
   );
-  form.addEventListener("submit", async (e) => {
-    e.preventDefault();
-    try {
-      await api("dock.create", {
-        name: name.value.trim(),
-        send: picks.filter((p) => p.send.checked).map((p) => p.box),
-        receive: picks.filter((p) => p.receive.checked).map((p) => p.box),
-      });
-      render();
-    } catch (err) {
-      status.replaceChildren(errorBox(err));
-    }
+  onSubmit(form, status, async () => {
+    await account.createDock(name.value.trim(), { send: picks.filter((p) => p.send.checked).map((p) => p.box), receive: picks.filter((p) => p.receive.checked).map((p) => p.box) });
+    render();
   });
   return form;
 }
 
-const SCOPE_LABEL = { openid: "knows you (private ID)", profile: "your name", email: "your email", box: "keeps data in your Cardboard", mcp: "AI assistant", offline_access: "stays connected" };
+// ── Apps ────────────────────────────────────────────────────────────────────
 
-/** Which boxes an AI assistant may see (and change). Ticking "change" also means "see". */
-function shareEditor(a, boxes) {
-  const rows = boxes
-    .filter((b) => b.name !== a.box)
-    .map((b) => {
-      const current = a.shared.find((s) => s.box === b.name);
-      return { name: b.name, see: h("input", { type: "checkbox", checked: Boolean(current) }), change: h("input", { type: "checkbox", checked: Boolean(current?.write) }) };
-    });
-  const status = h("div");
-  const form = h(
-    "form",
-    { class: "stack" },
-    rows.length
-      ? h("div", { class: "table-wrap" }, h("table", {}, h("thead", {}, h("tr", {}, h("th", {}, "Box"), h("th", {}, "See"), h("th", {}, "Change"))), h("tbody", {}, rows.map((r) => h("tr", {}, h("td", { class: "mono" }, r.name), h("td", {}, r.see), h("td", {}, r.change))))))
-      : h("p", { class: "muted small" }, "You have no other boxes to share."),
-    rows.length ? h("div", {}, h("button", { type: "submit", class: "secondary tiny" }, "Save")) : null,
-    status,
-  );
-  form.addEventListener("submit", async (e) => {
-    e.preventDefault();
-    try {
-      const shared = rows.filter((r) => r.see.checked || r.change.checked).map((r) => ({ box: r.name, write: r.change.checked }));
-      await api("apps.share", { grant: a.grant, shared });
-      status.replaceChildren(h("span", { class: "chip ok" }, "Saved. It applies to its next request."));
-    } catch (err) {
-      status.replaceChildren(errorBox(err));
-    }
-  });
-  return h("details", {}, h("summary", { class: "small" }, a.shared.length ? `Can see: ${a.shared.map((s) => `${s.box}${s.write ? " (can change)" : ""}`).join(", ")}` : "Can see: only its own box"), form);
-}
+const SCOPE_LABEL = { openid: "knows you (private ID)", profile: "your name", email: "your email", box: "keeps data in your Cardboard", offline_access: "stays connected" };
 
 async function renderApps() {
-  const [data, { boxes }] = await Promise.all([api("apps"), api("boxes")]);
+  const data = await account.apps();
   const connected = data.connected.map((a) => {
     const disconnect = h("button", { type: "button", class: "secondary tiny" }, "Disconnect");
-    const shred = a.box ? h("button", { type: "button", class: "danger tiny" }, "Disconnect & shred its data") : null;
-    disconnect.addEventListener("click", () => withBusy(disconnect, async () => {
-      if (!confirm(`Disconnect ${a.name}? It loses access right away.${a.box ? " Its box stays, in case you reconnect." : ""}`)) return;
-      await api("apps.disconnect", { grant: a.grant });
-      render();
-    }));
-    shred?.addEventListener("click", () => withBusy(shred, async () => {
-      if (!confirm(`Disconnect ${a.name} and shred everything it stored about you in “${a.box}”? This can't be undone.`)) return;
-      await api("apps.disconnect", { grant: a.grant, shred: true });
-      render();
-    }));
+    const shred = a.boxName ? h("button", { type: "button", class: "danger tiny" }, "Disconnect & shred its data") : null;
+    disconnect.addEventListener("click", () =>
+      withBusy(disconnect, async () => {
+        if (!confirm(`Disconnect ${a.name}? It loses access right away.${a.boxName ? " Its box stays, in case you reconnect." : ""}`)) return;
+        await account.disconnectApp(a.grant);
+        render();
+      }),
+    );
+    shred?.addEventListener("click", () =>
+      withBusy(shred, async () => {
+        if (!confirm(`Disconnect ${a.name} and shred everything it stored about you in “${a.boxName}”? This can't be undone.`)) return;
+        await account.disconnectApp(a.grant, { shred: true });
+        render();
+      }),
+    );
     return h(
       "li",
       { class: "stack" },
       h("div", { class: "row spread" }, h("div", {}, h("strong", {}, a.name), h("span", { class: "muted small" }, ` · ${a.site}`)), h("div", { class: "row" }, disconnect, shred)),
       h("div", { class: "row" }, a.scopes.filter((s) => SCOPE_LABEL[s]).map((s) => h("span", { class: "chip" }, SCOPE_LABEL[s])), a.selfRegistered ? h("span", { class: "chip warn" }, "registered itself") : null),
-      h(
-        "div",
-        { class: "muted small" },
-        `Connected ${ago(a.connectedAt)} · last used ${ago(a.lastUsedAt)}`,
-        a.box ? [" · data in ", h("a", { href: `#/box/${encodeURIComponent(a.box)}` }, a.box)] : null,
-      ),
+      h("div", { class: "muted small" }, `Connected ${ago(a.connectedAt)} · last used ${ago(a.lastUsedAt)}`, a.boxName ? [" · data in ", h("a", { href: `#/box/${encodeURIComponent(a.boxName)}` }, a.boxName)] : null),
       h("div", { class: "muted small mono" }, `knows you as ${a.privateId}`),
-      a.assistant ? shareEditor(a, boxes) : null,
     );
   });
 
   const registered = data.registered.map((c) => {
     const forget = h("button", { type: "button", class: "secondary tiny" }, "Forget");
-    forget.addEventListener("click", () => withBusy(forget, async () => {
-      await api("apps.forget", { client: c.client });
-      render();
-    }));
+    forget.addEventListener("click", () =>
+      withBusy(forget, async () => {
+        await account.forgetApp(c.client);
+        render();
+      }),
+    );
     return h("li", { class: "row spread" }, h("div", {}, h("strong", {}, c.name), h("div", { class: "muted small mono" }, c.redirectUris.join(", "))), forget);
   });
 
-  app.replaceChildren(
-    h(
-      "div",
-      { class: "page-head" },
-      h("div", {}, h("h1", {}, "Apps"), h("div", { class: "muted" }, "Apps you signed into with Cardboard. Each one knows you only by a private ID made for it, and keeps its data about you here, with you.")),
-    ),
+  fill(app, 
+    h("div", { class: "page-head" }, h("div", {}, h("h1", {}, "Apps"), h("div", { class: "muted" }, "Apps you signed into with Cardboard. Each one knows you only by a private ID made for it, and keeps its data about you here, sealed, with you."))),
     h(
       "div",
       { class: "two" },
@@ -959,48 +1048,24 @@ async function renderApps() {
         h("section", { class: "card" }, h("h2", {}, "Connected"), connected.length ? h("ul", { class: "list" }, connected) : h("p", { class: "muted" }, "No apps yet. When an app shows “Sign in with Cardboard”, this is where it lands.")),
         registered.length ? h("section", { class: "card" }, h("h2", {}, "Registered, not connected"), h("ul", { class: "list" }, registered)) : null,
       ),
-      h("div", {}, profileCard(data.profile), assistantCard(data.issuer), connectCard(data.issuer)),
+      h("div", {}, assistantCard(), connectCard(data.issuer)),
     ),
   );
 }
 
-function profileCard(profile) {
-  const name = h("input", { value: profile.name || "", placeholder: "How apps may greet you" });
-  const email = h("input", { type: "email", value: profile.email || "", placeholder: "you@example.com" });
-  const status = h("div");
-  const form = h(
-    "form",
-    { class: "card stack" },
-    h("h2", {}, "You"),
-    h("p", { class: "muted small" }, "Apps only see these if they ask and you say yes. By default they get nothing but their private ID for you."),
-    h("label", { class: "field" }, "Name", name),
-    h("label", { class: "field" }, "Email", email),
-    h("button", { type: "submit" }, "Save"),
-    status,
-  );
-  form.addEventListener("submit", async (e) => {
-    e.preventDefault();
-    try {
-      await api("profile.set", { name: name.value.trim() || null, email: email.value.trim() || null });
-      status.replaceChildren(h("span", { class: "chip ok" }, "Saved"));
-    } catch (err) {
-      status.replaceChildren(errorBox(err));
-    }
-  });
-  return form;
-}
-
-function assistantCard(issuer) {
-  const url = `${issuer}/mcp`;
-  const cmd = `claude mcp add --transport http cardboard ${url}`;
+function assistantCard() {
+  const cmd = "cardboard assistant add claude --see notes";
   return h(
     "section",
     { class: "card stack" },
     h("h2", {}, "Connect an AI assistant"),
-    h("p", { class: "small" }, "Cardboard is an MCP server. Add this address as a connector in Claude (or any assistant that supports MCP). It signs in through the same consent screen, gets its own box to remember things for you, and sees only the boxes you tick."),
-    h("div", { class: "row" }, h("code", { class: "secret" }, url), copyButton(url)),
-    h("p", { class: "muted small" }, "Claude Code:"),
+    h(
+      "p",
+      { class: "small" },
+      "Assistants (Claude Code, Claude Desktop, anything that speaks MCP) connect through Cardboard running on your own computer: it holds keys only for the boxes you share, so the assistant can open those and nothing else, and the server still sees nothing. On your computer, run:",
+    ),
     h("div", { class: "row" }, h("code", { class: "secret" }, cmd), copyButton(cmd)),
+    h("p", { class: "muted small" }, "It prints the line to paste into your assistant. It gets its own box to remember things for you, and every change it makes is logged and can be undone."),
   );
 }
 
@@ -1018,33 +1083,126 @@ function connectCard(issuer) {
     h("div", {}, h("button", { type: "submit", class: "secondary" }, "Register app")),
     status,
   );
-  form.addEventListener("submit", async (e) => {
-    e.preventDefault();
-    try {
-      const r = await api("apps.register", { name: name.value.trim(), redirectUris: [redirect.value.trim()], public: !server.checked });
-      status.replaceChildren(
-        h("div", { class: "stack" },
-          h("div", { class: "small" }, "client_id"), h("code", { class: "secret" }, r.client_id),
-          r.client_secret ? [h("div", { class: "small" }, "client_secret (shown once)"), h("code", { class: "secret" }, r.client_secret), copyButton(r.client_secret, "Copy secret")] : null,
-        ),
-      );
-    } catch (err) {
-      status.replaceChildren(errorBox(err));
-    }
+  onSubmit(form, status, async () => {
+    const r = await account.registerApp({ name: name.value.trim(), redirectUris: [redirect.value.trim()], public: !server.checked });
+    fill(
+      status,
+      h(
+        "div",
+        { class: "stack" },
+        h("div", { class: "small" }, "client_id"),
+        h("code", { class: "secret" }, r.client_id),
+        r.client_secret ? [h("div", { class: "small" }, "client_secret (shown once)"), h("code", { class: "secret" }, r.client_secret), copyButton(r.client_secret, "Copy secret")] : null,
+      ),
+    );
   });
   return h(
     "section",
     { class: "card stack" },
     h("h2", {}, "Add “Sign in with Cardboard” to an app"),
-    h("p", { class: "small" }, "Cardboard speaks OpenID Connect, so any app or library with a “generic OpenID Connect” option can use it. Give it this issuer:"),
+    h("p", { class: "small" }, "Cardboard speaks OpenID Connect, so any app with a “generic OpenID Connect” option can use it. Apps that use the Cardboard SDK can also get a box and your name, sealed so only they can open them. Issuer:"),
     h("div", { class: "row" }, h("code", { class: "secret" }, issuer), copyButton(issuer)),
     h("p", { class: "muted small" }, "Apps can register themselves automatically, or you can register one here:"),
     form,
   );
 }
 
+// ── Saying yes to an app (Sign in with Cardboard) ───────────────────────────
+
+const PERMISSIONS = {
+  openid: () => ["Recognise you when you come back", "With a private ID made only for this app, so it can't compare notes with other apps about you."],
+  profile: (ctx) => ["See your name", ctx.sealed ? (ctx.profile.name ? `“${ctx.profile.name}”, sealed so only the app can read it` : "You haven't set one, so it gets nothing.") : "This app can't take sealed data. Tick below if you want to pass your name anyway."],
+  email: (ctx) => ["See your email address", ctx.sealed ? (ctx.profile.email ? `${ctx.profile.email}, sealed so only the app can read it` : "You haven't set one, so it gets nothing.") : "This app can't take sealed data. Tick below if you want to pass your email anyway."],
+  box: (ctx) => [
+    "Keep its data about you in your Cardboard",
+    `${ctx.boxName ? `In the box “${ctx.boxName}”.` : "In a box of its own."} Not in its own database. The box key goes to the app sealed, past the server. You can look inside, take it with you, or shred it whenever you like.`,
+  ],
+  offline_access: () => null,
+};
+
+async function renderConnect(id) {
+  nav.hidden = false;
+  let req;
+  try {
+    req = await account.signInRequest(id);
+  } catch (err) {
+    fill(app, h("section", { class: "card stack login" }, h("h1", {}, "Can't continue"), errorBox(err), h("a", { href: "#/" }, "Go to your shelf")));
+    return;
+  }
+  const { profile } = await account.me();
+  const appKey = pendingConnect?.appKey ?? null;
+  const go = (url) => {
+    pendingConnect = null;
+    location.assign(url);
+  };
+  const returning = req.returning && req.scopes.every((s) => req.returning.scopes.includes(s));
+  if (returning && req.prompt !== "consent") {
+    // Already said yes to all of this: straight back to the app. It remembers you.
+    fill(app, h("section", { class: "card stack login" }, h("h1", {}, `Signing you in to ${req.client.name}…`), h("p", { class: "muted" }, "You said yes to this app before.")));
+    go(await account.approveSignIn(id, { appKey }));
+    return;
+  }
+  if (req.prompt === "none") return go(await account.denySignIn(id));
+  const sealed = Boolean(req.appKey);
+  const ctx = { profile, boxName: req.boxName, sealed };
+  const perms = req.scopes
+    .map((s) => PERMISSIONS[s]?.(ctx))
+    .filter(Boolean)
+    .map(([title, detail]) => h("li", {}, h("strong", {}, title), h("div", { class: "muted small" }, detail)));
+  const passName = h("input", { type: "checkbox" });
+  const plainShare =
+    !sealed && (req.scopes.includes("profile") || req.scopes.includes("email"))
+      ? h(
+          "label",
+          { class: "check small" },
+          passName,
+          "Pass my name/email to this app in the clear. It goes through Cardboard's server, which could see it on the way.",
+        )
+      : null;
+  const destination = (() => {
+    try {
+      return new URL(req.site).host || req.site;
+    } catch {
+      return req.site;
+    }
+  })();
+  const status = h("div");
+  const allow = h("button", { type: "button" }, "Let it in");
+  const deny = h("button", { type: "button", class: "secondary" }, "No thanks");
+  allow.addEventListener("click", () =>
+    withBusy(allow, async () => {
+      try {
+        const claims = passName.checked ? { ...(req.scopes.includes("profile") && profile.name ? { name: profile.name } : {}), ...(req.scopes.includes("email") && profile.email ? { email: profile.email } : {}) } : undefined;
+        go(await account.approveSignIn(id, { claims, appKey }));
+      } catch (err) {
+        status.replaceChildren(errorBox(err));
+      }
+    }),
+  );
+  deny.addEventListener("click", () => withBusy(deny, async () => go(await account.denySignIn(id))));
+  fill(app, 
+    h(
+      "section",
+      { class: "card stack login" },
+      h("h1", {}, "Let ", h("span", { class: "mono" }, req.client.name), " in?"),
+      h("p", { class: "muted" }, "It's asking to:"),
+      h("ul", { class: "list perms" }, perms),
+      plainShare,
+      h("p", { class: "small" }, "It stays connected until you disconnect it on your Apps page, or until it goes unused for 30 days."),
+      req.client.selfRegistered
+        ? h("div", { class: "insight warn" }, h("div", { class: "title" }, "This app registered itself"), h("div", { class: "detail" }, `Only continue if you just clicked “Sign in with Cardboard” on ${destination}.`))
+        : null,
+      h("p", { class: "small muted" }, "After you choose, you'll go back to ", h("strong", {}, destination), "."),
+      h("div", { class: "row" }, allow, deny),
+      status,
+    ),
+  );
+}
+
+// ── Activity, Security, You ─────────────────────────────────────────────────
+
 async function renderActivity() {
-  const { boxes } = await api("boxes");
+  const boxes = await account.boxes();
   const select = h("select", { "aria-label": "Box" }, h("option", { value: "" }, "All boxes"), boxes.map((b) => h("option", { value: b.name }, b.name)));
   const list = h("div");
   const more = h("button", { type: "button", class: "secondary" }, "Load older");
@@ -1054,66 +1212,251 @@ async function renderActivity() {
       before = undefined;
       list.replaceChildren();
     }
-    const { entries } = await api("log", { box: select.value || undefined, limit: 100, before });
+    const entries = await account.log({ box: select.value || undefined, limit: 100, before });
     list.append(logLines(entries));
     before = entries.length ? entries[entries.length - 1].id : before;
     more.hidden = entries.length < 100;
   }
   select.addEventListener("change", () => load(true));
   more.addEventListener("click", () => withBusy(more, () => load(false)));
-  app.replaceChildren(
+  fill(app, 
     h("div", { class: "page-head" }, h("h1", {}, "Activity"), select),
-    h("section", { class: "card" }, h("p", { class: "muted small" }, "Who touched what, newest first. Key names and addresses are stored encrypted with each box's key."), list, more),
+    h("section", { class: "card" }, h("p", { class: "muted small" }, "Who touched what, newest first. On the server, every name in here is sealed: it's opened here, in your browser."), list, more),
   );
   await load(true);
 }
 
-async function renderShake() {
-  const run = h("button", { type: "button" }, "Shake it again");
-  const body = h("div");
-  async function show(report) {
-    body.replaceChildren(
-      h("p", {}, h("span", { class: `chip ${report.ok ? "ok" : "danger"}` }, `${report.ok ? "✓" : "✗"} ${report.summary}`), h("span", { class: "muted small" }, ` · ${ago(report.at)}`)),
+async function renderSecurity() {
+  const info = await hello();
+  const report = info.shake;
+  fill(app, 
+    h("div", { class: "page-head" }, h("div", {}, h("h1", {}, "Security"), h("div", { class: "muted" }, "What keeps your data yours, and how this server tested itself."))),
+    h(
+      "div",
+      { class: "two" },
       h(
-        "ul",
-        { class: "list" },
-        report.results.map((r) =>
-          h("li", { class: "shake-result" }, h("span", { class: `mark ${r.status}` }, r.status === "pass" ? "✓" : r.status === "fail" ? "✗" : "!"), h("div", {}, h("strong", {}, r.title), h("div", { class: "muted small" }, r.detail))),
+        "section",
+        { class: "card stack" },
+        h("h2", {}, "End to end"),
+        h(
+          "ul",
+          { class: "list small" },
+          h("li", {}, h("strong", {}, "Your keys live on your devices. "), "Everything you and your apps store is sealed (AES-256-GCM) before it leaves the device. The server keeps only sealed bytes."),
+          h("li", {}, h("strong", {}, "Names too. "), "Box names, item keys, dock names, tape labels, your profile: all sealed. Lookups use keyed fingerprints the server can't reverse."),
+          h("li", {}, h("strong", {}, "The host is locked out. "), "Whoever runs this server can see that accounts exist, how much they store and when they're used. Not what's inside."),
+          h("li", {}, h("strong", {}, "Apps get only their box. "), "A tape carries one box's key; Sign in with Cardboard seals the key to the app itself, past the server."),
+          h("li", {}, h("strong", {}, "The honest catch: "), "this page's code comes from the server. A server that turned bad could serve a page that steals keys next time you open it. The CLI doesn't have that problem, because its code is installed on your computer."),
         ),
       ),
-    );
-  }
-  run.addEventListener("click", () => withBusy(run, async () => show(await api("shake"))));
-  app.replaceChildren(
-    h("div", { class: "page-head" }, h("div", {}, h("h1", {}, "Shake test"), h("div", { class: "muted" }, "Cardboard attacks itself through the same API your apps use, on two throwaway boxes, and reports what held.")), run),
-    h("section", { class: "card" }, body),
+      h(
+        "section",
+        { class: "card stack" },
+        h("h2", {}, "The server's self-test"),
+        report
+          ? [
+              h("p", {}, h("span", { class: `chip ${report.ok ? "ok" : "danger"}` }, `${report.ok ? "✓" : "✗"} ${report.summary}`), h("span", { class: "muted small" }, ` · ${ago(report.at)}`)),
+              h(
+                "ul",
+                { class: "list" },
+                report.results.map((r) =>
+                  h("li", { class: "shake-result" }, h("span", { class: `mark ${r.status}` }, r.status === "pass" ? "✓" : r.status === "fail" ? "✗" : "!"), h("div", {}, h("strong", {}, r.title), h("div", { class: "muted small" }, r.detail))),
+                ),
+              ),
+            ]
+          : h("p", { class: "muted" }, "This server hasn't run its shake test yet."),
+      ),
+    ),
   );
-  const { shake } = await api("overview");
-  if (shake) show(shake);
-  else show(await api("shake"));
+}
+
+const PLANS = [
+  { id: "kit", title: "Recovery kit", badge: "standard", detail: "A code you print or keep in a password manager. Lose every device, type the code, you're back." },
+  { id: "device", title: "Another device", detail: "No code: you get back in by approving a new device from one you still have. Keep at least two signed in." },
+  { id: "friends", title: "Trusted friends", detail: "Your key is split into pieces for friends. Any 2 of 3 (you choose) get you back in. One piece alone reveals nothing." },
+  { id: "none", title: "No recovery", detail: "Only your signed-in devices can open your Cardboard. Lose them all and the data is gone, for everyone. Maximum privacy, no safety net." },
+];
+
+async function renderYou() {
+  const me = await account.me();
+  const devices = me.devices.map((d) => {
+    const remove = h("button", { type: "button", class: "secondary tiny" }, d.current ? "Sign out here" : "Remove");
+    remove.addEventListener("click", () =>
+      withBusy(remove, async () => {
+        if (d.current) return signOutHere();
+        if (!confirm(`Remove “${d.name}”? It's signed out for good and its copy of your account key is deleted.`)) return;
+        await account.removeDevice(d.id);
+        render();
+      }),
+    );
+    const rename = h("button", { type: "button", class: "secondary tiny" }, "Rename");
+    rename.addEventListener("click", () =>
+      withBusy(rename, async () => {
+        const name = prompt("What should this device be called?", d.name);
+        if (!name) return;
+        await account.renameDevice(d.id, name.trim().slice(0, 60));
+        render();
+      }),
+    );
+    return h(
+      "li",
+      { class: "row spread" },
+      h("div", {}, h("strong", {}, d.name), d.current ? h("span", { class: "chip ok" }, "this browser") : null, h("div", { class: "muted small" }, `${d.kind} · last seen ${ago(d.lastSeenAt)} · added ${ago(d.createdAt)}`)),
+      h("div", { class: "row" }, rename, remove),
+    );
+  });
+
+  const code = h("input", { placeholder: "XXXXX-XXXXX-XXXXX", required: true, autocomplete: "off", spellcheck: "false" });
+  const deviceName = h("input", { placeholder: "e.g. Phone" });
+  const addStatus = h("div");
+  const add = h(
+    "form",
+    { class: "stack" },
+    h("p", { class: "small" }, "On the new device, open this Cardboard (or run ", h("code", {}, `cardboard pair ${ORIGIN}`), ") and choose “Use a device I have”. Type the code it shows:"),
+    h("div", { class: "two" }, h("label", { class: "field" }, "Pairing code", code), h("label", { class: "field" }, "Call it", deviceName)),
+    h("button", { type: "submit" }, "Approve this device"),
+    addStatus,
+  );
+  onSubmit(add, addStatus, async () => {
+    await account.approveDevice(code.value, deviceName.value.trim() || undefined);
+    addStatus.replaceChildren(h("span", { class: "chip ok" }, "Approved. It's signing in now."));
+    setTimeout(render, 2500);
+  });
+
+  const choice = PLANS.map((p) => ({ ...p, input: h("input", { type: "radio", name: "plan", value: p.id, checked: me.recovery === p.id }) }));
+  const friendsCount = h("select", {}, [2, 3, 4, 5].map((n) => h("option", { value: n, selected: n === 3 }, `${n} friends`)));
+  const friendsNeed = h("select", {}, [2, 3, 4].map((n) => h("option", { value: n, selected: n === 2 }, `any ${n} of them`)));
+  const recStatus = h("div");
+  const recovery = h(
+    "form",
+    { class: "stack" },
+    choice.map((c) =>
+      h("label", { class: `plan ${me.recovery === c.id ? "current" : ""}` }, c.input, h("div", {}, h("strong", {}, c.title), c.badge ? h("span", { class: "chip ok" }, c.badge) : null, me.recovery === c.id ? h("span", { class: "chip" }, "your plan") : null, h("div", { class: "muted small" }, c.detail))),
+    ),
+    h("div", { class: "row small" }, "For trusted friends:", friendsCount, friendsNeed),
+    h("button", { type: "submit" }, "Use this plan"),
+    h("p", { class: "muted small" }, "Picking a plan again makes fresh codes; the old kit or pieces stop working."),
+    recStatus,
+  );
+  onSubmit(recovery, recStatus, async () => {
+    const plan = choice.find((c) => c.input.checked)?.id;
+    if (!plan) return;
+    if (plan === "none" && !confirm("With no recovery, losing your devices means losing your data. Nobody can help, not even whoever runs Cardboard. Continue?")) return;
+    const result = await account.setRecovery(plan, { count: Number(friendsCount.value), threshold: Number(friendsNeed.value) });
+    if (result.kit || result.pieces) showRecovery(result, render);
+    else render();
+  });
+
+  const name = h("input", { value: me.profile.name || "", placeholder: "How apps may greet you" });
+  const email = h("input", { type: "email", value: me.profile.email || "", placeholder: "you@example.com" });
+  const profileStatus = h("div");
+  const profile = h(
+    "form",
+    { class: "stack" },
+    h("p", { class: "muted small" }, "Sealed on your devices. Apps only get these if they ask and you say yes, sealed to the app."),
+    h("label", { class: "field" }, "Name", name),
+    h("label", { class: "field" }, "Email", email),
+    h("button", { type: "submit" }, "Save"),
+    profileStatus,
+  );
+  onSubmit(profile, profileStatus, async () => {
+    await account.setProfile({ name: name.value.trim() || null, email: email.value.trim() || null });
+    profileStatus.replaceChildren(h("span", { class: "chip ok" }, "Saved"));
+  });
+
+  const confirmDelete = h("input", { placeholder: "delete", "aria-label": 'Type "delete" to confirm' });
+  const deleteBtn = h("button", { type: "button", class: "danger" }, "Delete my account");
+  const deleteStatus = h("div");
+  deleteBtn.addEventListener("click", () =>
+    withBusy(deleteBtn, async () => {
+      if (confirmDelete.value.trim() !== "delete") return deleteStatus.replaceChildren(errorBox(new Error('Type "delete" to confirm.')));
+      await account.deleteAccount();
+      account = null;
+      location.hash = "#/";
+      render();
+    }),
+  );
+
+  fill(app, 
+    h("div", { class: "page-head" }, h("div", {}, h("h1", {}, "You"), h("div", { class: "muted small mono" }, me.id))),
+    h(
+      "div",
+      { class: "two" },
+      h(
+        "div",
+        {},
+        h("section", { class: "card stack" }, h("h2", {}, "Devices"), h("ul", { class: "list" }, devices), h("details", {}, h("summary", {}, "Add a device"), add)),
+        h("section", { class: "card stack" }, h("h2", {}, "Your name and email"), profile),
+      ),
+      h(
+        "div",
+        {},
+        h("section", { class: "card stack" }, h("h2", {}, "If you lose every device"), h("p", { class: "small" }, "Pick how you'd get back in. Cardboard can't reset anything for you: that's what keeps everyone else out."), recovery),
+        h("section", { class: "card stack danger-zone" }, h("h2", {}, "Delete account"), h("p", { class: "small" }, "Everything goes: boxes, history, tapes, docks, connected apps, devices."), h("div", { class: "row" }, confirmDelete, deleteBtn), deleteStatus),
+      ),
+    ),
+  );
 }
 
 // ── Router ──────────────────────────────────────────────────────────────────
 
+/**
+ * An app sent you here to sign in: /?connect=<request>#cardboard_key=<the app's key>. The key in
+ * the fragment never reached the server, so it's what the request's key gets checked against.
+ */
+function takeConnectFromUrl() {
+  const fromQuery = new URLSearchParams(location.search).get("connect");
+  if (fromQuery) {
+    pendingConnect = { id: fromQuery, appKey: hashParam("cardboard_key"), appName: null };
+    history.replaceState(null, "", `/#connect=${encodeURIComponent(fromQuery)}`);
+    return;
+  }
+  const fromHash = hashParam("connect");
+  if (fromHash && pendingConnect?.id !== fromHash) pendingConnect = { id: fromHash, appKey: null, appName: null };
+}
+
 async function render() {
   closeModal(false);
-  if (!token) return renderLogin();
+  takeConnectFromUrl();
+  if (!account) {
+    try {
+      account = await unlock(browserStore);
+    } catch (err) {
+      if (err.code === "bad_device") await browserStore.clear();
+      else {
+        fill(app, errorBox(err));
+        return;
+      }
+    }
+  }
+  if (!account) return renderWelcome(await hello().catch(() => null));
+  if (pendingConnect) {
+    const id = pendingConnect.id;
+    if (!location.hash.startsWith("#connect=")) history.replaceState(null, "", `#connect=${id}`);
+    return renderConnect(id);
+  }
   nav.hidden = false;
   const [, page, arg, key] = location.hash.split("/");
-  for (const a of nav.querySelectorAll("a")) {
-    a.classList.toggle("active", a.getAttribute("href") === `#/${page && page !== "box" ? page : ""}`);
-  }
+  for (const a of nav.querySelectorAll("a")) a.classList.toggle("active", a.getAttribute("href") === `#/${page && page !== "box" ? page : ""}`);
   try {
     if (page === "box" && arg) await renderBox(decodeURIComponent(arg), key ? decodeURIComponent(key) : undefined);
     else if (page === "activity") await renderActivity();
     else if (page === "docks") await renderDocks();
     else if (page === "apps") await renderApps();
-    else if (page === "shake") await renderShake();
+    else if (page === "security") await renderSecurity();
+    else if (page === "you") await renderYou();
     else await renderShelf();
   } catch (err) {
-    if (token) app.replaceChildren(errorBox(err), h("p", {}, h("a", { href: "#/" }, "Back to the shelf")));
+    if (err.code === "bad_device") {
+      await browserStore.clear();
+      account = null;
+      return render();
+    }
+    fill(app, errorBox(err), h("p", {}, h("a", { href: "#/" }, "Back to the shelf")));
   }
 }
 
-window.addEventListener("hashchange", render);
+window.addEventListener("hashchange", () => {
+  if (!hashParam("connect")) pendingConnect = null;
+  render();
+});
 render();

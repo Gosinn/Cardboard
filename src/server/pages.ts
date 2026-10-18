@@ -1,9 +1,7 @@
-import { relativeTime } from "../shared/duration.ts";
-import type { AuthRequest, Client, OwnerProfile, Scope } from "./oauth.ts";
-
 /**
- * The few pages Cardboard renders on the server: signing in, saying yes or no
- * to an app, and errors. No JavaScript, strict CSP, and every value escaped.
+ * The only page Cardboard renders on the server: "can't continue". Saying yes
+ * to an app happens in your dashboard, because that's where your keys are.
+ * No JavaScript, strict CSP, and every value escaped.
  */
 
 export function esc(value: unknown): string {
@@ -19,7 +17,6 @@ function layout(title: string, body: string): string {
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <meta name="color-scheme" content="light dark" />
-<meta name="referrer" content="same-origin" />
 <title>${esc(title)} · Cardboard</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
 <link rel="stylesheet" href="/style.css" />
@@ -35,122 +32,6 @@ ${body}
 </html>`;
 }
 
-export function loginPage(options: { returnTo: string; appName?: string; error?: string }): string {
-  return layout(
-    "Sign in",
-    `<h1>Open your Cardboard</h1>
-<p class="muted">${options.appName ? `${esc(options.appName)} wants to connect. First, prove this is your Cardboard.` : "Sign in with your owner token."}</p>
-${options.error ? `<div class="error">${esc(options.error)}</div>` : ""}
-<form method="post" action="/oauth/login" class="stack">
-<input type="hidden" name="return_to" value="${esc(options.returnTo)}" />
-<input type="text" name="username" value="Cardboard owner" autocomplete="username" hidden />
-<label class="field">Owner token<input type="password" name="token" autocomplete="current-password" placeholder="cbo_…" required autofocus /></label>
-<button type="submit">Sign in</button>
-</form>
-<p class="muted small">Your password manager can remember it. This browser stays signed in for 30 days.</p>`,
-  );
-}
-
-const PERMISSIONS: Record<Scope, (ctx: { profile: OwnerProfile; boxName: string | null }) => [string, string] | null> = {
-  openid: () => [
-    "Recognise you when you come back",
-    "With a private ID made only for this app, so it can't compare notes with other apps about you.",
-  ],
-  profile: ({ profile }) => ["See your name", profile.name ? `“${profile.name}”` : "You haven't set one, so it gets nothing."],
-  email: ({ profile }) => ["See your email address", profile.email ?? "You haven't set one, so it gets nothing."],
-  box: ({ boxName }) => [
-    "Keep its data about you in your Cardboard",
-    `${boxName ? `In the box “${boxName}”.` : "In a box of its own."} Not in its own database. You can look inside, take it with you, or shred it whenever you like.`,
-  ],
-  mcp: ({ boxName }) => [
-    "Work with your Cardboard as an AI assistant",
-    `It gets its own box${boxName ? ` (“${boxName}”)` : ""} to remember things for you. It sees only the boxes you tick below, changes only the ones you allow, and every change it makes is logged and can be undone.`,
-  ],
-  offline_access: () => null,
-};
-
-export function consentPage(options: {
-  request: AuthRequest;
-  profile: OwnerProfile;
-  boxName: string | null;
-  csrf: string;
-  now: number;
-  /** Your boxes, for choosing what an AI assistant may see. */
-  boxes?: Array<{ name: string; summary: string }>;
-  shared?: Array<{ name: string; write: boolean }>;
-}): string {
-  const { request, profile, boxName, csrf, now } = options;
-  const { client } = request;
-  const destination = destinationOf(request.redirectUri);
-  const permissions = request.scopes
-    .map((scope) => PERMISSIONS[scope]({ profile, boxName }))
-    .filter((p): p is [string, string] => p !== null)
-    .map(([title, detail]) => `<li><strong>${esc(title)}</strong><div class="muted small">${esc(detail)}</div></li>`)
-    .join("\n");
-  const hidden = {
-    client_id: client.id,
-    redirect_uri: request.redirectUri,
-    scope: request.scopes.join(" "),
-    state: request.state,
-    code_challenge: request.codeChallenge,
-    code_challenge_method: "S256",
-    nonce: request.nonce,
-    csrf,
-  };
-  return layout(
-    `Connect ${client.name}`,
-    `<h1>Let <span class="mono">${esc(client.name)}</span> in?</h1>
-<p class="muted">It's asking to:</p>
-<ul class="list perms">${permissions}</ul>
-${request.scopes.includes("mcp") ? shareList(options.boxes ?? [], options.shared ?? []) : ""}
-<p class="small">It stays connected until you disconnect it from your Cardboard, or until it goes unused for 30 days.</p>
-${unverified(client, now)}
-<p class="small muted">After you choose, you'll go back to <strong>${esc(destination)}</strong>.</p>
-<form method="post" action="/oauth/authorize" class="row" id="consent">
-${Object.entries(hidden)
-  .filter(([, v]) => v !== null && v !== undefined)
-  .map(([k, v]) => `<input type="hidden" name="${esc(k)}" value="${esc(v)}" />`)
-  .join("\n")}
-<button type="submit" name="decision" value="allow">Let it in</button>
-<button type="submit" name="decision" value="deny" class="secondary">No thanks</button>
-</form>`,
-  );
-}
-
-/** Checkboxes live outside the form element, so they point at it with form="consent". */
-function shareList(boxes: Array<{ name: string; summary: string }>, shared: Array<{ name: string; write: boolean }>): string {
-  if (boxes.length === 0) return `<p class="small muted">You have no other boxes yet, so it only gets its own.</p>`;
-  const rows = boxes
-    .map((b) => {
-      const current = shared.find((s) => s.name === b.name);
-      return `<tr><td><span class="mono">${esc(b.name)}</span><div class="muted small">${esc(b.summary)}</div></td>
-<td><label class="check"><input type="checkbox" form="consent" name="read" value="${esc(b.name)}"${current ? " checked" : ""} /> see</label></td>
-<td><label class="check"><input type="checkbox" form="consent" name="write" value="${esc(b.name)}"${current?.write ? " checked" : ""} /> change</label></td></tr>`;
-    })
-    .join("\n");
-  return `<div class="share"><strong>Which of your boxes may it see?</strong>
-<div class="table-wrap"><table><tbody>${rows}</tbody></table></div>
-<p class="muted small">Nothing is ticked unless you tick it. “Change” includes “see”. You can change this any time on your Cardboard's Apps page.</p></div>`;
-}
-
-function unverified(client: Client, now: number): string {
-  if (client.registeredBy !== "self") return "";
-  return `<div class="insight warn"><div class="title">This app registered itself ${esc(relativeTime(client.createdAt, now))}</div><div class="detail">Only continue if you just clicked “Sign in with Cardboard” on ${esc(client.clientUri ? destinationOf(client.clientUri) : "its site")}.</div></div>`;
-}
-
 export function errorPage(message: string, hint?: string): string {
   return layout("Can't continue", `<h1>Can't continue</h1><div class="error">${esc(message)}</div>${hint ? `<p class="muted">${esc(hint)}</p>` : ""}`);
-}
-
-export function donePage(message: string): string {
-  return layout("Done", `<h1>${esc(message)}</h1><p class="muted">You can close this tab.</p>`);
-}
-
-function destinationOf(uri: string): string {
-  try {
-    const url = new URL(uri);
-    return url.host || url.protocol.replace(/:$/, "");
-  } catch {
-    return uri;
-  }
 }

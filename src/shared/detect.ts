@@ -42,7 +42,7 @@ const PROVIDER_KEYS: Array<[string, RegExp]> = [
   ["Stripe", /\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,255}/],
   ["Slack", /\bxox[abposr]-[A-Za-z0-9-]{10,255}/],
   ["Google", /\bAIza[0-9A-Za-z_-]{35}\b/],
-  ["Cardboard", /\bcb[torsk]_[A-Za-z0-9_-]{40,60}/],
+  ["Cardboard", /\bcb[a-z]_[A-Za-z0-9_-]{40,90}/],
 ];
 
 const PRIVATE_KEY = /-----BEGIN (?:[A-Z]{1,20} ){0,3}PRIVATE KEY-----/;

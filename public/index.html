@@ -7,7 +7,7 @@
     <title>Cardboard</title>
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="/style.css" />
-    <script src="/app.js" defer></script>
+    <script type="module" src="/app.js"></script>
   </head>
   <body>
     <header class="top">
@@ -25,11 +25,12 @@
         <a href="#/docks">Docks</a>
         <a href="#/apps">Apps</a>
         <a href="#/activity">Activity</a>
-        <a href="#/shake">Shake test</a>
+        <a href="#/security">Security</a>
+        <a href="#/you">You</a>
         <button id="signout" class="link">Sign out</button>
       </nav>
     </header>
-    <main id="app"><p class="muted">Opening the box…</p></main>
+    <main id="app"><p class="muted">Opening the box…</p><noscript><p>Cardboard opens your data in the browser, so it needs JavaScript.</p></noscript></main>
     <div id="modal" class="modal" hidden></div>
   </body>
 </html>

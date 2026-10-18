@@ -1,9 +1,8 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fail } from "../shared/errors.ts";
-import { newSecret, randomKey, sha256 } from "./crypto.ts";
+import { derive, newSecret, randomKey, seal, sha256, unseal } from "./crypto.ts";
 import { getMeta, openDb, setMeta, type DB } from "./db.ts";
-import { Vault } from "./vault.ts";
 
 export interface Paths {
   dataDir: string;
@@ -13,18 +12,30 @@ export interface Paths {
 
 export function resolvePaths(options: { dataDir?: string; keyFile?: string } = {}): Paths {
   const dataDir = resolve(options.dataDir ?? process.env["CARDBOARD_DATA"] ?? "cardboard-data");
-  const keyFile = resolve(options.keyFile ?? process.env["CARDBOARD_KEY_FILE"] ?? join(dataDir, "master.key"));
+  const keyFile = resolve(options.keyFile ?? process.env["CARDBOARD_KEY_FILE"] ?? join(dataDir, "server.key"));
   return { dataDir, dbFile: join(dataDir, "cardboard.db"), keyFile };
 }
 
-const KEY_PREFIX = "cbk1:";
+const KEY_PREFIX = "cbk2:";
+
+/**
+ * The server key protects the server's own secrets: the key that signs
+ * sign-in tokens, the key behind apps' private IDs for you, and the key behind
+ * dock pseudonyms. It does NOT protect anyone's data (that's sealed with keys
+ * only their devices hold), so losing it never loses data. It does change
+ * every app's private ID for every person, so keep it with your backups.
+ */
+export interface ServerKeys {
+  subkey(purpose: string): Buffer;
+}
 
 function writeKeyFile(path: string, key: Buffer) {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   const body = [
-    "# Cardboard master key.",
-    "# Without it nothing in Cardboard can be read; with it, everything can.",
-    "# Back it up somewhere that is NOT the data folder (a password manager is ideal).",
+    "# Cardboard server key.",
+    "# It protects the server's own secrets (sign-in signing key, private IDs, dock pseudonyms).",
+    "# People's data is sealed with keys only their devices hold, so this key can't open it.",
+    "# Keep it with your backups: without it, apps see everyone as a new person.",
     `${KEY_PREFIX}${key.toString("base64")}`,
     "",
   ].join("\n");
@@ -36,40 +47,39 @@ function readKeyFile(path: string): Buffer {
     .split(/\r?\n/)
     .find((l) => l.startsWith(KEY_PREFIX));
   const key = line ? Buffer.from(line.slice(KEY_PREFIX.length).trim(), "base64") : Buffer.alloc(0);
-  if (key.length !== 32) {
-    throw fail("bad_key_file", 500, `${path} doesn't contain a valid Cardboard master key.`);
-  }
+  if (key.length !== 32) throw fail("bad_key_file", 500, `${path} doesn't contain a valid Cardboard server key.`);
   return key;
 }
 
 export interface Store {
   db: DB;
-  vault: Vault;
+  keys: ServerKeys;
   firstRun: boolean;
-  /** Only set the very first time, when the owner token is created. */
-  ownerToken?: string;
+  /** Only set the very first time, when the host token is created. */
+  hostToken?: string;
 }
 
 /**
- * Opens (or creates) the data folder. A new master key is only ever generated
+ * Opens (or creates) the data folder. A new server key is only ever generated
  * for a brand-new database: Cardboard never silently replaces a key.
  */
 export function openStore(paths: Paths, now: () => number = Date.now): Store {
   mkdirSync(paths.dataDir, { recursive: true, mode: 0o700 });
   const dbExists = existsSync(paths.dbFile);
-  let masterKey: Buffer;
+  let serverKey: Buffer;
   if (existsSync(paths.keyFile)) {
-    masterKey = readKeyFile(paths.keyFile);
+    serverKey = readKeyFile(paths.keyFile);
   } else if (dbExists) {
+    openDb(paths.dbFile).close(); // A 0.1 data folder gets a clearer message than "missing key".
     throw fail(
       "missing_key",
       500,
-      `Found a database at ${paths.dbFile} but no master key at ${paths.keyFile}.`,
-      "Without its key the data can't be read. Restore master.key, or set CARDBOARD_KEY_FILE to where it is.",
+      `Found a database at ${paths.dbFile} but no server key at ${paths.keyFile}.`,
+      "Restore server.key from your backup, or set CARDBOARD_KEY_FILE to where it is.",
     );
   } else {
-    masterKey = randomKey();
-    writeKeyFile(paths.keyFile, masterKey);
+    serverKey = randomKey();
+    writeKeyFile(paths.keyFile, serverKey);
   }
 
   const db = openDb(paths.dbFile);
@@ -78,32 +88,50 @@ export function openStore(paths: Paths, now: () => number = Date.now): Store {
   } catch {
     // Not fatal (e.g. on some network filesystems); the shake test reports folder permissions.
   }
-  let vault: Vault;
+  const system = derive(serverKey, "server");
+  serverKey.fill(0);
   try {
-    vault = new Vault(db, masterKey, now);
+    verifyKey(db, derive(system, "check"));
   } catch (err) {
     db.close();
     throw err;
-  } finally {
-    masterKey.fill(0);
   }
+  const keys: ServerKeys = { subkey: (purpose) => derive(system, purpose) };
 
-  let ownerToken: string | undefined;
-  if (!getMeta(db, "owner_hash")) {
-    ownerToken = newSecret("cbo");
-    setMeta(db, "owner_hash", sha256(ownerToken).toString("base64"));
+  let hostToken: string | undefined;
+  if (!getMeta(db, "host_hash")) {
+    hostToken = newSecret("cbh");
+    setMeta(db, "host_hash", sha256(hostToken).toString("base64"));
     setMeta(db, "created_at", String(now()));
   }
-  return { db, vault, firstRun: !dbExists, ownerToken };
+  return { db, keys, firstRun: !dbExists, hostToken };
 }
 
-/** Replaces the owner token. Needs the data folder and master key, i.e. access to the server itself. */
-export function resetOwner(paths: Paths): string {
+function verifyKey(db: DB, checkKey: Buffer) {
+  const stored = getMeta(db, "key_check");
+  if (!stored) {
+    setMeta(db, "key_check", seal(checkKey, "cardboard", "key-check").toString("base64"));
+    return;
+  }
+  try {
+    unseal(checkKey, Buffer.from(stored, "base64"), "key-check");
+  } catch {
+    throw fail(
+      "wrong_key",
+      500,
+      "This server key doesn't belong to this database.",
+      "Point CARDBOARD_KEY_FILE at the server.key that was created together with this data folder.",
+    );
+  }
+}
+
+/** Replaces the host token. Needs the data folder and server key, i.e. access to the server itself. */
+export function resetHost(paths: Paths): string {
   if (!existsSync(paths.dbFile)) throw fail("no_data", 404, `There's no Cardboard data at ${paths.dataDir}.`);
   const { db } = openStore(paths);
   try {
-    const token = newSecret("cbo");
-    setMeta(db, "owner_hash", sha256(token).toString("base64"));
+    const token = newSecret("cbh");
+    setMeta(db, "host_hash", sha256(token).toString("base64"));
     return token;
   } finally {
     db.close();

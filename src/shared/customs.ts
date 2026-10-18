@@ -1,7 +1,7 @@
-import { fail } from "../shared/errors.ts";
-import { formatBytes } from "../shared/size.ts";
+import { fail } from "./errors.ts";
+import { formatBytes } from "./size.ts";
 import { kindName, notice, scan, SECRET_KINDS, type SensitiveKind } from "./detect.ts";
-import { isPlainObject } from "./vault.ts";
+import { byteLength, isPlainObject } from "./data.ts";
 
 /**
  * Customs: every parcel crossing a dock is inspected here before anyone else
@@ -91,7 +91,7 @@ export function inspect(body: unknown, policy: CustomsPolicy): Cleared {
   }
 
   const json = JSON.stringify(shaped);
-  const size = Buffer.byteLength(json);
+  const size = byteLength(json);
   if (size > policy.maxParcelBytes) {
     throw fail(
       "parcel_too_large",

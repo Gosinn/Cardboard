@@ -1,22 +1,35 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { signUp, type Account } from "../src/client/account.ts";
+import { MemoryStore } from "../src/client/device.ts";
 import { open, type Box } from "../src/sdk/index.ts";
 import { startServer, type RunningCardboard, type StartOptions } from "../src/server/index.ts";
 
 export interface TestServer {
   cb: RunningCardboard;
   dir: string;
-  owner: string;
+  hostToken: string;
+  /** The first account, signed in on an in-memory device. */
+  me: Account;
+  kit: string;
   clock: { now: number; advance(ms: number): void };
-  admin<T = any>(op: string, body?: unknown, headers?: Record<string, string>): Promise<{ status: number; body: T }>;
-  app<T = any>(secret: string, op: string, body?: unknown, headers?: Record<string, string>): Promise<{ status: number; body: T; headers: Headers }>;
-  newBox(name: string, tape?: Record<string, unknown>): Promise<{ box: Box; secret: string; tapeId: string }>;
+  host<T = any>(op: string, body?: unknown, headers?: Record<string, string>): Promise<{ status: number; body: T }>;
+  raw<T = any>(token: string | null, op: string, body?: unknown, headers?: Record<string, string>): Promise<{ status: number; body: T; headers: Headers }>;
+  /** A new box with a tape, opened the way an app would (SDK + tape). */
+  newBox(name: string, tape?: Parameters<Account["createTape"]>[1]): Promise<{ box: Box; secret: string; tapeId: string; token: string }>;
+  /** Another person on the same Cardboard. */
+  newAccount(): Promise<{ account: Account; kit: string }>;
   stop(): Promise<void>;
 }
 
 export const HOUR = 60 * 60 * 1000;
 export const DAY = 24 * HOUR;
+
+/** The token half of a tape: what an app actually sends. */
+export function tokenOf(secret: string): string {
+  return `cbt_${Buffer.from(secret.slice(4), "base64url").subarray(0, 32).toString("base64url")}`;
+}
 
 export async function startTestServer(options: StartOptions = {}): Promise<TestServer> {
   const dir = mkdtempSync(join(tmpdir(), "cardboard-test-"));
@@ -27,81 +40,39 @@ export async function startTestServer(options: StartOptions = {}): Promise<TestS
     },
   };
   const cb = await startServer({ dataDir: join(dir, "data"), port: 0, now: () => clock.now, sweepEveryMs: 3_600_000, ...options });
-  const owner = cb.ownerToken!;
-  const post = async (path: string, secret: string, body: unknown, headers: Record<string, string> = {}) => {
+  const hostToken = cb.hostToken!;
+  const post = async (path: string, token: string | null, body: unknown, headers: Record<string, string> = {}) => {
     const res = await fetch(`${cb.url}${path}`, {
       method: "POST",
-      headers: { authorization: `Bearer ${secret}`, "content-type": "application/json", ...headers },
+      headers: { ...(token ? { authorization: `Bearer ${token}` } : {}), "content-type": "application/json", ...headers },
       body: JSON.stringify(body ?? {}),
     });
     return { status: res.status, body: (await res.json().catch(() => null)) as any, headers: res.headers };
   };
+  const invite = async () => (await post("/v1/host.invite", hostToken, {})).body.code as string;
+  const newAccount = async () => signUp({ url: cb.url, invite: await invite(), store: new MemoryStore(), kind: "cli", label: "test laptop" });
+  const first = cb.firstInvite
+    ? await signUp({ url: cb.url, invite: cb.firstInvite, store: new MemoryStore(), kind: "cli", label: "test laptop" })
+    : await newAccount();
   const server: TestServer = {
     cb,
     dir,
-    owner,
+    hostToken,
+    me: first.account,
+    kit: first.kit,
     clock,
-    admin: (op, body, headers) => post(`/v1/admin/${op}`, owner, body, headers),
-    app: (secret, op, body, headers) => post(`/v1/${op}`, secret, body, headers),
+    host: (op, body, headers) => post(`/v1/${op}`, hostToken, body, headers),
+    raw: (token, op, body, headers) => post(`/v1/${op}`, token, body, headers),
     async newBox(name, tape = {}) {
-      const res = await server.admin("box.create", { name, ...tape });
-      if (res.status !== 200) throw new Error(`box.create failed: ${JSON.stringify(res.body)}`);
-      return {
-        box: open({ url: cb.url, tape: res.body.secret, onNotice: false }),
-        secret: res.body.secret,
-        tapeId: res.body.tape.id,
-      };
+      await server.me.createBox(name);
+      const { tape: info, secret } = await server.me.createTape(name, tape);
+      return { box: open({ url: cb.url, tape: secret, onNotice: false }), secret, tapeId: info.id, token: tokenOf(secret) };
     },
+    newAccount,
     async stop() {
       await cb.close();
       rmSync(dir, { recursive: true, force: true });
     },
   };
   return server;
-}
-
-/** Just enough of a browser: keeps cookies, doesn't follow redirects, sends Origin on posts. */
-export class Browser {
-  private readonly cookies = new Map<string, string>();
-  private readonly origin: string;
-  constructor(origin: string) {
-    this.origin = origin;
-  }
-
-  private remember(res: Response) {
-    for (const c of res.headers.getSetCookie()) {
-      const [pair] = c.split(";");
-      const [name, ...value] = pair!.split("=");
-      this.cookies.set(name!, value.join("="));
-    }
-  }
-
-  cookieHeader() {
-    return [...this.cookies].filter(([, v]) => v).map(([k, v]) => `${k}=${v}`).join("; ");
-  }
-
-  async get(url: string) {
-    const res = await fetch(url, { redirect: "manual", headers: { cookie: this.cookieHeader() } });
-    this.remember(res);
-    return { status: res.status, location: res.headers.get("location"), html: await res.text() };
-  }
-
-  async post(url: string, form: Record<string, string>, origin = this.origin) {
-    const res = await fetch(url, {
-      method: "POST",
-      redirect: "manual",
-      headers: { cookie: this.cookieHeader(), origin, "content-type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams(form).toString(),
-    });
-    this.remember(res);
-    return { status: res.status, location: res.headers.get("location"), html: await res.text() };
-  }
-}
-
-export function hiddenFields(html: string): Record<string, string> {
-  const fields: Record<string, string> = {};
-  for (const m of html.matchAll(/<input type="hidden" name="([^"]+)" value="([^"]*)" \/>/g)) {
-    fields[m[1]!] = m[2]!.replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">");
-  }
-  return fields;
 }

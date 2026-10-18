@@ -1,7 +1,7 @@
 {
   "name": "cardboard",
-  "version": "0.1.0",
-  "description": "A smart, private deposit box for all your personal apps.",
+  "version": "0.2.0",
+  "description": "A smart, private, end-to-end encrypted deposit box for all your personal apps.",
   "type": "module",
   "license": "UNLICENSED",
   "private": true,
@@ -15,6 +15,10 @@
     ".": {
       "types": "./dist/sdk/index.d.ts",
       "default": "./dist/sdk/index.js"
+    },
+    "./account": {
+      "types": "./dist/client/account.d.ts",
+      "default": "./dist/client/account.js"
     },
     "./server": {
       "types": "./dist/server/index.d.ts",

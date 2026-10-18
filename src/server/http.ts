@@ -1,22 +1,23 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { createServer as createHttpServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { createServer as createHttpsServer } from "node:https";
+import { stripTypeScriptTypes } from "node:module";
 import type { AddressInfo } from "node:net";
-import { join } from "node:path";
+import { join, normalize } from "node:path";
 import { CardboardError, fail } from "../shared/errors.ts";
 import { VERSION } from "../shared/version.ts";
+import { Accounts } from "./accounts.ts";
 import { Api, errorResponse, type ApiRequest } from "./api.ts";
 import { Audit } from "./audit.ts";
 import { Docks, type Parcel } from "./docks.ts";
 import { Hub } from "./hub.ts";
-import { Mcp } from "./mcp.ts";
 import { OAuth } from "./oauth.ts";
 import { createOAuthHandler } from "./oauth-http.ts";
 import type { ServerInfo } from "./insights.ts";
 import { openStore, resolvePaths, type Paths } from "./setup.ts";
 import type { ShakeReport } from "./shake.ts";
 import { Tapes } from "./tapes.ts";
-import type { Vault } from "./vault.ts";
+import { DEFAULT_ACCOUNT_QUOTA, Vault, type Change } from "./vault.ts";
 
 export interface StartOptions {
   dataDir?: string;
@@ -29,6 +30,10 @@ export interface StartOptions {
   trustProxy?: boolean;
   /** The address people and apps reach Cardboard at, e.g. https://cardboard.example.com (the OpenID issuer). */
   publicUrl?: string;
+  /** Let anyone make an account (default: invite only). */
+  openSignup?: boolean;
+  /** Storage per account unless the host sets it per person (default 1 GB). */
+  accountQuotaBytes?: number;
   /** Run the shake test on startup (default true). */
   shake?: boolean;
   sweepEveryMs?: number;
@@ -44,18 +49,21 @@ export interface RunningCardboard {
   paths: Paths;
   firstRun: boolean;
   /** Printed once, on the very first start. */
-  ownerToken?: string;
+  hostToken?: string;
+  /** On the very first start: an invite link for the first account (probably yours). */
+  firstInvite?: string;
   shake: ShakeReport | null;
   api: Api;
-  vault: Vault;
   close(): Promise<void>;
 }
 
-const MAX_BODY = 16 * 1024 * 1024;
-const PUBLIC_DIR = join(import.meta.dirname, "..", "..", "public");
+const MAX_BODY = 32 * 1024 * 1024;
+const ROOT = join(import.meta.dirname, "..", "..");
+const PUBLIC_DIR = join(ROOT, "public");
 const STATIC: Record<string, string> = {
   "/index.html": "text/html; charset=utf-8",
   "/app.js": "text/javascript; charset=utf-8",
+  "/device.js": "text/javascript; charset=utf-8",
   "/style.css": "text/css; charset=utf-8",
   "/favicon.svg": "image/svg+xml",
 };
@@ -73,21 +81,18 @@ const CSP = [
 export async function startServer(options: StartOptions = {}): Promise<RunningCardboard> {
   const now = options.now ?? Date.now;
   const paths = resolvePaths(options);
-  const { db, vault, firstRun, ownerToken } = openStore(paths, now);
+  const { db, keys, firstRun, hostToken } = openStore(paths, now);
 
-  // A crash mid-shake could leave its throwaway boxes behind.
-  for (const box of vault.listBoxes({ includeSystem: true })) {
-    if (box.system && box.name.startsWith("__shake-")) vault.shredBox(box.id);
-  }
-
-  const tapes = new Tapes(db, now);
-  const audit = new Audit(db, vault, tapes);
-  const hub = new Hub();
-  const docks = new Docks(db, vault);
+  // A crash mid-shake could leave its throwaway accounts behind.
+  db.prepare("DELETE FROM accounts WHERE internal = 1").run();
   db.prepare("DELETE FROM oauth_clients WHERE registered_by = 'shake'").run();
-  for (const dock of docks.list({ includeInternal: true })) {
-    if (dock.name.startsWith("__shake-")) docks.shred(dock.id);
-  }
+
+  const accounts = new Accounts(db, now);
+  const vault = new Vault(db, now, options.accountQuotaBytes ?? DEFAULT_ACCOUNT_QUOTA);
+  const tapes = new Tapes(db, now);
+  const audit = new Audit(db, now);
+  const hub = new Hub();
+  const docks = new Docks(db, now, keys.subkey("dock-tags"));
   const host = options.host ?? process.env["CARDBOARD_HOST"] ?? "127.0.0.1";
   const port = options.port ?? Number(process.env["CARDBOARD_PORT"] ?? 8787);
   const info: ServerInfo = {
@@ -101,24 +106,13 @@ export async function startServer(options: StartOptions = {}): Promise<RunningCa
     trustProxy: Boolean(options.trustProxy),
     publicUrl: "",
     startedAt: now(),
+    signup: options.openSignup || process.env["CARDBOARD_OPEN_SIGNUP"] === "1" ? "open" : "invite",
   };
-  const oauth = new OAuth(db, vault, tapes, () => info.publicUrl);
-  const api = new Api({ db, vault, tapes, audit, hub, docks, oauth, info });
-  const mcp = new Mcp(api);
-  api.mcp = mcp;
-  audit.resolveActor = (actor) => {
-    if (!actor.startsWith("grant:")) return null;
-    const grant = oauth.grant(actor.slice(6));
-    const client = grant ? oauth.client(grant.clientId) : undefined;
-    return client ? `${client.name} (AI assistant)` : "A disconnected assistant";
-  };
-  const oauthHandler = createOAuthHandler({
-    oauth,
-    api,
-    secure: () => info.publicUrl.startsWith("https:"),
-    ip: (req) => clientIp(req, info.trustProxy),
-  });
+  const oauth = new OAuth(db, vault, tapes, keys, () => info.publicUrl);
+  const api = new Api({ db, accounts, vault, tapes, audit, hub, docks, oauth, info });
+  const oauthHandler = createOAuthHandler({ oauth, api, ip: (req) => clientIp(req, info.trustProxy) });
   const statics = loadStatics();
+  const modules = new Map<string, Buffer | null>();
 
   const handler = (req: IncomingMessage, res: ServerResponse) => {
     handle(req, res).catch((err) => {
@@ -133,11 +127,17 @@ export async function startServer(options: StartOptions = {}): Promise<RunningCa
     res.setHeader("referrer-policy", "no-referrer");
     res.setHeader("x-frame-options", "DENY");
     const path = new URL(req.url ?? "/", "http://cardboard.local").pathname;
-    if (await mcp.http(req, res, path, clientIp(req, info.trustProxy))) return;
     if (await oauthHandler(req, res, path)) return;
 
     if (req.method === "GET" || req.method === "HEAD") {
       if (path === "/health") return sendJson(res, 200, { ok: true, version: VERSION });
+      if (path.startsWith("/lib/")) {
+        const body = clientModule(path.slice(5), modules);
+        if (!body) return sendJson(res, 404, notFound());
+        res.writeHead(200, { "content-type": "text/javascript; charset=utf-8", "cache-control": "no-cache" });
+        res.end(req.method === "HEAD" ? undefined : body);
+        return;
+      }
       const file = statics.get(path === "/" ? "/index.html" : path);
       if (!file) return sendJson(res, 404, notFound());
       res.writeHead(200, {
@@ -149,10 +149,10 @@ export async function startServer(options: StartOptions = {}): Promise<RunningCa
       return;
     }
 
-    const route = /^\/v1\/(admin\/)?([a-z][a-z.]{0,40})$/.exec(path);
+    const route = /^\/v1\/([a-z][a-z.]{0,40})$/.exec(path);
     const origin = header(req, "origin");
     if (req.method === "OPTIONS" && route) {
-      if (origin && !route[1] && api.preflightAllowed(origin)) {
+      if (origin && api.preflightAllowed(origin)) {
         res.writeHead(204, {
           "access-control-allow-origin": origin,
           "access-control-allow-methods": "POST",
@@ -169,9 +169,7 @@ export async function startServer(options: StartOptions = {}): Promise<RunningCa
     if (req.method !== "POST" || !route) return sendJson(res, 404, notFound());
 
     if (!/^application\/json\b/i.test(header(req, "content-type") ?? "")) {
-      return sendJson(res, 415, {
-        error: { code: "json_only", message: "Cardboard only speaks JSON.", hint: "Send Content-Type: application/json." },
-      });
+      return sendJson(res, 415, { error: { code: "json_only", message: "Cardboard only speaks JSON.", hint: "Send Content-Type: application/json." } });
     }
     let body: unknown;
     try {
@@ -182,21 +180,21 @@ export async function startServer(options: StartOptions = {}): Promise<RunningCa
     }
 
     const apiReq: ApiRequest = {
-      op: route[2]!,
-      admin: Boolean(route[1]),
+      op: route[1]!,
       authorization: header(req, "authorization"),
       origin,
       host: header(req, "host"),
       ip: clientIp(req, info.trustProxy),
       body,
     };
-    if (!apiReq.admin && apiReq.op === "watch") return watch(apiReq, res);
-    if (!apiReq.admin && apiReq.op === "dock.watch") return watchDock(apiReq, res);
-    const out = api.call(apiReq);
+    const tapeCall = /^Bearer\s+cbt_/i.test(apiReq.authorization ?? "");
+    if (tapeCall && apiReq.op === "watch") return watch(apiReq, res);
+    if (tapeCall && apiReq.op === "dock.watch") return watchDock(apiReq, res);
+    const out = apiReq.op === "host.shake" ? await api.hostShake(apiReq) : api.call(apiReq);
     sendJson(res, out.status, out.body, out.headers);
   }
 
-  /** Server-sent events: one `change` event per committed write under the watched prefix. */
+  /** Server-sent events: one sealed `change` event per committed write. */
   function watch(apiReq: ApiRequest, res: ServerResponse) {
     let auth: ReturnType<Api["authorizeWatch"]>;
     try {
@@ -205,15 +203,9 @@ export async function startServer(options: StartOptions = {}): Promise<RunningCa
       const out = errorResponse(err);
       return sendJson(res, out.status, out.body);
     }
-    res.writeHead(200, {
-      "content-type": "text/event-stream; charset=utf-8",
-      "cache-control": "no-store",
-      connection: "keep-alive",
-      "x-accel-buffering": "no",
-      ...auth.cors,
-    });
-    res.write(`event: ready\ndata: ${JSON.stringify({ box: auth.box.name, prefix: auth.prefix })}\n\n`);
-    stream(res, `box:${auth.box.id}`, auth.box.id, auth.tape.id, (change: { key: string }) => change.key.startsWith(auth.prefix), "change");
+    openStream(res, auth.cors);
+    res.write(`event: ready\ndata: ${JSON.stringify({ box: auth.box.id })}\n\n`);
+    stream(res, `box:${auth.box.id}`, auth.box.id, auth.tape.id, (_change: Omit<Change, "boxId">) => true, "change");
   }
 
   /** Server-sent events: one `parcel` event per parcel addressed to this app at the dock. */
@@ -225,16 +217,20 @@ export async function startServer(options: StartOptions = {}): Promise<RunningCa
       const out = errorResponse(err);
       return sendJson(res, out.status, out.body);
     }
+    openStream(res, auth.cors);
+    res.write(`event: ready\ndata: ${JSON.stringify({ me: auth.berth.tag })}\n\n`);
+    const me = auth.berth.tag;
+    stream(res, `dock:${auth.dock.id}`, auth.box.id, auth.tape.id, (p: Parcel) => p.from !== me && (p.to === null || p.to === me), "parcel");
+  }
+
+  function openStream(res: ServerResponse, cors: Record<string, string>) {
     res.writeHead(200, {
       "content-type": "text/event-stream; charset=utf-8",
       "cache-control": "no-store",
       connection: "keep-alive",
       "x-accel-buffering": "no",
-      ...auth.cors,
+      ...cors,
     });
-    res.write(`event: ready\ndata: ${JSON.stringify({ dock: auth.dock.name, me: auth.berth.tag })}\n\n`);
-    const me = auth.berth.tag;
-    stream(res, `dock:${auth.dock.id}`, auth.box.id, auth.tape.id, (p: Parcel) => p.from !== me && (p.to === null || p.to === me), "parcel");
   }
 
   function stream(res: ServerResponse, channel: string, boxId: string, tapeId: string, accept: (event: any) => boolean, eventName: string) {
@@ -271,11 +267,19 @@ export async function startServer(options: StartOptions = {}): Promise<RunningCa
   const localUrl = `${options.tls ? "https" : "http"}://${displayHost === "0.0.0.0" ? "127.0.0.1" : displayHost}:${info.port}`;
   info.publicUrl = (options.publicUrl ?? process.env["CARDBOARD_PUBLIC_URL"] ?? localUrl).replace(/\/+$/, "");
 
+  // The very first start makes one invite, so whoever runs Cardboard can make their own account right away.
+  let firstInvite: string | undefined;
+  if (hostToken && info.signup === "invite") firstInvite = `${info.publicUrl}/#invite=${accounts.createInvite({ note: "first account" }).code}`;
+
   const sweeper = setInterval(() => {
     try {
-      for (const [boxId, count] of vault.sweep().expired) audit.record(boxId, "system", "expire", "ok", { count });
+      for (const [boxId, count] of vault.sweep().expired) {
+        const box = vault.box(boxId);
+        if (box) audit.record({ accountId: box.accountId, boxId, actor: "system", action: "expire", count });
+      }
       docks.sweep();
       oauth.sweep();
+      accounts.sweep();
       audit.prune();
     } catch (err) {
       console.error("[cardboard] housekeeping failed:", err);
@@ -283,7 +287,7 @@ export async function startServer(options: StartOptions = {}): Promise<RunningCa
   }, options.sweepEveryMs ?? 60_000);
   sweeper.unref();
 
-  const shake = options.shake === false ? null : api.runShake();
+  const shake = options.shake === false ? null : await api.runShake();
 
   return {
     url: localUrl,
@@ -292,10 +296,10 @@ export async function startServer(options: StartOptions = {}): Promise<RunningCa
     port: info.port,
     paths,
     firstRun,
-    ownerToken,
+    hostToken,
+    firstInvite,
     shake,
     api,
-    vault,
     close: async () => {
       clearInterval(sweeper);
       hub.closeWhere(() => true);
@@ -318,6 +322,30 @@ function loadStatics(): Map<string, { body: Buffer; type: string }> {
   return files;
 }
 
+/**
+ * The dashboard's crypto is the same code as the SDK's (src/client, src/shared,
+ * src/sdk), served to the browser with its types stripped. From an installed
+ * package, the compiled dist/ files are served instead.
+ */
+function clientModule(path: string, cache: Map<string, Buffer | null>): Buffer | null {
+  if (!/^(client|shared|sdk)\/[a-z0-9-]+\.(ts|js)$/.test(path) || normalize(path) !== path) return null;
+  if (cache.has(path)) return cache.get(path)!;
+  let body: Buffer | null = null;
+  const source = join(ROOT, "src", path.replace(/\.js$/, ".ts"));
+  const built = join(ROOT, "dist", path.replace(/\.ts$/, ".js"));
+  try {
+    if (existsSync(source)) {
+      body = Buffer.from(stripTypeScriptTypes(readFileSync(source, "utf8"), { mode: "strip" }));
+    } else if (existsSync(built)) {
+      body = readFileSync(built);
+    }
+  } catch (err) {
+    console.error(`[cardboard] couldn't prepare ${path} for the dashboard:`, err);
+  }
+  cache.set(path, body);
+  return body;
+}
+
 function header(req: IncomingMessage, name: string): string | undefined {
   const value = req.headers[name];
   return Array.isArray(value) ? value[0] : value;
@@ -332,13 +360,7 @@ function clientIp(req: IncomingMessage, trustProxy: boolean): string {
 }
 
 function notFound() {
-  return {
-    error: {
-      code: "not_found",
-      message: "Nothing here.",
-      hint: "The API is POST /v1/<operation> with a JSON body. The dashboard is at /.",
-    },
-  };
+  return { error: { code: "not_found", message: "Nothing here.", hint: "The API is POST /v1/<operation> with a JSON body. The dashboard is at /." } };
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}) {

@@ -1,50 +1,28 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { CardboardError } from "../shared/errors.ts";
 import type { Api } from "./api.ts";
-import { OAuthError, type AuthRequest, type OAuth } from "./oauth.ts";
-import { consentPage, errorPage, loginPage } from "./pages.ts";
+import { OAuthError, type OAuth } from "./oauth.ts";
+import { errorPage } from "./pages.ts";
 
 /**
  * HTTP side of Sign in with Cardboard: the standard endpoints (discovery, JWKS,
- * dynamic registration, authorize, token, userinfo, revoke) plus the cookie
- * session that the sign-in and consent pages use.
+ * dynamic registration, authorize, token, userinfo, revoke). /oauth/authorize
+ * checks the request, then hands your browser to the dashboard, which has your
+ * keys and asks you.
  */
 
-const COOKIE = "cardboard_session";
 const MAX_FORM = 64 * 1024;
-/** form-action also governs where a submitted form may redirect, so it names the app being signed into. */
-function pageCsp(formTargets: string[]): string {
-  return [
-    "default-src 'none'",
-    "style-src 'self'",
-    "img-src 'self' data:",
-    `form-action 'self'${formTargets.map((t) => ` ${t}`).join("")}`,
-    "base-uri 'none'",
-    "frame-ancestors 'none'",
-  ].join("; ");
-}
-
-/** The CSP source for a redirect URI: its origin, or its scheme for native apps. */
-function formTarget(redirectUri: string): string {
-  const url = new URL(redirectUri);
-  return url.origin !== "null" ? url.origin : url.protocol;
-}
+const PAGE_CSP = ["default-src 'none'", "style-src 'self'", "img-src 'self' data:", "form-action 'none'", "base-uri 'none'", "frame-ancestors 'none'"].join("; ");
 
 export interface OAuthHttpDeps {
   oauth: OAuth;
   api: Api;
-  /** Whether cookies should be Secure (Cardboard is served over https). */
-  secure: () => boolean;
   ip: (req: IncomingMessage) => string;
 }
 
 export function createOAuthHandler(deps: OAuthHttpDeps) {
   const { oauth, api } = deps;
   const registrations = new Map<string, number[]>();
-
-  const log = (action: string, outcome: "ok" | "denied", detail: Record<string, unknown>, boxId: string | null = null) =>
-    api.ctx.audit.record(boxId, "owner", action, outcome, detail);
-  oauth.onAlarm = (message) => api.ctx.audit.record(null, "system", "app.alarm", "denied", { note: message });
 
   return async function handle(req: IncomingMessage, res: ServerResponse, path: string): Promise<boolean> {
     const method = req.method ?? "GET";
@@ -78,41 +56,18 @@ export function createOAuthHandler(deps: OAuthHttpDeps) {
         registrations.set(ip, [...recent, now]);
         const meta = JSON.parse((await readBody(req)).toString() || "{}") as Record<string, unknown>;
         const { client, response } = oauth.register(meta, "self");
-        api.ctx.audit.record(null, "system", "app.register", "ok", { name: client.name, note: client.redirectUris.join(", ") });
+        api.ctx.audit.record({ accountId: null, actor: "anonymous", action: "app.register", note: client.name });
         return json(res, 201, response, cors);
       }
 
-      if (path === "/oauth/authorize" && method === "GET") return authorize(req, res, new URL(req.url ?? "/", "http://x").searchParams);
-      if (path === "/oauth/authorize" && method === "POST") {
-        if (!sameOrigin(req)) return html(res, 403, errorPage("That form came from another site, so Cardboard ignored it."));
-        return decide(req, res, new URLSearchParams((await readBody(req)).toString()));
-      }
-
-      if (path === "/oauth/login" && method === "POST") {
-        if (!sameOrigin(req)) return html(res, 403, errorPage("That form came from another site, so Cardboard ignored it."));
-        const form = new URLSearchParams((await readBody(req)).toString());
-        const returnTo = safeReturn(form.get("return_to"));
-        const pending = oauth.checkAuthorize(new URL(returnTo, "http://cardboard.local").searchParams);
-        const targets = pending.kind === "ok" ? [formTarget(pending.request.redirectUri)] : [];
-        if (!api.verifyOwnerSecret(form.get("token")?.trim(), deps.ip(req))) {
-          return html(res, 401, loginPage({ returnTo, error: "That isn't the owner token for this Cardboard." }), targets);
-        }
-        startSession(res);
-        log("session", "ok", { ip: deps.ip(req) });
-        return redirect(res, 303, returnTo);
-      }
-
-      // The dashboard calls this after you sign in, so "Sign in with Cardboard" works in the same browser.
-      if (path === "/oauth/session" && method === "POST") {
-        const token = /^Bearer\s+(\S+)$/i.exec(req.headers.authorization ?? "")?.[1];
-        if (!sameOrigin(req) || !api.verifyOwnerSecret(token, deps.ip(req))) return json(res, 401, { error: "not_owner" });
-        startSession(res);
-        return json(res, 200, { ok: true });
-      }
-      if (path === "/oauth/logout" && method === "POST") {
-        oauth.endSession(cookie(req, COOKIE));
-        res.setHeader("set-cookie", sessionCookie("", 0));
-        return json(res, 200, { ok: true });
+      if (path === "/oauth/authorize" && method === "GET") {
+        const check = oauth.checkAuthorize(new URL(req.url ?? "/", "http://x").searchParams);
+        if (check.kind === "page") return html(res, 400, errorPage(check.message, check.hint));
+        if (check.kind === "redirect") return redirect(res, check.location);
+        // Your keys live in your dashboard, so that's where you say yes or no. No fragment in
+        // this redirect, so the browser keeps the app's own (#cardboard_key=…), which the server
+        // never sees: the dashboard checks the server didn't swap the app's key.
+        return redirect(res, `/?connect=${oauth.startRequest(check.request)}`);
       }
 
       if (path === "/oauth/token" && method === "POST") {
@@ -155,103 +110,13 @@ export function createOAuthHandler(deps: OAuthHttpDeps) {
         return json(res, err.status, { error: err.error, error_description: err.message }, headers);
       }
       if (err instanceof CardboardError) {
-        if (path === "/oauth/authorize" || path === "/oauth/login") return html(res, err.status, errorPage(err.reason, err.hint));
+        if (path === "/oauth/authorize") return html(res, err.status, errorPage(err.reason, err.hint));
         return json(res, err.status, { error: err.code, error_description: err.message }, cors);
       }
       if (err instanceof SyntaxError) return json(res, 400, { error: "invalid_request", error_description: "The request body isn't valid." }, cors);
       throw err;
     }
   };
-
-  function authorize(req: IncomingMessage, res: ServerResponse, params: URLSearchParams): boolean {
-    const check = oauth.checkAuthorize(params);
-    if (check.kind === "page") return html(res, 400, errorPage(check.message, check.hint));
-    if (check.kind === "redirect") return redirect(res, 302, check.location);
-    const { request } = check;
-    const session = oauth.checkSession(cookie(req, COOKIE));
-    if (!session) {
-      if (request.prompt === "none") return redirect(res, 302, oauth.redirectWith(request.redirectUri, { error: "login_required", state: request.state }));
-      return html(res, 200, loginPage({ returnTo: `/oauth/authorize?${params.toString()}`, appName: request.client.name }), [
-        formTarget(request.redirectUri),
-      ]);
-    }
-    const existing = oauth.existingGrant(request.client.id, request.scopes);
-    if (existing && request.prompt !== "consent") {
-      // Already said yes to all of this: straight back to the app. It remembers you.
-      return redirect(res, 302, codeRedirect(request, existing, session.createdAt));
-    }
-    if (request.prompt === "none") return redirect(res, 302, oauth.redirectWith(request.redirectUri, { error: "consent_required", state: request.state }));
-    const previous = oauth.grantsOf(request.client.id).find((g) => g.boxId);
-    const boxName = previous?.boxId ? (api.ctx.vault.getBox(previous.boxId)?.name ?? null) : null;
-    const active = oauth.grantsOf(request.client.id).find((g) => g.revokedAt === null);
-    const { vault } = api.ctx;
-    const boxes = request.scopes.includes("mcp")
-      ? vault
-          .listBoxes()
-          .filter((b) => b.id !== previous?.boxId)
-          .map((b) => ({ name: b.name, summary: api.inventoryFor(b.id).summary }))
-      : [];
-    const shared = active
-      ? oauth.shared(active.id).flatMap((s) => {
-          const box = vault.getBox(s.boxId);
-          return box ? [{ name: box.name, write: s.write }] : [];
-        })
-      : [];
-    return html(
-      res,
-      200,
-      consentPage({
-        request,
-        profile: oauth.profile(),
-        boxName,
-        csrf: oauth.csrf(session.hash, request.client.id),
-        now: vault.now(),
-        boxes,
-        shared,
-      }),
-      [formTarget(request.redirectUri)],
-    );
-  }
-
-  function decide(req: IncomingMessage, res: ServerResponse, form: URLSearchParams): boolean {
-    const session = oauth.checkSession(cookie(req, COOKIE));
-    if (!session) return html(res, 401, errorPage("Your sign-in expired.", "Go back to the app and try again."));
-    const check = oauth.checkAuthorize(new URLSearchParams([...form.entries(), ["response_type", "code"]]));
-    if (check.kind === "page") return html(res, 400, errorPage(check.message, check.hint));
-    if (check.kind === "redirect") return redirect(res, 303, check.location);
-    const { request } = check;
-    if (form.get("csrf") !== oauth.csrf(session.hash, request.client.id)) {
-      return html(res, 403, errorPage("That form is out of date or didn't come from this page.", "Go back to the app and try again."));
-    }
-    if (form.get("decision") !== "allow") {
-      log("app.deny", "ok", { name: request.client.name });
-      return redirect(res, 303, oauth.redirectWith(request.redirectUri, { error: "access_denied", error_description: "You said no.", state: request.state }));
-    }
-    // What an AI assistant may see: ticked boxes only ("change" includes "see"), never system boxes.
-    const { vault } = api.ctx;
-    const names = new Set([...form.getAll("read"), ...form.getAll("write")]);
-    const shared = [...names].flatMap((name) => {
-      const box = vault.findBox(name);
-      return box && !box.system ? [{ boxId: box.id, write: form.getAll("write").includes(name) }] : [];
-    });
-    const grant = oauth.consent(request, request.scopes.includes("mcp") ? { shared } : {});
-    const sharedNote = shared.length ? `; shared ${shared.map((s) => `${vault.getBox(s.boxId)?.name}${s.write ? " (change)" : ""}`).join(", ")}` : "";
-    log("app.connect", "ok", { name: request.client.name, note: `${grant.scopes.join(" ")}${sharedNote}` }, grant.boxId);
-    return redirect(res, 303, codeRedirect(request, grant, session.createdAt));
-  }
-
-  function codeRedirect(request: AuthRequest, grant: Parameters<OAuth["issueCode"]>[0], authTime: number): string {
-    const code = oauth.issueCode(grant, request, authTime);
-    return oauth.redirectWith(request.redirectUri, { code, state: request.state });
-  }
-
-  function startSession(res: ServerResponse) {
-    res.setHeader("set-cookie", sessionCookie(oauth.createSession(), 30 * 24 * 60 * 60));
-  }
-
-  function sessionCookie(value: string, maxAge: number): string {
-    return `${COOKIE}=${value}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}${deps.secure() ? "; Secure" : ""}`;
-  }
 }
 
 function json(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): true {
@@ -261,46 +126,16 @@ function json(res: ServerResponse, status: number, body: unknown, headers: Recor
   return true;
 }
 
-function html(res: ServerResponse, status: number, body: string, formTargets: string[] = []): true {
-  res.writeHead(status, {
-    "content-type": "text/html; charset=utf-8",
-    "content-security-policy": pageCsp(formTargets),
-    "cache-control": "no-store",
-    // no-referrer would make browsers send "Origin: null" on our own forms; same-origin still tells other sites nothing.
-    "referrer-policy": "same-origin",
-  });
+function html(res: ServerResponse, status: number, body: string): true {
+  res.writeHead(status, { "content-type": "text/html; charset=utf-8", "content-security-policy": PAGE_CSP, "cache-control": "no-store" });
   res.end(body);
   return true;
 }
 
-function redirect(res: ServerResponse, status: 302 | 303, location: string): true {
-  res.writeHead(status, { location, "cache-control": "no-store" });
+function redirect(res: ServerResponse, location: string): true {
+  res.writeHead(302, { location, "cache-control": "no-store" });
   res.end();
   return true;
-}
-
-function cookie(req: IncomingMessage, name: string): string | undefined {
-  for (const part of (req.headers.cookie ?? "").split(";")) {
-    const [key, ...rest] = part.trim().split("=");
-    if (key === name) return rest.join("=");
-  }
-  return undefined;
-}
-
-/** Browsers send Origin on form posts; it has to be this Cardboard. */
-function sameOrigin(req: IncomingMessage): boolean {
-  const origin = req.headers.origin;
-  if (!origin) return true;
-  try {
-    return new URL(origin).host === req.headers.host;
-  } catch {
-    return false;
-  }
-}
-
-/** Only ever bounce back into our own authorize flow, never to an arbitrary URL. */
-function safeReturn(value: string | null): string {
-  return value && value.startsWith("/oauth/authorize?") ? value : "/";
 }
 
 function clientCredentials(req: IncomingMessage, form: URLSearchParams): { clientId?: string; clientSecret?: string } {

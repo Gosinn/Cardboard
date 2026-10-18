@@ -1,4 +1,4 @@
-import { fail } from "../shared/errors.ts";
+import { fail } from "./errors.ts";
 
 /**
  * A small, forgiving query language over JSON documents:

@@ -1,5 +1,5 @@
 import { describeCounts, scan, SECRET_KINDS, type SensitiveKind } from "./detect.ts";
-import type { Item } from "./vault.ts";
+import type { Item } from "./data.ts";
 
 /**
  * Labels: Cardboard works out what each box holds by looking at the data, so

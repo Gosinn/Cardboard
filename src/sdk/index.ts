@@ -7,12 +7,25 @@
  *   const notes = box.collection<Note>("notes");
  *   await notes.add({ title: "Buy milk", done: false });
  *   await notes.find({ where: { done: false }, sort: "-$createdAt" });
+ *
+ * Everything is sealed right here, before it leaves your app: the Cardboard
+ * server only ever stores what it can't open. Key names, values, parcels:
+ * all of it. The smart parts (spotting secrets, queries, customs at docks)
+ * run here too, on the opened data.
  */
-import { CardboardError } from "../shared/errors.ts";
+import { CardboardError, fail } from "../shared/errors.ts";
 import type { Duration } from "../shared/duration.ts";
+import { ctx } from "../shared/contexts.ts";
+import { inspect, type CustomsPolicy } from "../shared/customs.ts";
+import { isPlainObject, mergePatch, sortableId, validateKey, type Item } from "../shared/data.ts";
+import { notice, scan, SECRET_KINDS, type Finding } from "../shared/detect.ts";
+import { matches, sortItems, type Where } from "../shared/query.ts";
+import { fromB64u, open as openSealed, openJson, openText, seal, sealJson, toB64u } from "../client/crypto.ts";
+import { boxKeys, dockIndex, dockKeys, itemIndex, namesKeys, newClientId, readBundle, type BoxKeys, type DockKeys, type NamesKeys } from "../client/keys.ts";
+import { Rpc, toError, type ErrorBody } from "../client/rpc.ts";
 
 export { CardboardError };
-export type { Duration };
+export type { Duration, Item, Where };
 
 export interface OpenOptions {
   /** Defaults to CARDBOARD_URL, then http://127.0.0.1:8787. */
@@ -26,18 +39,10 @@ export interface OpenOptions {
    * Pass false to silence.
    */
   onNotice?: ((notice: string, key: string) => void) | false;
-  /** Gets a fresh tape when this one expires (used by Sign in with Cardboard sessions). */
+  /** Gets a fresh access token when this one expires (used by Sign in with Cardboard sessions). */
   refresh?: () => Promise<string>;
-}
-
-export interface Item<T = unknown> {
-  key: string;
-  value: T;
-  version: number;
-  size: number;
-  createdAt: number;
-  updatedAt: number;
-  expiresAt: number | null;
+  /** The box key itself, for Sign in with Cardboard sessions (which get it sealed to the app). */
+  keys?: { boxId: string; box: Uint8Array; names: Uint8Array };
 }
 
 export interface ListEntry {
@@ -61,8 +66,6 @@ export interface WriteResult {
   version: number;
   notices: string[];
 }
-
-export type Where = Record<string, unknown>;
 
 export interface QueryOptions {
   prefix?: string;
@@ -93,7 +96,7 @@ export interface Version<T = unknown> {
 
 export type BatchOp =
   | { op: "put"; key: string; value: unknown; ttl?: Duration | null; ifVersion?: number }
-  | { op: "patch"; key: string; value: Record<string, unknown>; ttl?: Duration | null; ifVersion?: number }
+  | { op: "patch"; key: string; value: Record<string, unknown>; ttl?: Duration | null }
   | { op: "add"; collection: string; value: Record<string, unknown>; ttl?: Duration | null }
   | { op: "delete"; key: string; purge?: boolean };
 
@@ -107,7 +110,41 @@ export interface WatchOptions {
   onError?: (error: Error) => void;
 }
 
+export interface AppProfile {
+  title?: string;
+  description?: string;
+  url?: string;
+  version?: string;
+}
+
+export interface BoxSettings {
+  origins: string[];
+  quotaBytes: number;
+  maxItemBytes: number;
+  historyDays: number;
+  secrets: "warn" | "block";
+  defaultTtlMs: number | null;
+}
+
 export type Doc<T> = T & { id: string };
+
+interface WireItem {
+  idx: string;
+  name: string;
+  value?: string;
+  version: number;
+  size: number;
+  createdAt: number;
+  updatedAt: number;
+  expiresAt: number | null;
+}
+
+interface Opened {
+  boxId: string;
+  keys: BoxKeys;
+  names: NamesKeys;
+  settings: BoxSettings | null;
+}
 
 interface MaybeProcess {
   env?: Record<string, string | undefined>;
@@ -116,6 +153,8 @@ interface MaybeProcess {
 }
 
 const proc = (globalThis as { process?: MaybeProcess }).process;
+const TAPE = /^cbt_([A-Za-z0-9_-]{86})$/;
+const MAX_PATCH_RETRIES = 5;
 let warnedBrowser = false;
 
 /** Reads only CARDBOARD_URL and CARDBOARD_TAPE from ./.env, without touching process.env. */
@@ -135,83 +174,174 @@ function readDotEnv(): Record<string, string> {
   }
 }
 
+/** A tape is two halves: the token the server checks, and the key that never leaves your app. */
+export function splitTape(tape: string): { token: string; key: Uint8Array } {
+  const match = TAPE.exec(tape.trim());
+  if (!match) {
+    throw new CardboardError(
+      "bad_tape",
+      0,
+      "That doesn't look like a Cardboard tape.",
+      "Tapes start with cbt_ and have 86 more characters. Make one with: cardboard connect <app>",
+    );
+  }
+  const bytes = fromB64u(match[1]!);
+  return { token: `cbt_${toB64u(bytes.subarray(0, 32))}`, key: bytes.slice(32) };
+}
+
 export function open(options: OpenOptions = {}): Box {
   return new Box(options);
 }
 
+type KeySource =
+  | { kind: "tape"; key: Uint8Array }
+  | { kind: "bundle"; boxId: string; box: Uint8Array; names: Uint8Array }
+  | { kind: "owned"; opened: Opened };
+
+interface InternalOptions extends OpenOptions {
+  /** Your own device opening one of your boxes (the CLI and dashboard). */
+  owned?: { rpc: Rpc; opened: Opened };
+}
+
 export class Box {
   readonly url: string;
-  private tape: string;
-  private readonly refreshTape: (() => Promise<string>) | undefined;
-  private readonly fetchImpl: typeof fetch;
+  private readonly rpc: Rpc;
+  /** Added to every request: devices name the box, an app's tape already implies it. */
+  private readonly scope: Record<string, unknown>;
+  private readonly source: KeySource;
+  private readonly refreshToken: (() => Promise<string>) | undefined;
   private readonly onNotice: ((notice: string, key: string) => void) | false;
   private readonly seenNotices = new Set<string>();
+  private opened: Promise<Opened> | null = null;
 
   constructor(options: OpenOptions = {}) {
-    const dotenv = options.url && options.tape ? {} : readDotEnv();
+    const owned = (options as InternalOptions).owned;
+    this.refreshToken = options.refresh;
+    this.onNotice = options.onNotice ?? ((message) => console.warn(`[cardboard] ${message}`));
+    if (owned) {
+      this.url = owned.rpc.url;
+      this.rpc = owned.rpc;
+      this.scope = { box: owned.opened.boxId };
+      this.source = { kind: "owned", opened: owned.opened };
+      return;
+    }
+    const dotenv = options.url && (options.tape || options.keys) ? {} : readDotEnv();
     const url = options.url ?? proc?.env?.["CARDBOARD_URL"] ?? dotenv["CARDBOARD_URL"] ?? "http://127.0.0.1:8787";
     const tape = options.tape ?? proc?.env?.["CARDBOARD_TAPE"] ?? dotenv["CARDBOARD_TAPE"];
     if (!tape) {
-      throw new CardboardError(
-        "no_tape",
-        0,
-        "No tape found for Cardboard.",
-        "Run `cardboard connect <app-name>` in your app's folder, or pass { tape } to open().",
-      );
+      throw new CardboardError("no_tape", 0, "No tape found for Cardboard.", "Run `cardboard connect <app-name>` in your app's folder, or pass { tape } to open().");
     }
     this.url = url.replace(/\/+$/, "");
-    this.tape = tape;
-    this.refreshTape = options.refresh;
-    this.fetchImpl = options.fetch ?? globalThis.fetch.bind(globalThis);
-    this.onNotice = options.onNotice ?? ((notice) => console.warn(`[cardboard] ${notice}`));
-    if (typeof (globalThis as { document?: unknown }).document !== "undefined" && !warnedBrowser) {
-      warnedBrowser = true;
-      console.warn(
-        "[cardboard] This tape is being used in a browser, where anyone using the page can read it. " +
-          "Prefer a read-only tape limited to a prefix, or call Cardboard from your server.",
-      );
+    this.scope = {};
+    if (options.keys) {
+      // A Sign in with Cardboard session: the token is an access token, the keys came sealed to the app.
+      this.rpc = new Rpc(this.url, tape, options.fetch);
+      this.source = { kind: "bundle", ...options.keys };
+    } else {
+      const { token, key } = splitTape(tape);
+      this.rpc = new Rpc(this.url, token, options.fetch);
+      this.source = { kind: "tape", key };
+      if (typeof (globalThis as { document?: unknown }).document !== "undefined" && !warnedBrowser) {
+        warnedBrowser = true;
+        console.warn(
+          "[cardboard] This tape is being used in a browser, where anyone using the page can read it, key half included. " +
+            "Prefer Sign in with Cardboard, a read-only tape, or calling Cardboard from your server.",
+        );
+      }
     }
   }
 
-  /** @internal Sends one operation. Used by collections; you shouldn't need it. */
-  async request<T>(op: string, body: unknown, retried = false): Promise<T> {
-    let res: Response;
+  /** @internal Your own device opening one of your boxes (the CLI and dashboard use this). */
+  static owned(rpc: Rpc, boxId: string, keys: BoxKeys, names: NamesKeys, settings: BoxSettings): Box {
+    return new Box({ owned: { rpc, opened: { boxId, keys, names, settings } } } as InternalOptions);
+  }
+
+  /** @internal Sends one operation (with a fresh token, if this one expired). */
+  async request<T>(op: string, body: Record<string, unknown> = {}): Promise<T> {
     try {
-      res = await this.fetchImpl(`${this.url}/v1/${op}`, {
-        method: "POST",
-        headers: { authorization: `Bearer ${this.tape}`, "content-type": "application/json" },
-        body: JSON.stringify(body),
-      });
-    } catch {
-      throw new CardboardError(
-        "unreachable",
-        0,
-        `Couldn't reach Cardboard at ${this.url}.`,
-        "Is it running? Start it with: cardboard start",
-      );
+      return await this.rpc.call<T>(op, { ...body, ...this.scope });
+    } catch (err) {
+      if (err instanceof CardboardError && err.status === 401 && this.refreshToken) {
+        this.rpc.token = await this.refreshToken();
+        return this.rpc.call<T>(op, { ...body, ...this.scope });
+      }
+      throw err;
     }
-    const data = (await res.json().catch(() => null)) as ErrorBody;
-    if (res.status === 401 && this.refreshTape && !retried) {
-      this.tape = await this.refreshTape();
-      return this.request<T>(op, body, true);
-    }
-    if (!res.ok) throw toError(res.status, data);
-    return data as T;
   }
 
-  private notify(result: { key: string; notices?: string[] }) {
+  /** @internal The box's keys, opened from the tape (once). */
+  ready(): Promise<Opened> {
+    this.opened ??= this.openKeys();
+    this.opened.catch(() => {
+      this.opened = null;
+    });
+    return this.opened;
+  }
+
+  private async openKeys(): Promise<Opened> {
+    const source = this.source;
+    if (source.kind === "owned") return source.opened;
+    const who = await this.request<{ box: { id: string; settings: BoxSettings }; bundle: string | null }>("whoami");
+    if (source.kind === "bundle") {
+      if (who.box.id !== source.boxId) throw new CardboardError("wrong_box", 0, "This sign-in's token belongs to a different box than its keys.");
+      return { boxId: source.boxId, keys: await boxKeys(source.box), names: await namesKeys(source.names), settings: who.box.settings };
+    }
+    if (!who.bundle) throw new CardboardError("no_keys", 0, "This tape doesn't carry the box key.", "Make a new tape with: cardboard tape <box>");
+    const bundle = readBundle(await openJson(source.key, fromB64u(who.bundle), ctx.tapeBundle(who.box.id)));
+    if (bundle.boxId !== who.box.id) throw new CardboardError("locked", 0, "This tape's key doesn't belong to this box.");
+    return { boxId: who.box.id, keys: await boxKeys(bundle.box), names: await namesKeys(bundle.names), settings: who.box.settings };
+  }
+
+  // ── Sealing ──────────────────────────────────────────────────────────────
+
+  private async sealItem(o: Opened, key: string, value: unknown) {
+    validateKey(key);
+    if (value === undefined) throw fail("missing_value", 400, "Nothing to store: the value is undefined.");
+    const idx = await itemIndex(o.keys, key);
+    const [name, sealedValue] = await Promise.all([
+      seal(o.keys.seal, key, ctx.itemName(o.boxId, idx)),
+      seal(o.keys.seal, JSON.stringify(value), ctx.itemValue(o.boxId, idx)),
+    ]);
+    return { idx, name: toB64u(name), value: toB64u(sealedValue) };
+  }
+
+  private async openItem<T>(o: Opened, wire: WireItem): Promise<Item<T>> {
+    const key = await openText(o.keys.seal, fromB64u(wire.name), ctx.itemName(o.boxId, wire.idx));
+    const value = wire.value !== undefined ? (JSON.parse(await openText(o.keys.seal, fromB64u(wire.value), ctx.itemValue(o.boxId, wire.idx))) as T) : (undefined as T);
+    return { key, value, version: wire.version, size: wire.size, createdAt: wire.createdAt, updatedAt: wire.updatedAt, expiresAt: wire.expiresAt };
+  }
+
+  /** Looks for secrets before anything is sealed, and refuses them if the box says so. */
+  private check(o: Opened, key: string, value: unknown): { findings: Finding[]; notices: string[] } {
+    const findings = scan(value);
+    if (o.settings?.secrets === "block") {
+      const secret = findings.find((f) => SECRET_KINDS.has(f.kind));
+      if (secret) throw fail("secret_blocked", 422, notice(secret), "This box is set to refuse secrets. Store a hash instead, or keep the key out of app data.");
+    }
+    return { findings, notices: findings.filter((f) => f.kind !== "email" && f.kind !== "phone").map(notice) };
+  }
+
+  private async detail(o: Opened, notices: string[]): Promise<string | undefined> {
+    if (notices.length === 0) return undefined;
+    return toB64u(await sealJson(o.keys.seal, { notices: notices.slice(0, 5) }, ctx.logNote(o.boxId)));
+  }
+
+  private notify(key: string, notices: string[]) {
     if (!this.onNotice) return;
-    for (const notice of result.notices ?? []) {
-      const id = `${result.key}\u0000${notice}`;
+    for (const message of notices) {
+      const id = `${key}\u0000${message}`;
       if (this.seenNotices.has(id)) continue;
       this.seenNotices.add(id);
-      this.onNotice(notice, result.key);
+      this.onNotice(message, key);
     }
   }
 
-  /** Who am I? The box name, this tape's permissions, and how much is stored. */
-  whoami(): Promise<{ box: string; items: number; bytes: number; tape: Record<string, unknown> }> {
-    return this.request("whoami", {});
+  // ── Items ────────────────────────────────────────────────────────────────
+
+  /** Which box this is, this tape's permissions, and how much is stored. */
+  async whoami(): Promise<{ box: string; items: number; bytes: number; tape: Record<string, unknown> }> {
+    const who = await this.request<{ box: { id: string }; items: number; bytes: number; tape: Record<string, unknown> }>("whoami");
+    return { box: who.box.id, items: who.items, bytes: who.bytes, tape: who.tape };
   }
 
   /** The value at `key`, or null if there's nothing there. */
@@ -222,8 +352,10 @@ export class Box {
 
   /** Like get, but with version and timestamps. */
   async getItem<T = unknown>(key: string): Promise<Item<T> | null> {
-    const { item } = await this.request<{ item: Item<T> | null }>("get", { key });
-    return item;
+    validateKey(key);
+    const o = await this.ready();
+    const { item } = await this.request<{ item: WireItem | null }>("get", { idx: await itemIndex(o.keys, key) });
+    return item ? this.openItem<T>(o, item) : null;
   }
 
   async has(key: string): Promise<boolean> {
@@ -231,82 +363,155 @@ export class Box {
   }
 
   async put<T>(key: string, value: T, options: WriteOptions = {}): Promise<WriteResult> {
-    const result = await this.request<WriteResult>("put", { key, value, ...writeBody(options) });
-    this.notify(result);
-    return result;
+    const o = await this.ready();
+    const { notices } = this.check(o, key, value);
+    const sealed = await this.sealItem(o, key, value);
+    const result = await this.request<{ version: number }>("put", { ...sealed, ...writeBody(options), detail: await this.detail(o, notices) });
+    this.notify(key, notices);
+    return { key, version: result.version, notices };
   }
 
   /** Merges `changes` into the object at `key` (null removes a field). Returns the merged object. */
-  async patch<T extends Record<string, unknown>>(
-    key: string,
-    changes: Partial<{ [K in keyof T]: T[K] | null }>,
-    options: WriteOptions = {},
-  ): Promise<T> {
-    const result = await this.request<WriteResult & { value: T }>("patch", { key, value: changes, ...writeBody(options) });
-    this.notify(result);
-    return result.value;
+  async patch<T extends Record<string, unknown>>(key: string, changes: Partial<{ [K in keyof T]: T[K] | null }>, options: WriteOptions = {}): Promise<T> {
+    if (!isPlainObject(changes)) throw fail("bad_patch", 400, "A patch must be an object, like { done: true }.");
+    for (let attempt = 0; ; attempt++) {
+      const current = await this.getItem(key);
+      if (current && !isPlainObject(current.value)) throw fail("not_an_object", 409, `"${key}" isn't an object, so it can't be patched.`, "Use put to replace it.");
+      if (options.ifVersion !== undefined && (current?.version ?? 0) !== options.ifVersion) {
+        throw fail("version_conflict", 409, `"${key}" changed since you read it.`, "Read it again and retry.");
+      }
+      const value = mergePatch(current?.value ?? {}, changes) as T;
+      const ttl = options.ttl !== undefined ? options.ttl : current?.expiresAt ? Math.max(1, Math.ceil((current.expiresAt - Date.now()) / 1000)) : undefined;
+      try {
+        await this.put(key, value, { ttl, ifVersion: current?.version ?? 0 });
+        return value;
+      } catch (err) {
+        // Someone else wrote in between: read again and merge again.
+        if (!(err instanceof CardboardError) || (err.code !== "version_conflict" && err.code !== "already_exists") || attempt >= MAX_PATCH_RETRIES) throw err;
+      }
+    }
   }
 
   /** Deletes `key`. It stays in history (undo brings it back) unless `purge` is set. */
   async delete(key: string, options: { purge?: boolean } = {}): Promise<boolean> {
-    const { deleted } = await this.request<{ deleted: boolean }>("delete", { key, purge: options.purge });
+    validateKey(key);
+    const o = await this.ready();
+    const { deleted } = await this.request<{ deleted: boolean }>("delete", { idx: await itemIndex(o.keys, key), purge: options.purge });
     return deleted;
   }
 
-  /** Every key under `prefix`, with metadata. Pages through automatically. */
-  async list(prefix = "", options: { limit?: number } = {}): Promise<ListEntry[]> {
-    const wanted = options.limit ?? 10_000;
-    const out: ListEntry[] = [];
+  /** @internal Every live item, opened. */
+  private async fetchAll(withValues: boolean): Promise<Item[]> {
+    const o = await this.ready();
+    const out: Item[] = [];
     let after: string | undefined;
-    while (out.length < wanted) {
-      const page = await this.request<{ items: ListEntry[]; next: string | null }>("list", {
-        prefix,
-        after,
-        limit: Math.min(1000, wanted - out.length),
-      });
-      out.push(...page.items);
+    for (;;) {
+      const page = await this.request<{ items: WireItem[]; next: string | null }>("list", { after, limit: 1000, values: withValues });
+      out.push(...(await Promise.all(page.items.map((i) => this.openItem(o, i)))));
       if (!page.next) break;
       after = page.next;
     }
-    return out;
+    return out.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+  }
+
+  /** Every item under `prefix`, opened, sorted by key. Fine at personal scale (tens of thousands of items). */
+  async items<T = unknown>(prefix = ""): Promise<Item<T>[]> {
+    return (await this.fetchAll(true)).filter((i) => i.key.startsWith(prefix)) as Item<T>[];
+  }
+
+  /** Every key under `prefix`, with metadata. */
+  async list(prefix = "", options: { limit?: number } = {}): Promise<ListEntry[]> {
+    const all = (await this.fetchAll(false)).filter((i) => i.key.startsWith(prefix));
+    return all.slice(0, options.limit ?? 10_000).map(({ key, size, version, createdAt, updatedAt, expiresAt }) => ({ key, size, version, createdAt, updatedAt, expiresAt }));
   }
 
   async keys(prefix = ""): Promise<string[]> {
     return (await this.list(prefix)).map((e) => e.key);
   }
 
-  /** Search values: { where: { done: false, stars: { $gte: 4 } }, sort: "-stars", limit: 20 }. */
-  query<T = unknown>(options: QueryOptions = {}): Promise<{ items: Item<T>[]; total: number }> {
-    return this.request("query", options);
+  /** Search values: { where: { done: false, stars: { $gte: 4 } }, sort: "-stars", limit: 20 }. Runs here, on opened data. */
+  async query<T = unknown>(options: QueryOptions = {}): Promise<{ items: Item<T>[]; total: number }> {
+    if (options.where !== undefined && !isPlainObject(options.where)) throw fail("bad_query", 400, "`where` must be an object, like { done: false }.");
+    const found = (await this.items<T>(options.prefix ?? "")).filter((item) => matches(item.value, options.where));
+    const sorted = sortItems(found, options.sort);
+    const offset = Math.max(0, Math.floor(options.offset ?? 0));
+    const limit = Math.min(10_000, Math.max(1, Math.floor(options.limit ?? 100)));
+    return { items: sorted.slice(offset, offset + limit), total: sorted.length };
   }
 
   /** Past versions of `key`, newest first. */
   async history<T = unknown>(key: string): Promise<Version<T>[]> {
-    const { versions } = await this.request<{ versions: Version<T>[] }>("history", { key });
-    return versions;
+    validateKey(key);
+    const o = await this.ready();
+    const idx = await itemIndex(o.keys, key);
+    const { versions } = await this.request<{ versions: Array<{ version: number; at: number; deleted: boolean; value: string | null; size: number; actor: string }> }>("history", { idx });
+    return Promise.all(
+      versions.map(async (v) => ({
+        version: v.version,
+        at: v.at,
+        deleted: v.deleted,
+        ...(v.value ? { value: JSON.parse(await openText(o.keys.seal, fromB64u(v.value), ctx.itemValue(o.boxId, idx))) as T } : {}),
+        size: v.size,
+        actor: v.actor,
+      })),
+    );
   }
 
   /** Puts `key` back to its previous version (or version `to`). Undo again to redo. */
-  undo(key: string, options: { to?: number } = {}): Promise<{ key: string; version: number; restored: number; deleted: boolean }> {
-    return this.request("undo", { key, to: options.to });
+  async undo(key: string, options: { to?: number } = {}): Promise<{ key: string; version: number; restored: number; deleted: boolean }> {
+    validateKey(key);
+    const o = await this.ready();
+    const result = await this.request<{ version: number; restored: number; deleted: boolean }>("undo", { idx: await itemIndex(o.keys, key), to: options.to });
+    return { key, ...result };
   }
 
   /** Several writes that all happen, or none do. */
   async batch(ops: BatchOp[]): Promise<Array<Record<string, unknown>>> {
-    const { results } = await this.request<{ results: Array<{ key: string; notices?: string[] }> }>("batch", { ops });
-    for (const r of results) this.notify(r);
-    return results;
+    const o = await this.ready();
+    const allNotices: string[] = [];
+    const planned = await Promise.all(
+      ops.map(async (op) => {
+        switch (op.op) {
+          case "put": {
+            const { notices } = this.check(o, op.key, op.value);
+            allNotices.push(...notices);
+            return { wire: { op: "put", ...(await this.sealItem(o, op.key, op.value)), ...writeBody(op) }, out: { op: "put", key: op.key, notices } };
+          }
+          case "patch": {
+            const current = await this.getItem(op.key);
+            const value = mergePatch(current?.value ?? {}, op.value);
+            const { notices } = this.check(o, op.key, value);
+            allNotices.push(...notices);
+            return { wire: { op: "put", ...(await this.sealItem(o, op.key, value)), ...writeBody(op), ifVersion: current?.version ?? 0 }, out: { op: "patch", key: op.key, notices } };
+          }
+          case "add": {
+            const { key, id, doc } = collectionDoc(op.collection, op.value);
+            const { notices } = this.check(o, key, doc);
+            allNotices.push(...notices);
+            return { wire: { op: "put", ...(await this.sealItem(o, key, doc)), ...writeBody(op), ifVersion: 0 }, out: { op: "add", key, id, notices } };
+          }
+          case "delete":
+            validateKey(op.key);
+            return { wire: { op: "delete", idx: await itemIndex(o.keys, op.key), purge: op.purge }, out: { op: "delete", key: op.key } };
+          default:
+            throw fail("bad_batch", 400, `Unknown batch op "${String((op as { op: unknown }).op)}". Use put, patch, add or delete.`);
+        }
+      }),
+    );
+    const { results } = await this.request<{ results: Array<Record<string, unknown>> }>("batch", { ops: planned.map((p) => p.wire), detail: await this.detail(o, allNotices) });
+    return results.map((r, i) => {
+      const out = planned[i]!.out as Record<string, unknown> & { key: string; notices?: string[] };
+      if (out.notices) this.notify(out.key, out.notices);
+      const { op: _op, idx: _idx, ...rest } = r;
+      return { ...out, ...rest };
+    });
   }
 
   /** Adds a document under `collection/` with a generated, time-ordered id (or its own `id`). */
-  async add<T extends object>(
-    collection: string,
-    doc: T & { id?: string },
-    options: { ttl?: Duration | null } = {},
-  ): Promise<WriteResult & { id: string }> {
-    const result = await this.request<WriteResult & { id: string }>("add", { collection, value: doc, ...writeBody(options) });
-    this.notify(result);
-    return result;
+  async add<T extends object>(collection: string, doc: T & { id?: string }, options: { ttl?: Duration | null } = {}): Promise<WriteResult & { id: string }> {
+    const { key, id, doc: full } = collectionDoc(collection, doc as Record<string, unknown>);
+    const result = await this.put(key, full, { ttl: options.ttl, ifVersion: 0 });
+    return { ...result, id };
   }
 
   /** A collection of documents under `name/`, with generated, time-ordered ids. */
@@ -320,19 +525,28 @@ export class Box {
    */
   watch<T = unknown>(prefix: string, onChange: (change: Change<T>) => void, options?: WatchOptions): Watcher;
   watch<T = unknown>(onChange: (change: Change<T>) => void, options?: WatchOptions): Watcher;
-  watch<T = unknown>(
-    a: string | ((change: Change<T>) => void),
-    b?: ((change: Change<T>) => void) | WatchOptions,
-    c?: WatchOptions,
-  ): Watcher {
+  watch<T = unknown>(a: string | ((change: Change<T>) => void), b?: ((change: Change<T>) => void) | WatchOptions, c?: WatchOptions): Watcher {
     const prefix = typeof a === "string" ? a : "";
     const onChange = (typeof a === "function" ? a : b) as (change: Change<T>) => void;
     const options = (typeof a === "function" ? b : c) as WatchOptions | undefined;
-    return this.stream("watch", { prefix }, {
+    let queue = Promise.resolve();
+    return this.stream("watch", {}, {
       onReady: () => options?.onReady?.(),
       onError: options?.onError,
       onEvent: (type, data) => {
-        if (type === "change") onChange(JSON.parse(data) as Change<T>);
+        if (type !== "change") return;
+        // Opening is async; a queue keeps changes in the order they happened.
+        queue = queue.then(async () => {
+          const o = await this.ready();
+          const raw = JSON.parse(data) as { type: "put" | "delete"; idx: string; name: string | null; value?: string; version: number | null; at: number; reason?: "expired" | "purged" };
+          if (!raw.name) return;
+          const key = await openText(o.keys.seal, fromB64u(raw.name), ctx.itemName(o.boxId, raw.idx));
+          if (!key.startsWith(prefix)) return;
+          const change: Change<T> = { type: raw.type, key, version: raw.version, at: raw.at };
+          if (raw.value) change.value = JSON.parse(await openText(o.keys.seal, fromB64u(raw.value), ctx.itemValue(o.boxId, raw.idx))) as T;
+          if (raw.reason) change.reason = raw.reason;
+          onChange(change);
+        }).catch((err) => (options?.onError ? options.onError(err as Error) : console.warn(`[cardboard] watch: ${(err as Error).message}`)));
       },
     });
   }
@@ -342,9 +556,21 @@ export class Box {
     return new Dock(this, name);
   }
 
-  /** Tell Cardboard who this app is, so you recognise it on your shelf. */
-  introduce(profile: AppProfile): Promise<{ profile: AppProfile }> {
-    return this.request("introduce", profile);
+  /** Tell Cardboard who this app is, so you recognise it on your shelf. Sealed, like everything else. */
+  async introduce(profile: AppProfile): Promise<{ profile: AppProfile }> {
+    const limits: Record<keyof AppProfile, number> = { title: 60, description: 200, url: 200, version: 40 };
+    const clean: AppProfile = {};
+    for (const [field, value] of Object.entries(profile)) {
+      if (!(field in limits)) throw fail("bad_profile", 400, `Unknown profile field "${field}". Use title, description, url and version.`);
+      const k = field as keyof AppProfile;
+      if (value === undefined || value === null || value === "") continue;
+      if (typeof value !== "string" || value.length > limits[k]) throw fail("bad_profile", 400, `\`${field}\` must be text of at most ${limits[k]} characters.`);
+      if (k === "url" && !/^https?:\/\//.test(value)) throw fail("bad_profile", 400, "`url` must start with http:// or https://.");
+      clean[k] = value;
+    }
+    const o = await this.ready();
+    await this.request("introduce", { profile: toB64u(await sealJson(o.keys.seal, clean, ctx.boxProfile(o.boxId))) });
+    return { profile: clean };
   }
 
   /**
@@ -376,16 +602,16 @@ export class Box {
       let justRefreshed = false;
       while (!closed) {
         try {
-          const res = await this.fetchImpl(`${this.url}/v1/${op}`, {
+          const res = await this.rpc.fetchImpl(`${this.url}/v1/${op}`, {
             method: "POST",
-            headers: { authorization: `Bearer ${this.tape}`, "content-type": "application/json" },
-            body: JSON.stringify(body),
+            headers: { authorization: `Bearer ${this.rpc.token}`, "content-type": "application/json" },
+            body: JSON.stringify(typeof body === "function" ? await (body as () => Promise<unknown>)() : body),
             signal: controller.signal,
           });
-          if (res.status === 401 && this.refreshTape && !justRefreshed) {
+          if (res.status === 401 && this.refreshToken && !justRefreshed) {
             justRefreshed = true;
             try {
-              this.tape = await this.refreshTape();
+              this.rpc.token = await this.refreshToken();
             } catch (err) {
               report(err);
               closed = true;
@@ -444,12 +670,17 @@ export class Box {
   }
 }
 
-export interface AppProfile {
-  title?: string;
-  description?: string;
-  url?: string;
-  version?: string;
+function collectionDoc(collection: string, doc: Record<string, unknown>): { key: string; id: string; doc: Record<string, unknown> } {
+  if (typeof collection !== "string" || !/^[^/\s][^\s]*$/.test(collection) || collection.endsWith("/")) {
+    throw fail("bad_collection", 400, "Collection names can't be empty, contain spaces, or end with '/'.");
+  }
+  if (!isPlainObject(doc)) throw fail("bad_document", 400, "Documents added to a collection must be objects.");
+  const id = doc["id"] === undefined ? sortableId(Date.now()) : doc["id"];
+  if (typeof id !== "string" || !id || id.includes("/")) throw fail("bad_id", 400, "A document `id` must be a non-empty string without '/'.");
+  return { key: `${collection}/${id}`, id, doc: { id, ...doc } };
 }
+
+// ── Docks ──────────────────────────────────────────────────────────────────
 
 /** A parcel as a receiving app sees it. `from` is a pseudonym, never a name. */
 export interface Parcel<T = unknown> {
@@ -490,27 +721,108 @@ export interface DockStatus {
 }
 
 export interface DockListenOptions extends WatchOptions {
-  /** Called once while the owner hasn't approved this app yet. Listening starts by itself once they do. */
+  /** Called once while you haven't approved this app yet. Listening starts by itself once you do. */
   onWaiting?: (message: string) => void;
+  /** Called when customs refuses a parcel (it's never handed to you). */
+  onRefused?: (reason: string, parcel: { id: string; seq: number; from: string }) => void;
 }
 
+interface RawStatus {
+  exists: boolean;
+  id: string | null;
+  me: string | null;
+  send: boolean;
+  receive: boolean;
+  waiting: { send: boolean; receive: boolean };
+  denied: boolean;
+  receivers: number | null;
+  senders: number | null;
+  key: string | null;
+  settings: (CustomsPolicy & { ttlMs: number }) | null;
+}
+
+interface RawParcel {
+  id: string;
+  seq: number;
+  from: string;
+  to: string | null;
+  body: string;
+  sentAt: number;
+  expiresAt: number;
+}
+
+const REFUSALS: Record<string, string> = {
+  secret_at_customs: "secret",
+  personal_at_customs: "personal",
+  shape_mismatch: "shape",
+  unsafe_parcel: "unsafe",
+  parcel_too_large: "unsafe",
+  locked: "sealed",
+};
+
 /**
- * A dock is a meeting point between apps. Cardboard carries parcels between
- * them, checks every parcel at customs, and never tells anyone who sent what.
- * The first time an app uses a dock, Cardboard asks you to approve it.
+ * A dock is a meeting point between apps. Parcels are sealed with a key that
+ * only apps you approved hold, so Cardboard carries them without being able to
+ * look inside, and never tells anyone who sent what. Customs runs here, in the
+ * SDK, at both ends: the sender's checks what leaves, the receiver's checks
+ * what arrives, so a careless (or hostile) app on the other side can't infect
+ * or leak through you. The first time an app uses a dock, Cardboard asks you.
  */
 export class Dock {
   readonly name: string;
   private readonly box: Box;
+  private docked: { id: string; key: DockKeys; policy: CustomsPolicy; me: string } | null = null;
 
   constructor(box: Box, name: string) {
     this.box = box;
     this.name = name;
   }
 
+  private async idx(): Promise<string> {
+    return dockIndex((await this.box.ready()).names, this.name);
+  }
+
+  /** The dock's name, sealed so that only you (not the server) can read this app's request. */
+  private async ask(): Promise<string> {
+    const o = await this.box.ready();
+    return toB64u(await seal(o.keys.seal, this.name, ctx.dockAsk(o.boxId, await this.idx())));
+  }
+
+  private async raw(): Promise<RawStatus> {
+    const s = await this.box.request<RawStatus>("dock.status", { dock: await this.idx() });
+    if (s.key && s.id && s.settings) {
+      const o = await this.box.ready();
+      const root = await openSealed(o.keys.wrap, fromB64u(s.key), ctx.berthKey(s.id, o.boxId));
+      this.docked = { id: s.id, key: await dockKeys(root), policy: s.settings, me: s.me! };
+    } else {
+      this.docked = null;
+    }
+    return s;
+  }
+
+  /** Opens the dock key, or files a request with you and throws "waiting for approval". */
+  private async ensure(want: "send" | "receive"): Promise<NonNullable<Dock["docked"]>> {
+    const s = await this.raw();
+    if (this.docked && (want === "send" ? s.send : s.receive)) return this.docked;
+    await this.box.request(want === "send" ? "dock.send" : "dock.receive", { dock: await this.idx(), ask: await this.ask() });
+    throw new CardboardError("dock_pending", 403, `Asked to ${want} on dock “${this.name}”. Waiting for approval.`);
+  }
+
   /** Sends a parcel to every app receiving at this dock, or to one pseudonym with `to`. */
-  send<T>(body: T, options: { to?: string } = {}): Promise<SendResult> {
-    return this.box.request("dock.send", { dock: this.name, body, to: options.to });
+  async send<T>(body: T, options: { to?: string } = {}): Promise<SendResult> {
+    const docked = this.docked ?? (await this.ensure("send"));
+    const cleared = inspect(body, docked.policy);
+    const id = newClientId("pcl");
+    const sealed = await sealJson(docked.key.seal, { body: cleared.body, redacted: cleared.redacted }, ctx.parcel(docked.id, id));
+    let result: { id: string; seq: number; recipients: number; from: string };
+    try {
+      result = await this.box.request("dock.send", { dock: await this.idx(), ask: await this.ask(), parcel: { id, body: toB64u(sealed) }, to: options.to });
+    } catch (err) {
+      // Taken off the dock (or the key changed) since we last looked: check again next time.
+      if (err instanceof CardboardError && (err.code === "dock_pending" || err.code === "dock_denied")) this.docked = null;
+      throw err;
+    }
+    return { ...result, redacted: cleared.redacted, stripped: cleared.stripped };
   }
 
   /** Answers a parcel. Only its sender gets the reply, and still doesn't learn who you are. */
@@ -518,19 +830,50 @@ export class Dock {
     return this.send(body, { to: parcel.from });
   }
 
+  /** Opens a parcel and runs it through customs. Refused parcels are reported (the kind, never the content) and never handed over. */
+  private async unpack<T>(docked: NonNullable<Dock["docked"]>, raw: RawParcel, onRefused?: DockListenOptions["onRefused"]): Promise<Parcel<T> | null> {
+    try {
+      const envelope = await openJson<{ body: unknown; redacted: string[] }>(docked.key.seal, fromB64u(raw.body), ctx.parcel(docked.id, raw.id));
+      const cleared = inspect(envelope.body, docked.policy);
+      return {
+        id: raw.id,
+        seq: raw.seq,
+        from: raw.from,
+        to: raw.to,
+        body: cleared.body as T,
+        sentAt: raw.sentAt,
+        expiresAt: raw.expiresAt,
+        redacted: [...new Set([...(envelope.redacted ?? []), ...cleared.redacted])],
+      };
+    } catch (err) {
+      const reason = err instanceof CardboardError ? REFUSALS[err.code] : err instanceof SyntaxError ? "sealed" : undefined;
+      if (!reason) throw err;
+      await this.box.request("dock.refuse", { dock: await this.idx(), reason }).catch(() => undefined);
+      onRefused?.(reason, { id: raw.id, seq: raw.seq, from: raw.from });
+      return null;
+    }
+  }
+
   /** Parcels waiting for this app, oldest first. With `ack: true` they're marked as picked up. */
   async receive<T = unknown>(options: { limit?: number; ack?: boolean; after?: number } = {}): Promise<Parcel<T>[]> {
-    const { parcels } = await this.box.request<{ parcels: Parcel<T>[] }>("dock.receive", { dock: this.name, ...options });
-    return parcels;
+    const docked = this.docked ?? (await this.ensure("receive"));
+    const { parcels } = await this.box.request<{ parcels: RawParcel[] }>("dock.receive", { dock: await this.idx(), ...options });
+    const out: Parcel<T>[] = [];
+    for (const raw of parcels) {
+      const parcel = await this.unpack<T>(docked, raw);
+      if (parcel) out.push(parcel);
+    }
+    return out;
   }
 
   /** Marks everything up to this parcel as picked up. Delivered parcels are deleted. */
   async ack(parcel: Parcel | number): Promise<void> {
-    await this.box.request("dock.ack", { dock: this.name, seq: typeof parcel === "number" ? parcel : parcel.seq });
+    await this.box.request("dock.ack", { dock: await this.idx(), seq: typeof parcel === "number" ? parcel : parcel.seq });
   }
 
-  status(): Promise<DockStatus> {
-    return this.box.request("dock.status", { dock: this.name });
+  async status(): Promise<DockStatus> {
+    const s = await this.raw();
+    return { dock: this.name, exists: s.exists, me: s.me, send: s.send, receive: s.receive, waiting: s.waiting, denied: s.denied, receivers: s.receivers, senders: s.senders };
   }
 
   /**
@@ -542,20 +885,22 @@ export class Dock {
     let lastSeq = 0;
     let queue: Promise<void> = Promise.resolve();
     let catchingUp = true;
-    let buffered: Parcel<T>[] = [];
+    let buffered: RawParcel[] = [];
     let saidWaiting = false;
     const report = (err: unknown) => {
       const error = err instanceof Error ? err : new Error(String(err));
       if (options.onError) options.onError(error);
       else console.warn(`[cardboard] dock ${this.name}: ${error.message}`);
     };
-    const handle = (parcel: Parcel<T>) => {
-      if (parcel.seq <= lastSeq) return;
-      lastSeq = parcel.seq;
+    const handle = (raw: RawParcel) => {
+      if (raw.seq <= lastSeq) return;
+      lastSeq = raw.seq;
       queue = queue.then(async () => {
         try {
-          await handler(parcel);
-          await this.ack(parcel.seq);
+          const docked = this.docked ?? (await this.ensure("receive"));
+          const parcel = await this.unpack<T>(docked, raw, options.onRefused);
+          if (parcel) await handler(parcel);
+          await this.ack(raw.seq);
         } catch (err) {
           report(err);
         }
@@ -563,10 +908,11 @@ export class Dock {
     };
     const catchUp = async () => {
       try {
+        await this.raw();
         for (;;) {
-          const batch = await this.receive<T>({ limit: 100, after: lastSeq || undefined });
-          batch.forEach(handle);
-          if (batch.length < 100) break;
+          const { parcels } = await this.box.request<{ parcels: RawParcel[] }>("dock.receive", { dock: await this.idx(), limit: 100, after: lastSeq || undefined });
+          parcels.forEach(handle);
+          if (parcels.length < 100) break;
         }
       } catch (err) {
         report(err);
@@ -578,7 +924,7 @@ export class Dock {
       }
     };
 
-    return this.box.stream("dock.watch", { dock: this.name }, {
+    return this.box.stream("dock.watch", async () => ({ dock: await this.idx(), ask: await this.ask() }), {
       maxDelayMs: 10_000,
       onError: options.onError,
       onReady: () => {
@@ -589,9 +935,9 @@ export class Dock {
       },
       onEvent: (type, data) => {
         if (type !== "parcel") return;
-        const parcel = JSON.parse(data) as Parcel<T>;
-        if (catchingUp) buffered.push(parcel);
-        else handle(parcel);
+        const raw = JSON.parse(data) as RawParcel;
+        if (catchingUp) buffered.push(raw);
+        else handle(raw);
       },
       keepTrying: (error) => {
         if (error.code !== "dock_pending") return false;
@@ -605,6 +951,8 @@ export class Dock {
     });
   }
 }
+
+// ── Collections ────────────────────────────────────────────────────────────
 
 export class Collection<T extends object = Record<string, unknown>> {
   readonly name: string;
@@ -661,12 +1009,7 @@ export class Collection<T extends object = Record<string, unknown>> {
 
   /** Every document, oldest first. */
   async all(): Promise<Doc<T>[]> {
-    const out: Doc<T>[] = [];
-    for (;;) {
-      const { items, total } = await this.box.query<Doc<T>>({ prefix: `${this.name}/`, limit: 1000, offset: out.length });
-      out.push(...items.map((i) => i.value));
-      if (items.length === 0 || out.length >= total) return out;
-    }
+    return (await this.box.items<Doc<T>>(`${this.name}/`)).map((i) => i.value);
   }
 
   history(id: string) {
@@ -687,13 +1030,6 @@ function writeBody(options: { ttl?: Duration | null; ifVersion?: number }) {
   if (options.ttl !== undefined) body["ttl"] = options.ttl;
   if ("ifVersion" in options && options.ifVersion !== undefined) body["ifVersion"] = options.ifVersion;
   return body;
-}
-
-type ErrorBody = { error?: { code?: string; message?: string; hint?: string } } | null;
-
-function toError(status: number, data: ErrorBody) {
-  const e = data?.error;
-  return new CardboardError(e?.code ?? `http_${status}`, status, e?.message ?? `Cardboard answered with HTTP ${status}.`, e?.hint);
 }
 
 function parseEvent(raw: string): { type: string; data: string } {
@@ -718,6 +1054,7 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
     signal.addEventListener("abort", done);
   });
 }
+
 
 export {
   finishSignIn,

@@ -1,3 +1,7 @@
+[hidden] {
+  display: none !important;
+}
+
 :root {
   --paper: #f3eadb;
   --card: #fffaf1;
@@ -623,8 +627,61 @@ th {
 }
 
 .login {
-  max-width: 420px;
-  margin: 8vh auto 0;
+  max-width: 480px;
+  margin: 6vh auto 0;
+}
+
+.tabs {
+  gap: 6px;
+}
+
+.tabs button.active {
+  background: var(--kraft);
+  color: #fff;
+  border-color: var(--kraft);
+}
+
+.secret.big {
+  font-size: 1.25rem;
+  letter-spacing: 0.06em;
+  text-align: center;
+  padding: 16px;
+}
+
+.plan {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 10px;
+  align-items: start;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  cursor: pointer;
+}
+
+.plan.current {
+  border-color: var(--kraft);
+}
+
+.plan input {
+  margin-top: 4px;
+}
+
+.plan .chip {
+  margin-left: 6px;
+}
+
+@media print {
+  .top,
+  nav,
+  button,
+  .row > button {
+    display: none !important;
+  }
+  .modal {
+    position: static;
+    background: none;
+  }
 }
 
 .login svg {

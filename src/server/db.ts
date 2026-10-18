@@ -1,6 +1,18 @@
 import { DatabaseSync } from "node:sqlite";
+import { fail } from "../shared/errors.ts";
 
 export type DB = DatabaseSync;
+
+/**
+ * Cardboard 0.2 schema. The server is blind: every column that holds something
+ * a person wrote (names, values, labels, profiles) holds it sealed by a key
+ * that only that person's devices have. The rest is what the server needs to
+ * do its job: ids, sizes, times, permissions.
+ *
+ * user_version starts at 100, so a 0.1 database (versions 1–5, server-side
+ * encryption) is recognised and never half-migrated.
+ */
+const BASE = 100;
 
 const MIGRATIONS: string[] = [
   `
@@ -9,90 +21,171 @@ const MIGRATIONS: string[] = [
     v TEXT NOT NULL
   );
 
-  CREATE TABLE boxes (
-    id          TEXT PRIMARY KEY,
-    name        TEXT NOT NULL UNIQUE,
-    wrapped_key BLOB NOT NULL,
-    settings    TEXT NOT NULL DEFAULT '{}',
-    created_at  INTEGER NOT NULL,
-    system      INTEGER NOT NULL DEFAULT 0
+  -- One row per person. profile (your name and email, for apps you allow) is sealed.
+  CREATE TABLE accounts (
+    id           TEXT PRIMARY KEY,
+    created_at   INTEGER NOT NULL,
+    last_seen_at INTEGER,
+    recovery     TEXT NOT NULL DEFAULT 'kit',
+    profile      BLOB,
+    quota_bytes  INTEGER,
+    internal     INTEGER NOT NULL DEFAULT 0
   );
 
+  -- Every device you're signed in on. envelope is the account key sealed by a
+  -- key that never leaves that device: remove the device and its copy is gone.
+  CREATE TABLE devices (
+    id           TEXT PRIMARY KEY,
+    account_id   TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    token_hash   BLOB NOT NULL UNIQUE,
+    envelope     BLOB,
+    label        BLOB,
+    kind         TEXT NOT NULL,
+    created_at   INTEGER NOT NULL,
+    last_seen_at INTEGER
+  );
+  CREATE INDEX devices_account ON devices(account_id);
+
+  -- Recovery kit and trusted-friends copies of the account key, sealed by keys
+  -- derived from codes only you (or your friends) hold. lookup is a hash that
+  -- finds the account without revealing the code.
+  CREATE TABLE recovery (
+    account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    kind       TEXT NOT NULL,
+    lookup     BLOB NOT NULL UNIQUE,
+    envelope   BLOB NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (account_id, kind)
+  ) WITHOUT ROWID;
+
+  -- A new device asking to join. id and mac come from a code shown on that
+  -- device, which the server never sees; envelope is the account key sealed to
+  -- the new device's public key by the device that said yes.
+  CREATE TABLE pairings (
+    id          BLOB PRIMARY KEY,
+    public_key  BLOB NOT NULL,
+    token_hash  BLOB NOT NULL,
+    mac         BLOB NOT NULL,
+    kind        TEXT NOT NULL,
+    created_at  INTEGER NOT NULL,
+    expires_at  INTEGER NOT NULL,
+    account_id  TEXT REFERENCES accounts(id) ON DELETE CASCADE,
+    device_id   TEXT,
+    envelope    BLOB
+  ) WITHOUT ROWID;
+
+  CREATE TABLE invites (
+    hash       BLOB PRIMARY KEY,
+    note       TEXT,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    used_at    INTEGER,
+    account_id TEXT
+  ) WITHOUT ROWID;
+
+  -- idx is a keyed hash of the box's name (the key is yours); name and key are sealed,
+  -- profile is sealed by the box key. settings are plain: the server enforces them.
+  CREATE TABLE boxes (
+    id         TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    idx        BLOB NOT NULL,
+    name       BLOB NOT NULL,
+    key        BLOB NOT NULL,
+    profile    BLOB,
+    settings   TEXT NOT NULL DEFAULT '{}',
+    created_at INTEGER NOT NULL,
+    UNIQUE (account_id, idx)
+  );
+
+  -- An app's access to one box. The token half of a tape is stored hashed; the
+  -- key half never reaches the server, and opens bundle (the box key, sealed).
   CREATE TABLE tapes (
     id           TEXT PRIMARY KEY,
+    account_id   TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
     box_id       TEXT NOT NULL REFERENCES boxes(id) ON DELETE CASCADE,
-    label        TEXT NOT NULL,
-    secret_hash  BLOB NOT NULL UNIQUE,
+    token_hash   BLOB NOT NULL UNIQUE,
+    bundle       BLOB,
+    label        BLOB,
+    kind         TEXT NOT NULL DEFAULT 'app',
     can_read     INTEGER NOT NULL,
     can_write    INTEGER NOT NULL,
-    prefix       TEXT,
     idle_ms      INTEGER,
     expires_at   INTEGER,
     created_at   INTEGER NOT NULL,
     last_used_at INTEGER,
-    revoked_at   INTEGER
+    revoked_at   INTEGER,
+    grant_id     TEXT
   );
   CREATE INDEX tapes_box ON tapes(box_id);
+  CREATE INDEX tapes_grant ON tapes(grant_id) WHERE grant_id IS NOT NULL;
 
-  -- Current state. Key names are stored encrypted (key_enc) and looked up by
-  -- a keyed HMAC (key_id), so the database never holds them in plain text.
+  -- idx is a keyed hash of the item's name; name and value are sealed by the box key.
   CREATE TABLE items (
     box_id     TEXT NOT NULL REFERENCES boxes(id) ON DELETE CASCADE,
-    key_id     BLOB NOT NULL,
-    key_enc    BLOB NOT NULL,
-    value_enc  BLOB NOT NULL,
+    idx        BLOB NOT NULL,
+    name       BLOB NOT NULL,
+    value      BLOB NOT NULL,
     size       INTEGER NOT NULL,
     version    INTEGER NOT NULL,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     expires_at INTEGER,
-    PRIMARY KEY (box_id, key_id)
+    PRIMARY KEY (box_id, idx)
   ) WITHOUT ROWID;
   CREATE INDEX items_expiry ON items(expires_at) WHERE expires_at IS NOT NULL;
 
-  -- Every version ever written (until retention prunes it). value_enc NULL = deleted.
+  -- Every version, sealed exactly as it was written. value NULL = deleted.
   CREATE TABLE history (
-    box_id    TEXT NOT NULL REFERENCES boxes(id) ON DELETE CASCADE,
-    key_id    BLOB NOT NULL,
-    version   INTEGER NOT NULL,
-    key_enc   BLOB NOT NULL,
-    value_enc BLOB,
-    size      INTEGER NOT NULL,
-    at        INTEGER NOT NULL,
-    actor     TEXT NOT NULL,
-    PRIMARY KEY (box_id, key_id, version)
+    box_id  TEXT NOT NULL REFERENCES boxes(id) ON DELETE CASCADE,
+    idx     BLOB NOT NULL,
+    version INTEGER NOT NULL,
+    name    BLOB NOT NULL,
+    value   BLOB,
+    size    INTEGER NOT NULL,
+    at      INTEGER NOT NULL,
+    actor   TEXT NOT NULL,
+    PRIMARY KEY (box_id, idx, version)
   ) WITHOUT ROWID;
   CREATE INDEX history_at ON history(box_id, at);
 
-  -- Audit log. Who/what/when are plain; the details (key names, IPs) are encrypted.
+  -- Who did what, when. action, outcome and count are plain so they can be
+  -- counted. ref is a sealed name copied from where it lives (an item's, a
+  -- dock's) and ref_ctx says how to open it; detail is sealed by whoever did
+  -- it. note is the server's own words and never contains anything you stored.
   CREATE TABLE log (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id TEXT REFERENCES accounts(id) ON DELETE CASCADE,
     box_id     TEXT REFERENCES boxes(id) ON DELETE CASCADE,
+    dock_id    TEXT,
     at         INTEGER NOT NULL,
     actor      TEXT NOT NULL,
     action     TEXT NOT NULL,
     outcome    TEXT NOT NULL,
-    detail_enc BLOB
+    count      INTEGER,
+    note       TEXT,
+    ref        BLOB,
+    ref_ctx    TEXT,
+    detail     BLOB
   );
+  CREATE INDEX log_account_at ON log(account_id, at);
   CREATE INDEX log_box_at ON log(box_id, at);
-  CREATE INDEX log_at ON log(at);
-  `,
-  `
-  -- What an app has told Cardboard about itself (title, description, url, version).
-  ALTER TABLE boxes ADD COLUMN profile TEXT NOT NULL DEFAULT '{}';
 
-  -- Docks: named meeting points where apps swap data without learning who's who.
+  -- Docks: meeting points where your apps swap parcels without learning who's who.
+  -- name and key stay NULL while an app has only asked for a dock you haven't made.
   CREATE TABLE docks (
-    id          TEXT PRIMARY KEY,
-    name        TEXT NOT NULL UNIQUE,
-    wrapped_key BLOB NOT NULL,
-    settings    TEXT NOT NULL DEFAULT '{}',
-    created_at  INTEGER NOT NULL,
-    last_seq    INTEGER NOT NULL DEFAULT 0
+    id         TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    idx        BLOB NOT NULL,
+    name       BLOB,
+    key        BLOB,
+    settings   TEXT NOT NULL DEFAULT '{}',
+    created_at INTEGER NOT NULL,
+    last_seq   INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (account_id, idx)
   );
 
-  -- An app's place at a dock. can_* is what's approved, want_* what it has asked for.
-  -- tag is the app's pseudonym at this dock: a keyed hash, different at every dock.
+  -- key: the dock key sealed by this box's key (set when you approve).
+  -- ask: the dock's name sealed by the asking app, so you can read its request.
   CREATE TABLE berths (
     dock_id      TEXT NOT NULL REFERENCES docks(id) ON DELETE CASCADE,
     box_id       TEXT NOT NULL REFERENCES boxes(id) ON DELETE CASCADE,
@@ -105,35 +198,32 @@ const MIGRATIONS: string[] = [
     requested_at INTEGER,
     approved_at  INTEGER,
     cursor       INTEGER NOT NULL DEFAULT 0,
+    key          BLOB,
+    ask          BLOB,
     PRIMARY KEY (dock_id, box_id)
   ) WITHOUT ROWID;
   CREATE UNIQUE INDEX berths_tag ON berths(dock_id, tag);
   CREATE INDEX berths_box ON berths(box_id);
 
-  -- Parcels in flight. The sender is stored only as its pseudonym, plus an
-  -- encrypted copy of its box id that only the owner can read. seq counts per
-  -- dock, so apps can't gauge traffic on other docks.
+  -- Parcels in flight, sealed by the dock key. Apps only ever see sender_tag.
+  -- Shredding the sending box takes its parcels with it.
   CREATE TABLE parcels (
     id         TEXT PRIMARY KEY,
     dock_id    TEXT NOT NULL REFERENCES docks(id) ON DELETE CASCADE,
     seq        INTEGER NOT NULL,
     sender_tag TEXT NOT NULL,
+    sender_box TEXT NOT NULL REFERENCES boxes(id) ON DELETE CASCADE,
     to_tag     TEXT,
-    body_enc   BLOB NOT NULL,
-    sender_enc BLOB NOT NULL,
+    body       BLOB NOT NULL,
     size       INTEGER NOT NULL,
     sent_at    INTEGER NOT NULL,
     expires_at INTEGER NOT NULL
   );
   CREATE UNIQUE INDEX parcels_dock ON parcels(dock_id, seq);
   CREATE INDEX parcels_expiry ON parcels(expires_at);
-  `,
-  `
-  -- Sign in with Cardboard (OpenID Connect). Apps that connect get short-lived
-  -- tapes linked to their grant, so revoking the grant revokes everything.
-  ALTER TABLE tapes ADD COLUMN grant_id TEXT;
-  CREATE INDEX tapes_grant ON tapes(grant_id) WHERE grant_id IS NOT NULL;
 
+  -- Sign in with Cardboard (OpenID Connect). registered_by is 'self' (the app
+  -- registered itself) or the id of the account that added it.
   CREATE TABLE oauth_clients (
     id            TEXT PRIMARY KEY,
     secret_hash   BLOB,
@@ -145,22 +235,23 @@ const MIGRATIONS: string[] = [
     last_used_at  INTEGER
   );
 
-  -- What you said yes to. sector is the app's web origin: it decides the app's
-  -- private ID for you and which box it gets back if it reconnects.
+  -- claims: a name/email you chose to pass to an app that can't take sealed
+  -- data. It goes through the server, so it's sealed by the server's own key.
   CREATE TABLE oauth_grants (
     id           TEXT PRIMARY KEY,
+    account_id   TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
     client_id    TEXT NOT NULL REFERENCES oauth_clients(id) ON DELETE CASCADE,
     sector       TEXT NOT NULL,
     scopes       TEXT NOT NULL,
     box_id       TEXT REFERENCES boxes(id) ON DELETE SET NULL,
+    claims       BLOB,
     created_at   INTEGER NOT NULL,
     last_used_at INTEGER,
     revoked_at   INTEGER
   );
+  CREATE INDEX oauth_grants_account ON oauth_grants(account_id);
   CREATE INDEX oauth_grants_client ON oauth_grants(client_id);
-  CREATE INDEX oauth_grants_sector ON oauth_grants(sector);
 
-  -- Access and refresh tokens, stored only as hashes.
   CREATE TABLE oauth_tokens (
     hash       BLOB PRIMARY KEY,
     grant_id   TEXT NOT NULL REFERENCES oauth_grants(id) ON DELETE CASCADE,
@@ -170,23 +261,6 @@ const MIGRATIONS: string[] = [
     created_at INTEGER NOT NULL
   ) WITHOUT ROWID;
   CREATE INDEX oauth_tokens_grant ON oauth_tokens(grant_id);
-
-  -- Browser sessions for the sign-in and consent pages (cookie value stored hashed).
-  CREATE TABLE sessions (
-    hash         BLOB PRIMARY KEY,
-    created_at   INTEGER NOT NULL,
-    expires_at   INTEGER NOT NULL,
-    last_seen_at INTEGER
-  ) WITHOUT ROWID;
-  `,
-  `
-  -- Boxes you shared with an AI assistant (MCP). Read-only unless can_write.
-  CREATE TABLE oauth_grant_boxes (
-    grant_id  TEXT NOT NULL REFERENCES oauth_grants(id) ON DELETE CASCADE,
-    box_id    TEXT NOT NULL REFERENCES boxes(id) ON DELETE CASCADE,
-    can_write INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (grant_id, box_id)
-  ) WITHOUT ROWID;
   `,
 ];
 
@@ -199,16 +273,29 @@ export function openDb(path: string): DB {
     PRAGMA secure_delete = ON;
     PRAGMA busy_timeout = 5000;
   `);
-  migrate(db);
+  try {
+    migrate(db, path);
+  } catch (err) {
+    db.close();
+    throw err;
+  }
   return db;
 }
 
-function migrate(db: DB) {
-  const row = db.prepare("PRAGMA user_version").get() as { user_version: number };
-  for (let v = row.user_version; v < MIGRATIONS.length; v++) {
+function migrate(db: DB, path: string) {
+  const { user_version: current } = db.prepare("PRAGMA user_version").get() as { user_version: number };
+  if (current > 0 && current < BASE) {
+    throw fail(
+      "old_data",
+      500,
+      `${path} was made by Cardboard 0.1, which kept the keys to your data on the server.`,
+      "Cardboard 0.2 keeps keys only on your devices, so it needs a new data folder. Export your boxes with 0.1 (cardboard export <box>), then import them into your new account.",
+    );
+  }
+  for (let v = Math.max(current - BASE, 0); v < MIGRATIONS.length; v++) {
     transaction(db, () => {
       db.exec(MIGRATIONS[v]!);
-      db.exec(`PRAGMA user_version = ${v + 1}`);
+      db.exec(`PRAGMA user_version = ${BASE + v + 1}`);
     });
   }
 }

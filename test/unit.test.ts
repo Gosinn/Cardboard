@@ -2,10 +2,11 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { describeDuration, parseDuration } from "../src/shared/duration.ts";
 import { formatBytes, parseSize } from "../src/shared/size.ts";
-import { blindIndex, deriveBoxKeys, randomKey, seal, unseal } from "../src/server/crypto.ts";
-import { describeCounts, luhn, scan, validIban, validKennitala } from "../src/server/detect.ts";
-import { matches, sortItems } from "../src/server/query.ts";
-import { mergePatch } from "../src/server/vault.ts";
+import { combineShares, equalBytes, fromB64u, fromCode, keyPair, open, openWith, random, seal, sealTo, splitSecret, toB64u, toCode, utf8 } from "../src/client/crypto.ts";
+import { accountKeys, boxKeys, itemIndex } from "../src/client/keys.ts";
+import { mergePatch } from "../src/shared/data.ts";
+import { describeCounts, luhn, scan, validIban, validKennitala } from "../src/shared/detect.ts";
+import { matches, sortItems } from "../src/shared/query.ts";
 
 describe("durations and sizes", () => {
   it("parses the ways people write durations", () => {
@@ -31,29 +32,70 @@ describe("durations and sizes", () => {
   });
 });
 
-describe("crypto", () => {
-  it("round-trips and binds ciphertext to its context", () => {
-    const key = randomKey();
-    const sealed = seal(key, "hello", "item|a");
-    assert.equal(unseal(key, sealed, "item|a").toString(), "hello");
-    assert.throws(() => unseal(key, sealed, "item|b"), (err: any) => err.code === "tampered");
-    assert.throws(() => unseal(randomKey(), sealed, "item|a"), (err: any) => err.code === "tampered");
-    const bent = Buffer.from(sealed);
-    bent.writeUInt8(bent.readUInt8(20) ^ 1, 20);
-    assert.throws(() => unseal(key, bent, "item|a"), (err: any) => err.code === "tampered");
+describe("crypto (on your devices)", () => {
+  const locked = (err: unknown) => (err as { code?: string }).code === "locked";
+
+  it("round-trips and binds sealed data to its context", async () => {
+    const key = random(32);
+    const sealed = await seal(key, "hello", "item|a");
+    assert.equal(utf8.decode(await open(key, sealed, "item|a")), "hello");
+    await assert.rejects(open(key, sealed, "item|b"), locked);
+    await assert.rejects(open(random(32), sealed, "item|a"), locked);
+    const bent = Uint8Array.from(sealed);
+    bent[20]! ^= 1;
+    await assert.rejects(open(key, bent, "item|a"), locked);
   });
 
-  it("uses fresh IVs, so equal values don't look equal", () => {
-    const key = randomKey();
-    assert.notDeepEqual(seal(key, "same", "c"), seal(key, "same", "c"));
+  it("uses fresh IVs, so equal values don't look equal", async () => {
+    const key = random(32);
+    assert.ok(!equalBytes(await seal(key, "same", "c"), await seal(key, "same", "c")));
   });
 
-  it("derives independent per-box keys and stable blind indexes", () => {
-    const a = deriveBoxKeys(randomKey());
-    const b = deriveBoxKeys(randomKey());
-    assert.notDeepEqual(a.enc, a.idx);
-    assert.deepEqual(blindIndex(a.idx, "notes/1"), blindIndex(a.idx, "notes/1"));
-    assert.notDeepEqual(blindIndex(a.idx, "notes/1"), blindIndex(b.idx, "notes/1"));
+  it("seals to a public key that only its holder can open", async () => {
+    const alice = await keyPair();
+    const eve = await keyPair();
+    const sealed = await sealTo(alice.publicKey, "for alice", "to");
+    assert.equal(utf8.decode(await openWith(alice, sealed, "to")), "for alice");
+    await assert.rejects(openWith(eve, sealed, "to"), locked);
+    await assert.rejects(openWith(alice, sealed, "other"), locked);
+  });
+
+  it("derives independent keys and stable, keyed fingerprints", async () => {
+    const account = await accountKeys(random(32));
+    assert.ok(!equalBytes(account.wrap, account.meta) && !equalBytes(account.meta, account.index));
+    const a = await boxKeys(random(32));
+    const b = await boxKeys(random(32));
+    assert.equal(await itemIndex(a, "notes/1"), await itemIndex(a, "notes/1"));
+    assert.notEqual(await itemIndex(a, "notes/1"), await itemIndex(b, "notes/1"), "the same name looks different in every box");
+    assert.match(await itemIndex(a, "notes/1"), /^[A-Za-z0-9_-]{43}$/);
+  });
+
+  it("splits a secret so any k of n pieces rebuild it, and fewer reveal nothing usable", () => {
+    const secret = random(16);
+    const pieces = splitSecret(secret, 5, 3);
+    assert.ok(equalBytes(combineShares([pieces[4]!, pieces[0]!, pieces[2]!]), secret));
+    assert.ok(equalBytes(combineShares([pieces[1]!, pieces[3]!, pieces[2]!]), secret));
+    assert.ok(!equalBytes(combineShares([pieces[1]!, pieces[3]!]), secret), "two of a 3-of-5 split give garbage");
+    assert.throws(() => combineShares([pieces[0]!, pieces[0]!]), /don't fit together/);
+  });
+
+  it("writes human codes that survive sloppy typing but catch typos", () => {
+    const bytes = random(16);
+    const code = toCode(bytes);
+    assert.match(code, /^[0-9A-HJKMNP-TV-Z]{4}(-[0-9A-HJKMNP-TV-Z]{1,4}){6}$/);
+    assert.ok(equalBytes(fromCode(code.toLowerCase().replace(/-/g, "  ").replace(/0/g, "o"), 16), bytes));
+    const typo = code.replace(/^(.)/, (c) => (c === "7" ? "8" : "7"));
+    assert.throws(() => fromCode(typo, 16), /typo/);
+    assert.throws(() => fromCode("ABCD", 16), /doesn't look right/);
+  });
+
+  it("speaks base64url exactly like Node does", () => {
+    for (const n of [0, 1, 2, 3, 31, 32, 33, 65]) {
+      const b = random(n);
+      assert.equal(toB64u(b), Buffer.from(b).toString("base64url"));
+      assert.ok(equalBytes(fromB64u(toB64u(b)), b));
+    }
+    assert.throws(() => fromB64u("a+b/"));
   });
 });
 

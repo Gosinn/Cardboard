@@ -1,21 +1,28 @@
 import { fail } from "../shared/errors.ts";
 import { describeDuration } from "../shared/duration.ts";
-import { newId, newSecret, sha256 } from "./crypto.ts";
+import { newId, sha256 } from "./crypto.ts";
 import type { DB } from "./db.ts";
 
 /**
- * A tape is an app's access token for one box. Only a SHA-256 hash of the
- * secret is stored. By default a tape stops working after 90 days *without
- * use*: apps you use keep working, dead apps clean themselves up.
+ * A tape is an app's access to one box. It has two halves: a token, which the
+ * app sends to prove who it is (stored here only as a hash), and a key, which
+ * never leaves the app and opens `bundle`: the box key, sealed. So even a
+ * complete copy of this database can't open a box through its tapes.
+ *
+ * By default a tape stops working after 90 days *without use*: apps you use
+ * keep working, dead apps clean themselves up.
  */
+export type TapeKind = "app" | "assistant" | "grant";
+
 export interface Tape {
   id: string;
+  accountId: string;
   boxId: string;
-  label: string;
+  /** Sealed by the account key. */
+  label: Buffer | null;
+  kind: TapeKind;
   read: boolean;
   write: boolean;
-  /** If set, the tape can only reach keys starting with this. */
-  prefix: string | null;
   idleMs: number | null;
   expiresAt: number | null;
   createdAt: number;
@@ -24,14 +31,15 @@ export interface Tape {
   grantId: string | null;
 }
 
-export interface TapeOptions {
-  label?: string;
+export interface NewTape {
+  tokenHash: Buffer;
+  bundle: Buffer | null;
+  label: Buffer | null;
+  kind?: TapeKind;
   read?: boolean;
   write?: boolean;
-  prefix?: string | null;
   idleMs?: number | null;
   expiresAt?: number | null;
-  /** Set for tapes handed out through Sign in with Cardboard; revoking the grant revokes them. */
   grantId?: string | null;
 }
 
@@ -40,11 +48,13 @@ const TOUCH_EVERY_MS = 60 * 1000;
 
 interface TapeRow {
   id: string;
+  account_id: string;
   box_id: string;
-  label: string;
+  bundle: Uint8Array | null;
+  label: Uint8Array | null;
+  kind: string;
   can_read: number;
   can_write: number;
-  prefix: string | null;
   idle_ms: number | null;
   expires_at: number | null;
   created_at: number;
@@ -64,61 +74,59 @@ export class Tapes {
     this.now = now;
   }
 
-  create(boxId: string, options: TapeOptions = {}): { tape: Tape; secret: string } {
-    const read = options.read ?? true;
-    const write = options.write ?? true;
+  create(accountId: string, boxId: string, input: NewTape): Tape {
+    const read = input.read ?? true;
+    const write = input.write ?? true;
     if (!read && !write) throw fail("useless_tape", 400, "A tape has to be able to read, write, or both.");
-    const label = (options.label ?? "default").trim().slice(0, 60) || "default";
-    if (options.prefix !== undefined && options.prefix !== null && options.prefix.length === 0) {
-      throw fail("bad_prefix", 400, "A prefix can't be empty. Leave it out to reach the whole box.");
-    }
-    const secret = newSecret("cbt");
     const tape: Tape = {
       id: newId("tape"),
+      accountId,
       boxId,
-      label,
+      label: input.label,
+      kind: input.kind ?? "app",
       read,
       write,
-      prefix: options.prefix ?? null,
-      idleMs: options.idleMs === undefined ? DEFAULT_IDLE_MS : options.idleMs,
-      expiresAt: options.expiresAt ?? null,
+      idleMs: input.idleMs === undefined ? DEFAULT_IDLE_MS : input.idleMs,
+      expiresAt: input.expiresAt ?? null,
       createdAt: this.now(),
       lastUsedAt: null,
       revokedAt: null,
-      grantId: options.grantId ?? null,
+      grantId: input.grantId ?? null,
     };
-    this.db
-      .prepare(
-        `INSERT INTO tapes (id, box_id, label, secret_hash, can_read, can_write, prefix, idle_ms, expires_at, created_at, grant_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
-        tape.id,
-        boxId,
-        label,
-        sha256(secret),
-        read ? 1 : 0,
-        write ? 1 : 0,
-        tape.prefix,
-        tape.idleMs,
-        tape.expiresAt,
-        tape.createdAt,
-        tape.grantId,
-      );
-    return { tape, secret };
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO tapes (id, account_id, box_id, token_hash, bundle, label, kind, can_read, can_write, idle_ms, expires_at, created_at, grant_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          tape.id,
+          accountId,
+          boxId,
+          input.tokenHash,
+          input.bundle,
+          input.label,
+          tape.kind,
+          read ? 1 : 0,
+          write ? 1 : 0,
+          tape.idleMs,
+          tape.expiresAt,
+          tape.createdAt,
+          tape.grantId,
+        );
+    } catch {
+      throw fail("tape_exists", 409, "That tape token is already in use.", "Each tape gets its own random token.");
+    }
+    return tape;
   }
 
-  /** Checks a presented secret. Hashing first means lookups never compare secrets directly. */
-  check(secret: string): TapeCheck {
-    const row = this.db.prepare("SELECT * FROM tapes WHERE secret_hash = ?").get(sha256(secret)) as TapeRow | undefined;
-    if (!row) {
-      return { ok: false, reason: "That tape isn't valid.", hint: "Check CARDBOARD_TAPE, or make a new one with: cardboard connect <app>" };
-    }
+  /** Checks a presented token. Hashing first means lookups never compare secrets directly. */
+  check(token: string): TapeCheck {
+    const row = this.db.prepare("SELECT * FROM tapes WHERE token_hash = ?").get(sha256(token)) as TapeRow | undefined;
+    if (!row) return { ok: false, reason: "That tape isn't valid.", hint: "Check CARDBOARD_TAPE, or make a new one with: cardboard connect <app>" };
     const tape = toTape(row);
     const state = this.state(tape);
-    if (state !== "active") {
-      return { ok: false, reason: `That tape ${state}.`, hint: "Make a new one with: cardboard tape <box>", tape };
-    }
+    if (state !== "active") return { ok: false, reason: `That tape ${state}.`, hint: "Make a new one with: cardboard tape <box>", tape };
     const now = this.now();
     if (tape.lastUsedAt === null || now - tape.lastUsedAt > TOUCH_EVERY_MS) {
       this.db.prepare("UPDATE tapes SET last_used_at = ? WHERE id = ?").run(now, tape.id);
@@ -127,15 +135,19 @@ export class Tapes {
     return { ok: true, tape };
   }
 
+  /** The box key, sealed by the tape's key half. Useless without that half. */
+  bundle(tapeId: string): Buffer | null {
+    const row = this.db.prepare("SELECT bundle FROM tapes WHERE id = ?").get(tapeId) as { bundle: Uint8Array | null } | undefined;
+    return row?.bundle ? Buffer.from(row.bundle) : null;
+  }
+
   /** "active", or a sentence fragment explaining why not ("was revoked 2 days ago"). */
   state(tape: Tape): string {
     const now = this.now();
     if (tape.revokedAt !== null) return `was revoked ${describeDuration(now - tape.revokedAt)} ago`;
     if (tape.expiresAt !== null && tape.expiresAt <= now) return `expired ${describeDuration(now - tape.expiresAt)} ago`;
     const idleSince = tape.lastUsedAt ?? tape.createdAt;
-    if (tape.idleMs !== null && idleSince + tape.idleMs <= now) {
-      return `went unused for ${describeDuration(tape.idleMs)}, so it switched itself off`;
-    }
+    if (tape.idleMs !== null && idleSince + tape.idleMs <= now) return `went unused for ${describeDuration(tape.idleMs)}, so it switched itself off`;
     return "active";
   }
 
@@ -144,39 +156,32 @@ export class Tapes {
     return row && toTape(row);
   }
 
-  require(id: string): Tape {
+  /** A tape, only if it belongs to this account. */
+  own(accountId: string, id: string): Tape {
     const tape = this.get(id);
-    if (!tape) throw fail("no_such_tape", 404, `There's no tape with id ${id}.`, "List tapes with: cardboard box <name>");
+    if (!tape || tape.accountId !== accountId) throw fail("no_such_tape", 404, "You don't have a tape with that id.", "List tapes with: cardboard box <name>");
     return tape;
   }
 
   /** Tapes you made (short-lived Sign in with Cardboard tapes are listed under connected apps instead). */
   list(boxId: string): Tape[] {
-    const rows = this.db
-      .prepare("SELECT * FROM tapes WHERE box_id = ? AND grant_id IS NULL ORDER BY created_at DESC")
-      .all(boxId) as unknown as TapeRow[];
-    return rows.map(toTape);
-  }
-
-  listAll(): Tape[] {
-    const rows = this.db.prepare("SELECT * FROM tapes ORDER BY created_at DESC").all() as unknown as TapeRow[];
+    const rows = this.db.prepare("SELECT * FROM tapes WHERE box_id = ? AND grant_id IS NULL ORDER BY created_at DESC").all(boxId) as unknown as TapeRow[];
     return rows.map(toTape);
   }
 
   revoke(id: string): Tape {
-    const tape = this.require(id);
+    const tape = this.get(id);
+    if (!tape) throw fail("no_such_tape", 404, "There's no such tape.");
     if (tape.revokedAt === null) {
       tape.revokedAt = this.now();
-      this.db.prepare("UPDATE tapes SET revoked_at = ? WHERE id = ?").run(tape.revokedAt, id);
+      this.db.prepare("UPDATE tapes SET revoked_at = ?, bundle = NULL WHERE id = ?").run(tape.revokedAt, id);
     }
     return tape;
   }
 
   /** Revokes every tape handed out under a Sign in with Cardboard grant. Returns their ids. */
   revokeGrant(grantId: string): string[] {
-    const ids = (this.db.prepare("SELECT id FROM tapes WHERE grant_id = ? AND revoked_at IS NULL").all(grantId) as Array<{ id: string }>).map(
-      (r) => r.id,
-    );
+    const ids = (this.db.prepare("SELECT id FROM tapes WHERE grant_id = ? AND revoked_at IS NULL").all(grantId) as Array<{ id: string }>).map((r) => r.id);
     this.db.prepare("UPDATE tapes SET revoked_at = ? WHERE grant_id = ? AND revoked_at IS NULL").run(this.now(), grantId);
     return ids;
   }
@@ -195,11 +200,12 @@ export class Tapes {
 function toTape(row: TapeRow): Tape {
   return {
     id: row.id,
+    accountId: row.account_id,
     boxId: row.box_id,
-    label: row.label,
+    label: row.label ? Buffer.from(row.label) : null,
+    kind: row.kind as TapeKind,
     read: row.can_read === 1,
     write: row.can_write === 1,
-    prefix: row.prefix,
     idleMs: row.idle_ms,
     expiresAt: row.expires_at,
     createdAt: row.created_at,
@@ -209,14 +215,15 @@ function toTape(row: TapeRow): Tape {
   };
 }
 
-/** Public view of a tape (never includes the secret, which Cardboard doesn't have anyway). */
+/** What a device sees about a tape: everything except the token and key, which the server doesn't have. */
 export function tapeView(tape: Tape, state: string) {
   return {
     id: tape.id,
-    label: tape.label,
+    box: tape.boxId,
+    label: tape.label ? tape.label.toString("base64url") : null,
+    kind: tape.kind,
     read: tape.read,
     write: tape.write,
-    prefix: tape.prefix,
     idleMs: tape.idleMs,
     expiresAt: tape.expiresAt,
     createdAt: tape.createdAt,
