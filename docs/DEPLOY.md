@@ -34,7 +34,11 @@ node src/cli.ts start --tunnel tailscale
 - `Cardboard is online at https://….ts.net` (or `…ts.net:8443` if your Tailscale already uses the usual port for something else). That's your Cardboard's address, the same every time.
 - **A square QR code drawn in the window itself**, made of black and white blocks. Point your phone's camera at it and tap the link that pops up: that opens *Welcome to Cardboard* on your phone. Tap **Make my account**.
 
+A moment later it checks the address itself and says **✓ Your address works** once phones can open it. The very first time, that can take up to 10 minutes while the internet learns the new address; the window tells you while it's waiting.
+
 **5. Leave the window open.** Cardboard is online while it runs. Ctrl+C stops it (and takes the address offline).
+
+**Not working?** Open a second PowerShell (or Terminal) window, `cd Cardboard`, and run `node src/cli.ts doctor`. It says what's running, what Tailscale is sharing, and whether the address answers, with nothing secret in it, so you can paste it to whoever is helping you.
 
 To start it again later: open PowerShell, `cd Cardboard`, and run the same `node src/cli.ts start --tunnel tailscale`. Same address, same data (it's kept in the `cardboard-data` folder inside `Cardboard`).
 

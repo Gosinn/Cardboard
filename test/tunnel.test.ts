@@ -5,7 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
 import { readFileSync } from "node:fs";
-import { cloudflareUrl, openTunnel, pickFunnelPort } from "../src/node/tunnel.ts";
+import { checkAddress, cloudflareUrl, openTunnel, pickFunnelPort } from "../src/node/tunnel.ts";
+import { startTestServer } from "./helpers.ts";
 import { CardboardError } from "../src/sdk/index.ts";
 
 // Stand-ins for cloudflared and tailscale, printing what the real ones print.
@@ -128,6 +129,40 @@ describe("putting Cardboard online from your own computer", () => {
       await assert.rejects(openTunnel("tailscale", 8787), (err: unknown) => err instanceof CardboardError && err.code === "no_tailscale");
     } finally {
       process.env["PATH"] = `${bin}:${path}`;
+    }
+  });
+
+  it("checks an address really works: listed in public DNS, and Cardboard answering", async () => {
+    const ok = await checkAddress(`https://${HOST}:8443`, {
+      resolve: async () => ["1.2.3.4"],
+      fetch: (async () => new Response(JSON.stringify({ ok: true }))) as typeof fetch,
+    });
+    assert.deepEqual(ok, { listed: true, answers: true, problem: null });
+    const unlisted = await checkAddress(`https://${HOST}`, {
+      resolve: async () => {
+        throw Object.assign(new Error("not found"), { code: "ENOTFOUND" });
+      },
+      fetch: (async () => {
+        throw Object.assign(new TypeError("fetch failed"), { cause: { code: "ECONNREFUSED" } });
+      }) as typeof fetch,
+    });
+    assert.deepEqual(unlisted, { listed: false, answers: false, problem: "nothing is answering there [ECONNREFUSED]" });
+    const wrong = await checkAddress(`https://${HOST}`, { resolve: async () => ["1.2.3.4"], fetch: (async () => new Response("Bad gateway", { status: 502 })) as typeof fetch });
+    assert.match(wrong.problem ?? "", /status 502/);
+  });
+
+  it("cardboard doctor: says what's running and what Tailscale shares, with nothing secret in it", async () => {
+    const t = await startTestServer({ shake: false });
+    try {
+      const port = new URL(t.cb.url).port;
+      const run = (await import("node:util")).promisify((await import("node:child_process")).execFile);
+      const { stdout } = await run(process.execPath, [join(import.meta.dirname, "..", "src", "cli.ts"), "doctor", "--port", port], { env: { ...process.env, NODE_NO_WARNINGS: "1" } });
+      assert.match(stdout, /Cardboard on this computer: running/);
+      assert.match(stdout, /Tailscale: Running, this computer is laptop\.tail1234\.ts\.net/);
+      assert.match(stdout, /Nothing above is secret/);
+      assert.doesNotMatch(stdout, /cbh_|cbi_|cbd_|cbt_/);
+    } finally {
+      await t.stop();
     }
   });
 

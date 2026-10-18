@@ -31,6 +31,7 @@ whoever runs the server can't read what's in it.
     cardboard start                   Start a Cardboard server (first run sets everything up)
     cardboard start --tunnel tailscale   …and put it online from this computer, free, at a fixed https:// address
     cardboard start --tunnel cloudflare  …or at a throwaway address, with no account at all
+    cardboard doctor                  Why isn't my address working? (safe to paste for help)
     cardboard signup [invite-link]    Make your account on this computer (prints your recovery kit)
     cardboard connect <app>           Connect the app in this folder: makes a box + tape, writes .env
 
@@ -197,6 +198,34 @@ function printKit(kit: string) {
   console.log(dim("  Prefer another way? cardboard recovery device|friends|none"));
 }
 
+/**
+ * After going online: checks the address really works, and says so (or what's
+ * wrong) in the window. The first time, Tailscale can take minutes before the
+ * internet can find a new address.
+ */
+async function watchAddress(url: string) {
+  const { checkAddress } = await import("./node/tunnel.ts");
+  const started = Date.now();
+  let said = "";
+  for (;;) {
+    const check = await checkAddress(url).catch(() => ({ listed: null, answers: false, problem: "check failed" }));
+    if (check.answers && check.listed !== false) {
+      console.log(`  ${bold("✓ Your address works:")} ${url} (phones and other computers can open it now)`);
+      return;
+    }
+    const now = !check.answers
+      ? `  … ${url} isn't answering yet (${check.problem}). Checking again every 15 seconds.`
+      : "  … Your address works from this computer, but the internet can't find it yet. The first time, Tailscale can take up to 10 minutes. This window says ✓ when it can.";
+    if (now !== said) console.log(dim(now));
+    said = now;
+    if (Date.now() - started > 15 * 60_000) {
+      console.log(`  ✗ ${url} still doesn't work after 15 minutes. In another window, run: node src/cli.ts doctor  (and send what it says)`);
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 15_000).unref());
+  }
+}
+
 /** A link as a QR code a phone camera can scan (only on a real terminal; --no-qr leaves it out). */
 function printQr(link: string, show: boolean) {
   if (!show || !process.stdout.isTTY) return;
@@ -342,6 +371,7 @@ async function main() {
         for (const r of cb.shake.results.filter((r) => r.status !== "pass")) console.log(`    ${STATUS[r.status]} ${r.title}: ${r.detail}`);
       }
       console.log("");
+      if (tunnel) void watchAddress(tunnel.url);
       let stopping = false;
       const stop = async () => {
         if (stopping) return;
@@ -405,6 +435,30 @@ async function main() {
       console.log(`\n  ✓ You're back in, on this computer (${acct.id}).`);
       console.log(dim("  If your kit (or a piece) may have been seen by someone else, make a new one: cardboard recovery kit"));
       console.log(dim("  And if you lost a device, remove it: cardboard devices\n"));
+      return;
+    }
+
+    // Everything needed to say why the address doesn't work. Nothing secret, so it's safe to paste for help.
+    case "doctor": {
+      const { checkAddress, tailscaleReport } = await import("./node/tunnel.ts");
+      const port = values.port ? Number(values.port) : Number(process.env["CARDBOARD_PORT"] ?? process.env["PORT"] ?? 8787);
+      const out: string[] = [`Cardboard ${VERSION} · Node ${process.versions.node} · ${process.platform}`];
+      let publicUrl: string | null = null;
+      try {
+        const hello = (await (await fetch(`http://127.0.0.1:${port}/v1/hello`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" })).json()) as { version?: string; issuer?: string };
+        publicUrl = hello.issuer ?? null;
+        out.push(`Cardboard on this computer: running (port ${port}), its address is ${publicUrl}`);
+      } catch {
+        out.push(`Cardboard on this computer: not running on port ${port}. Start it in another window: node src/cli.ts start --tunnel tailscale`);
+      }
+      out.push(...(await tailscaleReport()));
+      if (publicUrl?.startsWith("https://")) {
+        const check = await checkAddress(publicUrl);
+        out.push(`The internet can find ${new URL(publicUrl).hostname}: ${check.listed === null ? "couldn't check" : check.listed ? "yes" : "not yet"}`);
+        out.push(`Opening ${publicUrl} from this computer: ${check.answers ? "works" : `doesn't work (${check.problem})`}`);
+      }
+      out.push("", "Nothing above is secret: you can paste it to get help.");
+      console.log(out.join("\n"));
       return;
     }
 

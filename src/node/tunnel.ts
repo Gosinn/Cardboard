@@ -1,4 +1,5 @@
 import { execFile, spawn, type ChildProcess } from "node:child_process";
+import { Resolver } from "node:dns/promises";
 import { existsSync } from "node:fs";
 import { CardboardError } from "../shared/errors.ts";
 
@@ -215,4 +216,73 @@ async function tailscale(port: number, options: { say?: (line: string) => void; 
       });
     },
   };
+}
+
+// ── Is the address really working? ─────────────────────────────────────────
+
+export interface AddressCheck {
+  /** Whether the internet's address book (public DNS) has it yet; null when that couldn't be checked. */
+  listed: boolean | null;
+  /** Whether Cardboard answers at the address (checked from this computer). */
+  answers: boolean;
+  /** What went wrong reaching it, in a few words. */
+  problem: string | null;
+}
+
+/** Asks public DNS (not this computer's, which Tailscale answers itself) whether an address exists yet. */
+async function publicDns(host: string): Promise<string[]> {
+  const resolver = new Resolver({ timeout: 3000, tries: 2 });
+  resolver.setServers(["1.1.1.1", "8.8.8.8"]);
+  return resolver.resolve4(host);
+}
+
+export async function checkAddress(url: string, options: { fetch?: typeof fetch; resolve?: (host: string) => Promise<string[]> } = {}): Promise<AddressCheck> {
+  const host = new URL(url).hostname;
+  let listed: boolean | null = null;
+  try {
+    listed = (await (options.resolve ?? publicDns)(host)).length > 0;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    listed = code === "ENOTFOUND" || code === "ENODATA" ? false : null;
+  }
+  let answers = false;
+  let problem: string | null = null;
+  try {
+    const res = await (options.fetch ?? fetch)(`${url}/health`, { signal: AbortSignal.timeout(10_000) });
+    answers = res.ok && ((await res.json().catch(() => ({}))) as { ok?: boolean }).ok === true;
+    if (!answers) problem = `something other than Cardboard answered (status ${res.status})`;
+  } catch (err) {
+    const cause = (err as { cause?: { code?: string; message?: string } }).cause;
+    problem = plain(cause?.code ?? cause?.message ?? (err as Error).message);
+  }
+  return { listed, answers, problem };
+}
+
+/** Network error codes in plain words (the code stays, for whoever helps you). */
+function plain(code: string): string {
+  if (code === "ENOTFOUND" || code === "EAI_AGAIN") return `this computer can't find that address yet [${code}]`;
+  if (code === "ECONNREFUSED") return `nothing is answering there [${code}]`;
+  if (/TIMEOUT|ETIMEDOUT|AbortError|aborted/i.test(code)) return `no answer in 10 seconds [${code}]`;
+  if (/CERT|TLS|SSL|SELF_SIGNED|VERIFY/i.test(code)) return `its HTTPS certificate isn't ready yet [${code}]`;
+  return code;
+}
+
+/** What Tailscale says about this computer and what it's sharing (nothing secret in it). */
+export async function tailscaleReport(): Promise<string[]> {
+  const bin = tailscaleBinary();
+  const lines: string[] = [];
+  try {
+    const status = JSON.parse(await run(bin, ["status", "--json"])) as { BackendState?: string; Self?: { DNSName?: string } };
+    lines.push(`Tailscale: ${status.BackendState ?? "unknown"}, this computer is ${status.Self?.DNSName?.replace(/\.$/, "").toLowerCase() ?? "(no name)"}`);
+  } catch (err) {
+    lines.push((err as NodeJS.ErrnoException).code === "ENOENT" ? "Tailscale: not installed (or not on PATH)" : "Tailscale: not running, or not logged in");
+    return lines;
+  }
+  try {
+    const funnel = (await run(bin, ["funnel", "status"])).trim();
+    lines.push("Tailscale funnel status:", ...(funnel ? funnel.split("\n").map((l) => `  ${l}`) : ["  (nothing shared)"]));
+  } catch (err) {
+    lines.push(`Tailscale funnel status failed: ${((err as { output?: string }).output ?? (err as Error).message).trim()}`);
+  }
+  return lines;
 }
