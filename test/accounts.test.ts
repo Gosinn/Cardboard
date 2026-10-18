@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
 import { recoverWithFriends, recoverWithKit, signUp, startPairing, unlock } from "../src/client/account.ts";
-import { keyPair, toB64u } from "../src/client/crypto.ts";
+import { keyPair, open, random, toB64u } from "../src/client/crypto.ts";
+import { ctx } from "../src/shared/contexts.ts";
 import { MemoryStore } from "../src/client/device.ts";
 import { CardboardError } from "../src/sdk/index.ts";
 import { startTestServer, type TestServer } from "./helpers.ts";
@@ -143,6 +144,52 @@ describe("accounts, devices and recovery", () => {
     assert.equal(await store.load(), null);
     const left = t.cb.api.ctx.db.prepare("SELECT COUNT(*) AS n FROM accounts WHERE id = ?").get(account.id) as { n: number };
     assert.equal(left.n, 0);
+  });
+
+  it("locks a device with a passkey: without Face ID, holding the device gets you nothing", async () => {
+    const store = new MemoryStore();
+    const { account } = await signUp({ ...device(), store, invite: (await t.host("host.invite")).body.code, label: "Phone" });
+    await account.createBox("diary");
+    const before = (await store.load())!;
+    const passkey = { credential: toB64u(random(16)), salt: toB64u(random(32)), secret: random(32) };
+    await account.lockWithPasskey(passkey, { idleMs: 5 * 60 * 1000 });
+
+    const locked = (await store.load())!;
+    assert.equal(locked.token, null, "the token isn't kept unsealed any more");
+    assert.equal(locked.lock?.kind, "passkey");
+    assert.equal(locked.lock?.idleMs, 5 * 60 * 1000);
+    assert.equal((await t.raw(before.token, "me")).status, 401, "the old, unsealed token stopped working");
+    assert.equal((await account.me()).device.lock, "passkey", "this session carries on with the new token");
+
+    await rejectsWith(unlock(store), "device_locked");
+    await rejectsWith(unlock(store, { passkey: async () => random(32) }), "wrong_passkey");
+    const again = await unlock(store, { passkey: async (lock) => (assert.equal(lock.credential, passkey.credential), passkey.secret) });
+    assert.deepEqual((await again!.boxes()).map((b) => b.name), ["diary"]);
+    assert.equal(again!.lock?.kind, "passkey");
+
+    // The server's copy needs both this device's key and the passkey: the device key alone opens nothing.
+    const envelope = new Uint8Array(t.cb.api.ctx.accounts.device(account.deviceId)!.envelope!);
+    await assert.rejects(open(locked.key, envelope, ctx.accountKey("device")));
+    const inner = await open(locked.key, envelope, ctx.lockedEnvelope);
+    await assert.rejects(open(random(32), inner, ctx.accountKey("passkey")));
+
+    const lines = await again!.log({ limit: 5 });
+    assert.ok(lines.some((l) => /locked “Phone” with Face ID/.test(l.text)), lines.map((l) => l.text).join("\n"));
+    const tips = await again!.insights();
+    assert.ok(!tips.some((i) => /Lock this browser/.test(i.title)));
+
+    await again!.removeLock();
+    assert.equal((await store.load())!.lock, null);
+    const plain = await unlock(store);
+    assert.deepEqual((await plain!.boxes()).map((b) => b.name), ["diary"]);
+    assert.equal((await plain!.me()).device.lock, null);
+    await assert.rejects(account.me(), "the session from before the unlock uses a retired token");
+  });
+
+  it("refuses a lock without a new token", async () => {
+    const res = await t.raw(t.me.rpc.token!, "device.envelope", { envelope: toB64u(random(60)), lock: "passkey" });
+    assert.equal(res.status, 400);
+    assert.match(res.body.error.message, /tokenHash/);
   });
 
   it("slows down people guessing recovery codes and pairing ids", async () => {

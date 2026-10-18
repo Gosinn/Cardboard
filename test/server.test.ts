@@ -391,6 +391,14 @@ describe("accounts and the host", () => {
     assert.ok(existsSync(res.body.file));
     assert.ok(!(await tip()));
   });
+
+  it("backs up on a schedule when asked to", async () => {
+    assert.equal(t.cb.api.backupIfDue(DAY), false, "a backup was just made");
+    t.clock.advance(DAY + 1000);
+    assert.equal(t.cb.api.backupIfDue(DAY), true);
+    const lines = (await t.host("host.log")).body.entries.filter((e: any) => e.action === "backup");
+    assert.equal(lines[0].actor, "system");
+  });
 });
 
 describe("HTTP edges", () => {

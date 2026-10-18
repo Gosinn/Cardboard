@@ -2,8 +2,8 @@ import { createHash, randomBytes } from "node:crypto";
 import { readFileSync, statSync } from "node:fs";
 import { CardboardError } from "../shared/errors.ts";
 import { ctx } from "../shared/contexts.ts";
-import { signUp, recoverWithKit, startPairing, type Account } from "../client/account.ts";
-import { fromB64u, keyPair, open, openWith, sealJson, toB64u, utf8 } from "../client/crypto.ts";
+import { signUp, recoverWithKit, startPairing, unlock, type Account } from "../client/account.ts";
+import { fromB64u, keyPair, open, openWith, random, sealJson, toB64u, utf8 } from "../client/crypto.ts";
 import { MemoryStore } from "../client/device.ts";
 import { dockIndex, dockKeys, newClientId, readBundle } from "../client/keys.ts";
 import { Box } from "../sdk/index.ts";
@@ -261,6 +261,71 @@ export async function runShake(api: Api): Promise<ShakeReport> {
       return res.status === 401 && copy.n === 0
         ? pass("A removed device's token stopped working and its sealed copy of the account key was deleted.")
         : failed("A removed device could still get in.");
+    });
+
+    await check("device-lock", "Locked devices need Face ID", async () => {
+      // A device locked with a (pretend) passkey, then stolen: its storage holds no working token or key.
+      const store = new MemoryStore();
+      const phone = await recoverWithKit({ url, code: kit, store, kind: "other", fetch: inProcess });
+      const oldToken = phone.rpc.token!;
+      const secret = random(32);
+      await phone.lockWithPasskey({ credential: toB64u(random(16)), salt: toB64u(random(32)), secret });
+      const stolen = (await store.load())!;
+      const oldTokenDead = call("me", oldToken, {}).status === 401;
+      const noToken = stolen.token === null;
+      const envelope = accounts.device(phone.deviceId)?.envelope;
+      const deviceKeyAlone = envelope ? !(await rejects(() => open(stolen.key, new Uint8Array(envelope), ctx.accountKey("device")))) : true;
+      const withoutFace = await rejects(() => unlock(store, { fetch: inProcess }), "device_locked");
+      const wrongFace = await rejects(() => unlock(store, { fetch: inProcess, passkey: async () => random(32) }), "wrong_passkey");
+      const rightFace = (await unlock(store, { fetch: inProcess, passkey: async () => secret }))?.id === me.id;
+      await me.removeDevice(phone.deviceId);
+      api.limiter.reset(PROBE_IP);
+      return oldTokenDead && noToken && !deviceKeyAlone && withoutFace && wrongFace && rightFace
+        ? pass("A device locked with a passkey kept no usable token; its old token stopped working; its key alone opened nothing, and neither did a wrong passkey. Only the right one did.")
+        : failed("A locked device could be opened without its passkey.");
+    });
+
+    // ── Sharing between people ──
+    await check("share-link", "Share links are sealed and work once", async () => {
+      const { link, code } = await me.shareBox(boxB.name, { label: canary });
+      const secretOnDisk = dbBytes().includes(Buffer.from(code)) || dbBytes().includes(Buffer.from(boxB.name)) || dbBytes().includes(Buffer.from(canary));
+      const { account: friend } = await getIn();
+      const joined = await friend.joinShare(link);
+      const opened = (await (await friend.open(joined)).items()).length === 0;
+      const reused = await rejects(() => stranger.joinShare(link), "no_such_share");
+      api.limiter.reset(PROBE_IP);
+      return !secretOnDisk && opened && reused
+        ? pass("The link's secret, the box's name and who it was for never reached the server; the person it was sent to opened the box, and nobody could use the link again.")
+        : failed("A share link was readable on the server, or worked twice.");
+    });
+
+    await check("share-cutoff", "People taken off a box are cut off", async () => {
+      const { link } = await me.shareBox(boxB.name);
+      const { account: friend } = await getIn();
+      const joined = await friend.joinShare(link);
+      const tape = await friend.createTape(joined.name, { label: "shake" });
+      const before = !(await rejects(() => sdk(tape.secret).keys()));
+      const outsider = await rejects(() => stranger.rpc.call("list", { box: boxB.id }), "no_such_box");
+      await me.removeMember(boxB.name, joined.shared!.memberId);
+      const device = await rejects(() => friend.rpc.call("list", { box: boxB.id }), "no_such_box");
+      const app = call("list", tokenOf(tape.secret), {}).status === 401;
+      api.limiter.reset(PROBE_IP);
+      return before && outsider && device && app
+        ? pass("Someone who was never invited couldn't reach the box at all; once taken off it, a member's devices and apps were turned away straight away.")
+        : failed("Someone outside a shared box could still reach it.");
+    });
+
+    await check("share-read-only", "Read-only sharing can't write", async () => {
+      const { link } = await me.shareBox(boxB.name, { write: false });
+      const { account: friend } = await getIn();
+      const joined = await friend.joinShare(link);
+      const device = await rejects(async () => (await friend.open(joined)).put("x", 1), "read_only");
+      const tape = await friend.createTape(joined.name, { label: "shake", write: true });
+      const app = await rejects(() => sdk(tape.secret).put("x", 1), "read_only");
+      api.limiter.reset(PROBE_IP);
+      return device && app && !tape.tape.write
+        ? pass("A person given read-only access couldn't write, from their devices or from a tape they made, even one asking to write.")
+        : failed("A read-only member wrote to a shared box.");
     });
 
     // ── Docks ──

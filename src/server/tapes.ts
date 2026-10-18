@@ -163,9 +163,13 @@ export class Tapes {
     return tape;
   }
 
-  /** Tapes you made (short-lived Sign in with Cardboard tapes are listed under connected apps instead). */
-  list(boxId: string): Tape[] {
-    const rows = this.db.prepare("SELECT * FROM tapes WHERE box_id = ? AND grant_id IS NULL ORDER BY created_at DESC").all(boxId) as unknown as TapeRow[];
+  /**
+   * Tapes one account made for a box (short-lived Sign in with Cardboard tapes
+   * are listed under connected apps instead). In a shared box, everyone's
+   * tapes are their own business.
+   */
+  list(boxId: string, accountId: string): Tape[] {
+    const rows = this.db.prepare("SELECT * FROM tapes WHERE box_id = ? AND account_id = ? AND grant_id IS NULL ORDER BY created_at DESC").all(boxId, accountId) as unknown as TapeRow[];
     return rows.map(toTape);
   }
 

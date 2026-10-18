@@ -39,9 +39,14 @@ export interface Device {
   kind: DeviceKind;
   label: Buffer | null;
   envelope: Buffer | null;
+  /** "passkey" when opening this device's envelope also takes Face ID (or another passkey). */
+  lock: DeviceLock | null;
   createdAt: number;
   lastSeenAt: number | null;
 }
+
+export const DEVICE_LOCKS = ["passkey"] as const;
+export type DeviceLock = (typeof DEVICE_LOCKS)[number];
 
 export interface NewDevice {
   tokenHash: Buffer;
@@ -81,6 +86,7 @@ interface DeviceRow {
   envelope: Uint8Array | null;
   label: Uint8Array | null;
   kind: string;
+  lock: string | null;
   created_at: number;
   last_seen_at: number | null;
 }
@@ -261,9 +267,23 @@ export class Accounts {
     return { account, device: toDevice(row) };
   }
 
-  /** A device stores its own sealed copy of the account key (after pairing or recovery). */
-  setEnvelope(deviceId: string, envelope: Buffer) {
-    this.db.prepare("UPDATE devices SET envelope = ? WHERE id = ?").run(envelope, deviceId);
+  /**
+   * A device stores its own sealed copy of the account key (after pairing or
+   * recovery, or when it's locked or unlocked). Locking also swaps its token,
+   * so the old one, which sat unsealed on the device, stops working.
+   */
+  setEnvelope(deviceId: string, envelope: Buffer, change: { lock?: DeviceLock | null; tokenHash?: Buffer } = {}) {
+    transaction(this.db, () => {
+      this.db.prepare("UPDATE devices SET envelope = ? WHERE id = ?").run(envelope, deviceId);
+      if (change.lock !== undefined) this.db.prepare("UPDATE devices SET lock = ? WHERE id = ?").run(change.lock, deviceId);
+      if (change.tokenHash) {
+        try {
+          this.db.prepare("UPDATE devices SET token_hash = ? WHERE id = ?").run(change.tokenHash, deviceId);
+        } catch {
+          throw fail("device_exists", 409, "That device token is already in use.", "Each device makes its own random token.");
+        }
+      }
+    });
   }
 
   setDeviceLabel(accountId: string, deviceId: string, label: Buffer | null) {
@@ -408,6 +428,7 @@ function toDevice(row: DeviceRow): Device {
     kind: row.kind as DeviceKind,
     label: row.label ? Buffer.from(row.label) : null,
     envelope: row.envelope ? Buffer.from(row.envelope) : null,
+    lock: (row.lock as DeviceLock | null) ?? null,
     createdAt: row.created_at,
     lastSeenAt: row.last_seen_at,
   };

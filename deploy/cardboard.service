@@ -1,0 +1,26 @@
+# Cardboard without Docker, as a systemd service. Put Caddy (or nginx) in front for HTTPS.
+#   sudo useradd --system --home /var/lib/cardboard --create-home cardboard
+#   sudo cp deploy/cardboard.service /etc/systemd/system/ && sudo systemctl enable --now cardboard
+#   sudo journalctl -u cardboard     # the host token and first invite, on first start
+[Unit]
+Description=Cardboard
+After=network.target
+
+[Service]
+User=cardboard
+WorkingDirectory=/opt/cardboard
+Environment=NODE_NO_WARNINGS=1
+Environment=CARDBOARD_DATA=/var/lib/cardboard/data
+Environment=CARDBOARD_PUBLIC_URL=https://cardboard.example.com
+Environment=CARDBOARD_TRUST_PROXY=1
+Environment=CARDBOARD_BACKUP_EVERY=1d
+ExecStart=/usr/bin/node src/cli.ts start
+Restart=on-failure
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/cardboard
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

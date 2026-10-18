@@ -1,0 +1,5 @@
+# HTTPS for Cardboard. Caddy fetches the certificate from Let's Encrypt on first start.
+{$CARDBOARD_DOMAIN} {
+	reverse_proxy cardboard:8787
+	header Strict-Transport-Security "max-age=31536000"
+}

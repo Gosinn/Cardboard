@@ -14,8 +14,29 @@ export interface DeviceRecord {
   url: string;
   accountId: string;
   deviceId: string;
-  token: string;
+  /** null while the device is locked: its token is in `lock`, sealed by the passkey. */
+  token: string | null;
   key: KeyLike;
+  lock?: DeviceLock | null;
+}
+
+/**
+ * A device locked with a passkey (Face ID, Touch ID, Windows Hello, a phone's
+ * fingerprint…). The passkey makes a secret (WebAuthn's PRF) that this device
+ * never stores; the account key and the device token are sealed by a key made
+ * from it. Someone holding this device, or a copy of its storage, gets
+ * nothing without the face, finger or PIN.
+ */
+export interface DeviceLock {
+  kind: "passkey";
+  /** Which passkey to ask for (its credential id, base64url). */
+  credential: string;
+  /** What the passkey's PRF is asked to sign (base64url). */
+  salt: string;
+  /** The device token, sealed by the passkey-made key (base64url). */
+  token: string;
+  /** Lock again after this long without use (ms); null = only when you say so. */
+  idleMs: number | null;
 }
 
 export interface DeviceStore {

@@ -87,11 +87,29 @@ export class Audit {
       );
   }
 
-  /** One account's entries (or, with accountId null, the server's own: sign-ups, backups, failed logins). */
-  read(accountId: string | null, options: { boxId?: string; limit?: number; before?: number } = {}): LogEntry[] {
+  /**
+   * One account's entries (or, with accountId null, the server's own:
+   * sign-ups, backups, failed logins). `actions` keeps only those actions;
+   * `sharedBoxes` adds entries about boxes shared with the account (filed
+   * under their owners), limited to `sharedActions`.
+   */
+  read(
+    accountId: string | null,
+    options: { boxId?: string; limit?: number; before?: number; actions?: string[]; sharedBoxes?: string[]; sharedActions?: string[] } = {},
+  ): LogEntry[] {
     const limit = Math.min(500, Math.max(1, options.limit ?? 50));
-    const where = [accountId === null ? "account_id IS NULL" : "account_id = ?"];
     const params: Array<string | number> = accountId === null ? [] : [accountId];
+    const mine = accountId === null ? "account_id IS NULL" : "account_id = ?";
+    const where: string[] = [];
+    const list = (n: number) => Array.from({ length: n }, () => "?").join(", ");
+    if (accountId !== null && options.sharedBoxes?.length && options.sharedActions?.length) {
+      where.push(`(${mine} OR (box_id IN (${list(options.sharedBoxes.length)}) AND action IN (${list(options.sharedActions.length)})))`);
+      params.push(...options.sharedBoxes, ...options.sharedActions);
+    } else where.push(mine);
+    if (options.actions) {
+      where.push(`action IN (${list(options.actions.length)})`);
+      params.push(...options.actions);
+    }
     if (options.boxId !== undefined) {
       where.push("box_id = ?");
       params.push(options.boxId);

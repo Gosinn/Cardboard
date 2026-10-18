@@ -5,7 +5,7 @@ import { basename, join, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { parseArgs } from "node:util";
 import { CardboardError } from "./shared/errors.ts";
-import { relativeTime } from "./shared/duration.ts";
+import { parseDuration, relativeTime } from "./shared/duration.ts";
 import { planName } from "./shared/activity.ts";
 import { formatBytes } from "./shared/size.ts";
 import { VERSION } from "./shared/version.ts";
@@ -78,6 +78,15 @@ whoever runs the server can't read what's in it.
     cardboard assistant list | remove <name>
     cardboard mcp <name>                    The MCP server an assistant starts (stdio)
 
+  Sharing a box with people (family, a partner, a friend)
+    cardboard share <box> [--for Anna] [--read-only] [--expires 3d] [--as "Gosinn"]
+                                            A one-time link: whoever opens it joins the box
+    cardboard shares                        Who each box is shared with, and links not used yet
+    cardboard share cancel <link-id>        Cancel a link nobody has used
+    cardboard join <link> [--as "Anna"]     Join a box someone shared with you
+    cardboard people remove <box> <name>    Take someone off a box (their apps are cut off too)
+    cardboard leave <box>                   Leave a box someone shared with you
+
   Boxes
     cardboard set <box> <setting> <value>   e.g. secrets block · defaultTtl 30d · quotaBytes 1GB
     cardboard allow <box> <origin>          Let a website call this box from the browser
@@ -100,6 +109,9 @@ whoever runs the server can't read what's in it.
   Options for start:  --port 8787  --host 127.0.0.1  --data ./cardboard-data  --key-file <path>
                       --tls-cert <file> --tls-key <file>  --trust-proxy  --open-signup
                       --public-url https://cardboard.example.com   (where people and apps reach you)
+                      --backup-every 1d   (snapshots in <data>/backups, newest 10 kept)
+  The same as environment variables: CARDBOARD_PORT, CARDBOARD_HOST, CARDBOARD_DATA, CARDBOARD_PUBLIC_URL,
+                      CARDBOARD_TRUST_PROXY=1, CARDBOARD_OPEN_SIGNUP=1, CARDBOARD_BACKUP_EVERY=1d
 `;
 
 interface HostCredentials {
@@ -202,6 +214,7 @@ async function main() {
       "trust-proxy": { type: "boolean" },
       "open-signup": { type: "boolean" },
       "public-url": { type: "string" },
+      "backup-every": { type: "string" },
       url: { type: "string" },
       dir: { type: "string" },
       force: { type: "boolean" },
@@ -228,6 +241,7 @@ async function main() {
       change: { type: "string" },
       "no-own": { type: "boolean" },
       note: { type: "string" },
+      for: { type: "string" },
       ttl: { type: "string" },
       json: { type: "boolean" },
       help: { type: "boolean", short: "h" },
@@ -253,6 +267,7 @@ async function main() {
         trustProxy: values["trust-proxy"],
         publicUrl: values["public-url"],
         openSignup: values["open-signup"],
+        backupEveryMs: values["backup-every"] ? (values["backup-every"] === "never" ? null : parseDuration(values["backup-every"])) : undefined,
       }).catch((err: NodeJS.ErrnoException) => {
         if (err.code === "EADDRINUSE") die(`Port ${values.port ?? 8787} is already in use.`, "Is Cardboard already running? Or pick another port with --port 8788.");
         throw err;
@@ -453,6 +468,8 @@ async function main() {
       for (const b of boxes) {
         const last = b.lastActivity ? relativeTime(b.lastActivity, Date.now()) : "never used";
         console.log(`${bold(b.name.padEnd(24))} ${String(b.items).padStart(6)} items  ${formatBytes(b.bytes).padStart(8)}  ${dim(last)}`);
+        if (b.shared) console.log(dim(`  Shared with you by ${b.shared.from}${b.shared.write ? "" : " (read only)"}`));
+        else if (b.people.members.length) console.log(dim(`  Shared with ${b.people.members.map((m) => m.name).join(", ")}`));
         if (b.profile.description || b.profile.version) console.log(dim(`  ${[b.profile.description, b.profile.version && `v${b.profile.version}`].filter(Boolean).join(" · ")}`));
         console.log(dim(`  ${(await acct.inventory(b)).summary}`));
         if (b.docks.length) console.log(dim(`  Docks: ${b.docks.map((d) => `${docks.find((x) => x.id === d.dock)?.name ?? "?"} (${arrows(d)})`).join(", ")}`));
@@ -475,6 +492,11 @@ async function main() {
       for (const t of box.tapes) {
         console.log(`  ${t.id}  “${t.label}”  ${[t.read && "read", t.write && "write"].filter(Boolean).join("+")}  ${dim(t.state)}`);
         console.log(dim(`    ${(await acct.blast(t, box)).summary}`));
+      }
+      if (box.shared || box.people.members.length) {
+        console.log(`\n  ${bold("People")}`);
+        if (box.shared) console.log(`  ${box.shared.from}  ${dim("owner")}`);
+        for (const m of box.people.members) console.log(`  ${m.name}${m.you ? " (you)" : ""}  ${dim(`${m.write ? "can change it" : "read only"} · ${m.apps} app${m.apps === 1 ? "" : "s"} · joined ${relativeTime(m.joinedAt, Date.now())}`)}`);
       }
       console.log(`\n  ${bold("Recent activity")}`);
       for (const e of (await acct.log({ box: box.name, limit: 10 })).slice(0, 10)) console.log(`  ${dim(relativeTime(e.at, Date.now()).padEnd(16))} ${e.text}`);
@@ -738,6 +760,71 @@ async function main() {
     }
 
     // ── Boxes ────────────────────────────────────────────────────────────
+
+    // ── Sharing ──────────────────────────────────────────────────────────
+
+    case "share": {
+      const acct = await account();
+      if (args[0] === "cancel") {
+        await acct.cancelShare(need(args[1], "Which link? cardboard shares lists them"));
+        return console.log("Cancelled. That link doesn't work any more.");
+      }
+      const name = need(args[0], "Which box? cardboard share <box>");
+      const forWhom = values.for ?? values.label;
+      const { link, expiresAt } = await acct.shareBox(name, { write: !values["read-only"], label: forWhom, as: values.as, expires: values.expires });
+      console.log(`\nSend this to ${forWhom ?? "them"} privately (Signal, iMessage, in person). It works once, until ${new Date(expiresAt).toLocaleString()}:\n`);
+      console.log(`  ${bold(link)}\n`);
+      console.log(dim("They open it with their own Cardboard on this server, or run: cardboard join <link>"));
+      console.log(dim("The secret is after the #, so it never reaches the server. Whoever opens it first gets in."));
+      console.log(dim(values["read-only"] ? "They'll be able to read it, not change it." : "They'll be able to read and change it (add --read-only to stop that)."));
+      return;
+    }
+
+    case "shares": {
+      const acct = await account();
+      let any = false;
+      for (const b of await acct.boxes()) {
+        if (b.shared) {
+          any = true;
+          console.log(`${bold(b.name)}  ${dim(`shared with you by ${b.shared.from}${b.shared.write ? "" : " (read only)"}`)}`);
+          continue;
+        }
+        if (!b.people.members.length && !b.people.links.length) continue;
+        any = true;
+        console.log(bold(b.name));
+        for (const m of b.people.members) console.log(`  ${m.name}  ${dim(`${m.write ? "can change it" : "read only"} · joined ${relativeTime(m.joinedAt, Date.now())}`)}`);
+        for (const l of b.people.links) console.log(`  ${dim(`link ${l.id}${l.label ? ` for ${l.label}` : ""}: not used yet, expires ${new Date(l.expiresAt).toLocaleString()}`)}`);
+      }
+      if (!any) console.log("Nothing is shared yet. Share a box with: cardboard share <box> --for Anna");
+      return;
+    }
+
+    case "join": {
+      const acct = await account();
+      const link = need(args[0], "Paste the link: cardboard join <link>");
+      const preview = await acct.viewShare(link);
+      console.log(`${preview.from} is sharing “${preview.name}” with you${preview.write ? "" : " (read only)"}.`);
+      const box = await acct.joinShare(link, { as: values.as });
+      console.log(`Joined. It's on your shelf as ${bold(box.name)}.`);
+      console.log(dim(`Connect an app to it: cardboard tape ${box.name} · leave any time: cardboard leave ${box.name}`));
+      return;
+    }
+
+    case "people": {
+      const acct = await account();
+      if (args[0] !== "remove") die("Try: cardboard people remove <box> <name>");
+      const boxName = need(args[1], "Which box? cardboard people remove <box> <name>");
+      await acct.removeMember(boxName, need(args[2], "Who? cardboard people remove <box> <name>"));
+      return console.log(`Done. They can't reach ${boxName} any more, and their apps were cut off.`);
+    }
+
+    case "leave": {
+      const acct = await account();
+      const boxName = need(args[0], "Which box? cardboard leave <box>");
+      await confirm(`Leave ${boxName}? You'd need a new link to come back.\nType the box name to confirm: `, boxName, values.yes);
+      await acct.leaveBox(boxName);
+      return console.log(`You left ${boxName}.`);
+    }
 
     case "set": {
       const [box, setting, ...rest] = args;

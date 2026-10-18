@@ -50,6 +50,8 @@ export const browserStore = {
     if (!persistent) return;
     try {
       await run("readwrite", (s) => s.put(record, KEY));
+      // Ask the browser not to clear this under storage pressure: it's this device's key.
+      navigator.storage?.persist?.().catch(() => {});
     } catch {
       persistent = false;
     }

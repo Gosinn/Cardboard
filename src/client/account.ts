@@ -30,7 +30,7 @@ import {
   toCode,
   type KeyLike,
 } from "./crypto.ts";
-import type { DeviceRecord, DeviceStore } from "./device.ts";
+import type { DeviceLock, DeviceRecord, DeviceStore } from "./device.ts";
 import { accountKeys, boxIndex, boxKeys, bundle, dockIndex, dockKeys, newClientId, newKey, type AccountKeys, type BoxKeys } from "./keys.ts";
 import { Rpc } from "./rpc.ts";
 
@@ -62,8 +62,8 @@ export interface Me {
   recoveryReady: boolean;
   profile: { name?: string; email?: string };
   quota: { used: number; limit: number };
-  device: { id: string; kind: DeviceKind };
-  devices: Array<{ id: string; kind: DeviceKind; name: string; createdAt: number; lastSeenAt: number | null; current: boolean }>;
+  device: { id: string; kind: DeviceKind; lock: "passkey" | null };
+  devices: Array<{ id: string; kind: DeviceKind; lock: "passkey" | null; name: string; createdAt: number; lastSeenAt: number | null; current: boolean }>;
   alarms: Array<{ at: number; text: string }>;
   server: { version: string; issuer: string; signup: "invite" | "open"; shake: { ok: boolean; summary: string; at: number } | null };
 }
@@ -83,6 +83,27 @@ export interface TapeInfo {
   state: string;
 }
 
+/** Someone a box is shared with, as everyone in it sees them. */
+export interface MemberInfo {
+  id: string;
+  name: string;
+  write: boolean;
+  joinedAt: number;
+  you: boolean;
+  /** How many of their apps have a working tape on the box. */
+  apps: number;
+}
+
+/** A share link that hasn't been used yet. */
+export interface ShareLinkInfo {
+  id: string;
+  /** Your note on who it's for. */
+  label: string | null;
+  write: boolean;
+  createdAt: number;
+  expiresAt: number;
+}
+
 export interface BoxInfo {
   id: string;
   name: string;
@@ -96,6 +117,10 @@ export interface BoxInfo {
   denied24h: number;
   customs24h: number;
   docks: Array<{ dock: string; send: boolean; receive: boolean; waiting: boolean }>;
+  /** Set when someone else shared this box with you. */
+  shared: { from: string; write: boolean; memberId: string; joinedAt: number } | null;
+  /** Who else is in the box (the owner's name, as they put it, when it isn't yours), and links waiting to be used. */
+  people: { owner: string | null; members: MemberInfo[]; links: ShareLinkInfo[] };
   /** @internal */
   keys: BoxKeys;
 }
@@ -131,9 +156,9 @@ export interface LogLine {
 
 interface WireMe {
   account: { id: string; createdAt: number; recovery: RecoveryPlan; recoveryReady: boolean; profile: string | null; quota: { used: number; limit: number } };
-  device: { id: string; kind: DeviceKind };
+  device: { id: string; kind: DeviceKind; lock: "passkey" | null };
   envelope: string | null;
-  devices: Array<{ id: string; kind: DeviceKind; label: string | null; createdAt: number; lastSeenAt: number | null; current: boolean }>;
+  devices: Array<{ id: string; kind: DeviceKind; lock: "passkey" | null; label: string | null; createdAt: number; lastSeenAt: number | null; current: boolean }>;
   alarms: Array<{ at: number; text: string }>;
   server: Me["server"];
 }
@@ -155,7 +180,7 @@ interface WireTape {
 
 interface WireBox {
   id: string;
-  idx: string;
+  idx: string | null;
   name: string;
   key: string;
   profile: string | null;
@@ -168,6 +193,32 @@ interface WireBox {
   denied24h: number;
   customs24h: number;
   docks: Array<{ dock: string; send: boolean; receive: boolean; waiting: boolean }>;
+  ownerLabel: string | null;
+  members: Array<{ id: string; label: string | null; write: boolean; joinedAt: number; you: boolean; apps: number }>;
+  shares: Array<{ id: string; label: string | null; write: boolean; createdAt: number; expiresAt: number }>;
+  shared: { member: string; write: boolean; joinedAt: number } | null;
+}
+
+/** What a share link holds, sealed by a key made from its secret. */
+interface ShareEnvelope {
+  v: 1;
+  box: string;
+  name: string;
+  from: string;
+}
+
+export interface SharePreview {
+  boxId: string;
+  /** What the owner calls the box. */
+  name: string;
+  /** Who's sharing it, as they put it. */
+  from: string;
+  write: boolean;
+  expiresAt: number;
+  /** It's your own box (you opened your own link). */
+  own: boolean;
+  /** You're already in it. */
+  member: boolean;
 }
 
 interface WireDock {
@@ -184,6 +235,9 @@ interface WireDock {
 const KIT_BYTES = 16;
 const PAIR_BYTES = 8;
 const FRIEND_BYTES = 16;
+const SHARE_BYTES = 16;
+/** A locked device locks itself again after this long without use, unless you pick otherwise. */
+export const DEFAULT_LOCK_IDLE_MS = 15 * 60 * 1000;
 
 // ── Getting in ─────────────────────────────────────────────────────────────
 
@@ -260,10 +314,50 @@ export function cleanInvite(invite: string): string {
   return match[0];
 }
 
-/** Opens the account this device is signed in to, or null if it isn't. */
-export async function unlock(store: DeviceStore, options: { fetch?: typeof fetch } = {}): Promise<Account | null> {
+export interface UnlockOptions {
+  fetch?: typeof fetch;
+  /**
+   * For a device locked with a passkey: asks for it (Face ID…) and returns its
+   * secret. In a browser, pass passkeySecret from passkey.ts.
+   */
+  passkey?: (lock: DeviceLock) => Promise<Uint8Array>;
+}
+
+/** Whether this device is locked with a passkey, without asking for it. */
+export async function deviceLock(store: DeviceStore): Promise<DeviceLock | null> {
+  return (await store.load())?.lock ?? null;
+}
+
+/**
+ * Opens the account this device is signed in to, or null if it isn't. A
+ * device locked with a passkey needs `passkey`, and throws device_locked
+ * without it.
+ */
+export async function unlock(store: DeviceStore, options: UnlockOptions = {}): Promise<Account | null> {
   const record = await store.load();
   if (!record) return null;
+  if (record.lock) {
+    if (!options.passkey) throw new CardboardError("device_locked", 0, "This device is locked.", "Unlock it with Face ID (or the passkey you locked it with).");
+    const lockKey = await derive(await options.passkey(record.lock), "device-lock");
+    let token: string;
+    try {
+      token = await openText(lockKey, fromB64u(record.lock.token), ctx.deviceToken);
+    } catch {
+      throw new CardboardError(
+        "wrong_passkey",
+        0,
+        "That passkey didn't unlock this device.",
+        "Use the passkey you locked it with. Lost it? Remove this device from another one, or sign in again here with your recovery kit.",
+      );
+    }
+    const rpc = new Rpc(record.url, token, options.fetch);
+    const me = await rpc.call<WireMe>("me");
+    if (!me.envelope || me.device.lock !== "passkey") throw new CardboardError("no_envelope", 0, "This device's lock doesn't match what the server has.", "Sign in again: pair it from another device, or use your recovery kit.");
+    const inner = await open(record.key, fromB64u(me.envelope), ctx.lockedEnvelope);
+    const root = await open(lockKey, inner, ctx.accountKey("passkey"));
+    return new Account(rpc, record, await accountKeys(root), store);
+  }
+  if (!record.token) throw new CardboardError("no_envelope", 0, "This device never finished signing in.", "Sign in again: cardboard pair, or use your recovery kit.");
   const rpc = new Rpc(record.url, record.token, options.fetch);
   const me = await rpc.call<WireMe>("me");
   if (!me.envelope) throw new CardboardError("no_envelope", 0, "This device never finished signing in.", "Sign in again: cardboard pair, or use your recovery kit.");
@@ -352,6 +446,8 @@ export class Account {
   readonly rpc: Rpc;
   private readonly keys: AccountKeys;
   private readonly store: DeviceStore;
+  /** What this device keeps about itself (token sealed while locked; the live token is in rpc). */
+  private record: DeviceRecord;
   private boxCache: Map<string, BoxInfo> | null = null;
   private readonly inventories = new Map<string, { stamp: string; inventory: Inventory }>();
 
@@ -360,6 +456,7 @@ export class Account {
     this.url = rpc.url;
     this.id = record.accountId;
     this.deviceId = record.deviceId;
+    this.record = record;
     this.keys = keys;
     this.store = store;
   }
@@ -434,6 +531,66 @@ export class Account {
     return res.device;
   }
 
+  // ── Locking this device (Face ID…) ───────────────────────────────────────
+
+  /** This device's passkey lock, or null if opening it needs nothing but the device itself. */
+  get lock(): DeviceLock | null {
+    return this.record.lock ?? null;
+  }
+
+  /**
+   * Locks this device with a passkey: from now on, opening your account here
+   * takes the passkey's secret (Face ID, Touch ID, Windows Hello…) as well as
+   * this device's own key. Its token is swapped for a new one, kept sealed by
+   * the passkey, so the old one (which sat on the device unsealed) stops
+   * working. In a browser, get `passkey` from createPasskey in passkey.ts.
+   */
+  async lockWithPasskey(passkey: { credential: string; salt: string; secret: Uint8Array }, options: { idleMs?: number | null } = {}) {
+    if (passkey.secret.byteLength < 32) throw fail("bad_passkey", 400, "That passkey's secret is too short to lock anything with.");
+    const lockKey = await derive(passkey.secret, "device-lock");
+    const envelope = await seal(this.record.key, await seal(lockKey, this.keys.root, ctx.accountKey("passkey")), ctx.lockedEnvelope);
+    const token = newDeviceToken();
+    const lock: DeviceLock = {
+      kind: "passkey",
+      credential: passkey.credential,
+      salt: passkey.salt,
+      token: toB64u(await seal(lockKey, token, ctx.deviceToken)),
+      idleMs: options.idleMs === undefined ? (this.record.lock?.idleMs ?? DEFAULT_LOCK_IDLE_MS) : options.idleMs,
+    };
+    await this.swapEnvelope(envelope, "passkey", token, { ...this.record, token: null, lock });
+  }
+
+  /** Takes the passkey lock off this device: opening it needs only the device again. */
+  async removeLock() {
+    if (!this.record.lock) return;
+    const token = newDeviceToken();
+    const envelope = await seal(this.record.key, this.keys.root, ctx.accountKey("device"));
+    await this.swapEnvelope(envelope, null, token, { ...this.record, token, lock: null });
+  }
+
+  /** How long this locked device waits without use before locking itself again (null: never). */
+  async setLockIdle(idleMs: number | null) {
+    if (!this.record.lock) throw fail("not_locked", 400, "This device isn't locked with a passkey.", "Lock it first.");
+    if (idleMs !== null && (!Number.isFinite(idleMs) || idleMs < 60_000)) throw fail("bad_request", 400, "Pick at least a minute, or never.");
+    const record = { ...this.record, lock: { ...this.record.lock, idleMs } };
+    await this.store.save(record);
+    this.record = record;
+  }
+
+  /** Remembers the new lock here first, so a failed call to the server can be put back. */
+  private async swapEnvelope(envelope: Uint8Array, lock: "passkey" | null, token: string, record: DeviceRecord) {
+    const previous = this.record;
+    await this.store.save(record);
+    try {
+      await this.rpc.call("device.envelope", { envelope: toB64u(envelope), lock, tokenHash: await hashOf(token) });
+    } catch (err) {
+      await this.store.save(previous);
+      throw err;
+    }
+    this.rpc.token = token;
+    this.record = record;
+  }
+
   async renameDevice(id: string, label: string) {
     await this.rpc.call("device.label", { id, label: await this.sealMeta(label, ctx.deviceLabel) });
   }
@@ -482,12 +639,32 @@ export class Account {
   // ── Boxes ────────────────────────────────────────────────────────────────
 
   private async openBoxInfo(raw: WireBox): Promise<BoxInfo> {
-    const root = await open(this.keys.wrap, fromB64u(raw.key), ctx.boxKey(raw.id));
+    const shared = raw.shared;
+    const root = await open(this.keys.wrap, fromB64u(raw.key), shared ? ctx.memberBoxKey(raw.id) : ctx.boxKey(raw.id));
     const keys = await boxKeys(root);
-    const name = await openText(this.keys.meta, fromB64u(raw.name), ctx.boxName(raw.id));
+    const name = await openText(this.keys.meta, fromB64u(raw.name), shared ? ctx.memberBoxName(raw.id) : ctx.boxName(raw.id));
     const profile = raw.profile ? await openJson<AppProfile>(keys.seal, fromB64u(raw.profile), ctx.boxProfile(raw.id)).catch(() => ({})) : {};
     const tapes = await Promise.all(raw.tapes.map((t) => this.openTape(t)));
-    return { ...raw, name, profile, tapes, keys };
+    const inBox = (sealed: string | null, context: string, fallback: string) =>
+      sealed ? openText(keys.seal, fromB64u(sealed), context).catch(() => fallback) : Promise.resolve(fallback);
+    const owner = shared ? await inBox(raw.ownerLabel, ctx.ownerLabel(raw.id), "Whoever shared it") : null;
+    const members = await Promise.all(raw.members.map(async (m) => ({ ...m, label: undefined, name: await inBox(m.label, ctx.memberLabel(raw.id, m.id), "Someone") })));
+    const links = await Promise.all(raw.shares.map(async (l) => ({ ...l, label: l.label ? await this.openMeta(l.label, ctx.shareLabel(raw.id), "") || null : null })));
+    return {
+      ...raw,
+      name,
+      profile,
+      tapes,
+      keys,
+      shared: shared ? { from: owner ?? "Whoever shared it", write: shared.write, memberId: shared.member, joinedAt: shared.joinedAt } : null,
+      people: { owner, members, links },
+    };
+  }
+
+  private async ownedBox(name: string): Promise<BoxInfo> {
+    const box = await this.box(name);
+    if (box.shared) throw fail("not_your_box", 403, `${name} was shared with you by ${box.shared.from}; only they can change that.`, "You can leave it, or rename it for yourself.");
+    return box;
   }
 
   private async openTape(t: WireTape): Promise<TapeInfo> {
@@ -523,6 +700,9 @@ export class Account {
     if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(name)) {
       throw fail("bad_box_name", 400, `"${name}" can't be used as a box name.`, "Use lowercase letters, numbers and dashes, like recipe-app.");
     }
+    for (const box of (await this.cache()).values()) {
+      if (box.shared && box.name === name) throw fail("box_exists", 409, `You already have a box called ${name} (shared with you by ${box.shared.from}).`, "Pick another name, or rename that one.");
+    }
     const id = newClientId("box");
     const root = newKey();
     const res = await this.rpc.call<{ box: WireBox }>("box.create", {
@@ -552,7 +732,7 @@ export class Account {
   }
 
   async setBoxSettings(name: string, settings: Record<string, unknown>): Promise<BoxInfo> {
-    const box = await this.box(name);
+    const box = await this.ownedBox(name);
     const res = await this.rpc.call<{ box: WireBox }>("box.settings", { box: box.id, settings });
     const updated = await this.openBoxInfo(res.box);
     (await this.cache()).set(updated.id, updated);
@@ -562,6 +742,13 @@ export class Account {
   async renameBox(name: string, to: string): Promise<BoxInfo> {
     if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(to)) throw fail("bad_box_name", 400, `"${to}" can't be used as a box name.`, "Use lowercase letters, numbers and dashes.");
     const box = await this.box(name);
+    if ((await this.boxes()).some((b) => b.name === to && b.id !== box.id)) throw fail("box_exists", 409, `You already have a box called ${to}.`);
+    if (box.shared) {
+      // Your own name for a box someone shared with you: only you see it.
+      await this.rpc.call("member.rename", { box: box.id, name: await this.sealMeta(to, ctx.memberBoxName(box.id)) });
+      this.boxCache = null;
+      return this.box(to);
+    }
     const res = await this.rpc.call<{ box: WireBox }>("box.rename", { box: box.id, idx: await boxIndex(this.keys, to), name: await this.sealMeta(to, ctx.boxName(box.id)) });
     const updated = await this.openBoxInfo(res.box);
     (await this.cache()).set(updated.id, updated);
@@ -569,20 +756,20 @@ export class Account {
   }
 
   async setBoxProfile(name: string, profile: AppProfile) {
-    const box = await this.box(name);
+    const box = await this.ownedBox(name);
     await this.rpc.call("box.profile", { box: box.id, profile: toB64u(await sealJson(box.keys.seal, profile, ctx.boxProfile(box.id))) });
     this.boxCache = null;
   }
 
   /** Crypto-shredding: the sealed box key, every item, version, tape and log line go. */
   async shredBox(name: string) {
-    const box = await this.box(name);
+    const box = await this.ownedBox(name);
     await this.rpc.call("box.shred", { box: box.id, confirm: box.id });
     this.boxCache?.delete(box.id);
   }
 
   async rewind(name: string, to: string | number): Promise<{ changed: number; to: number }> {
-    const box = await this.box(name);
+    const box = await this.ownedBox(name);
     return this.rpc.call("rewind", { box: box.id, to });
   }
 
@@ -664,6 +851,106 @@ export class Account {
     return undefined;
   }
 
+  // ── Sharing boxes with people ────────────────────────────────────────────
+
+  /**
+   * A link that shares a box with one person. Its secret is in the part after
+   * #, which browsers never send to a server: a key made from it seals the
+   * box key and name for whoever opens it. It works once, then it's gone.
+   * `as` is your name as they'll see it; `label` is your note on who it's for.
+   */
+  async shareBox(
+    boxName: string,
+    options: { write?: boolean; label?: string; as?: string; expires?: string } = {},
+  ): Promise<{ link: string; code: string; share: ShareLinkInfo; expiresAt: number }> {
+    const box = await this.ownedBox(boxName);
+    const me = await this.me();
+    const from = (options.as ?? me.profile.name ?? "").trim().slice(0, 60) || "Someone";
+    const secret = random(SHARE_BYTES);
+    const [auth, wrap] = await Promise.all([derive(secret, "share-auth"), derive(secret, "share-wrap")]);
+    const envelope: ShareEnvelope = { v: 1, box: toB64u(box.keys.root), name: box.name, from };
+    const label = options.label?.trim().slice(0, 60);
+    const res = await this.rpc.call<{ share: WireBox["shares"][number] }>("share.create", {
+      box: box.id,
+      lookup: toB64u(await sha256(auth)),
+      envelope: toB64u(await sealJson(wrap, envelope, ctx.share(box.id))),
+      label: label ? await this.sealMeta(label, ctx.shareLabel(box.id)) : undefined,
+      write: options.write ?? true,
+      ttl: options.expires,
+      ownerLabel: toB64u(await seal(box.keys.seal, from, ctx.ownerLabel(box.id))),
+    });
+    this.boxCache = null;
+    const code = toCode(secret);
+    return { link: `${me.server.issuer || this.url}/#share=${code}`, code, share: { ...res.share, label: label ?? null }, expiresAt: res.share.expiresAt };
+  }
+
+  /** Cancels a share link nobody has used yet. */
+  async cancelShare(id: string) {
+    await this.rpc.call("share.revoke", { id });
+    this.boxCache = null;
+  }
+
+  private async shareKeys(link: string) {
+    const code = /#share=([^&\s]+)/.exec(link)?.[1] ?? link;
+    const secret = fromCode(decodeURIComponent(code), SHARE_BYTES);
+    const [auth, wrap] = await Promise.all([derive(secret, "share-auth"), derive(secret, "share-wrap")]);
+    return { auth: toB64u(auth), wrap };
+  }
+
+  /** What a share link (or its code) is for, opened here. Doesn't use it up. */
+  async viewShare(link: string): Promise<SharePreview> {
+    const { auth, wrap } = await this.shareKeys(link);
+    const res = await this.rpc.call<{ box: string; envelope: string; write: boolean; expiresAt: number; own: boolean; member: boolean }>("share.view", { secret: auth });
+    const opened = await openJson<ShareEnvelope>(wrap, fromB64u(res.envelope), ctx.share(res.box));
+    return { boxId: res.box, name: opened.name, from: opened.from, write: res.write, expiresAt: res.expiresAt, own: res.own, member: res.member };
+  }
+
+  /**
+   * Joins a box someone shared with you. The box key is re-sealed with your
+   * own account key, so the link is no longer needed (and no longer works).
+   * `as` is your name as everyone in the box will see it.
+   */
+  async joinShare(link: string, options: { as?: string; name?: string } = {}): Promise<BoxInfo> {
+    const { auth, wrap } = await this.shareKeys(link);
+    const view = await this.rpc.call<{ box: string; envelope: string; own: boolean; member: boolean }>("share.view", { secret: auth });
+    if (view.own) throw fail("own_box", 409, "That's your own box.", "Send the link to the person you want to share it with.");
+    if (view.member) throw fail("already_member", 409, "You're already in this box.", "It's on your shelf.");
+    const opened = await openJson<ShareEnvelope>(wrap, fromB64u(view.envelope), ctx.share(view.box));
+    const root = fromB64u(opened.box);
+    const keys = await boxKeys(root);
+    const id = newClientId("mem");
+    const wanted = (options.name ?? opened.name).toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 50) || "shared";
+    const name = await this.freeName(wanted);
+    const as = (options.as ?? (await this.me()).profile.name ?? "").trim().slice(0, 60) || "Someone";
+    const res = await this.rpc.call<{ box: WireBox }>("share.accept", {
+      secret: auth,
+      id,
+      key: toB64u(await seal(this.keys.wrap, root, ctx.memberBoxKey(view.box))),
+      name: await this.sealMeta(name, ctx.memberBoxName(view.box)),
+      label: toB64u(await seal(keys.seal, as, ctx.memberLabel(view.box, id))),
+    });
+    const box = await this.openBoxInfo(res.box);
+    (await this.cache()).set(box.id, box);
+    return box;
+  }
+
+  /** Takes someone off a box you own. Their apps' tapes on it stop working right away. */
+  async removeMember(boxName: string, member: string) {
+    const box = await this.ownedBox(boxName);
+    const found = box.people.members.find((m) => m.id === member || m.name === member);
+    if (!found) throw fail("no_such_member", 404, `Nobody called ${member} is in ${boxName}.`, `See who is: cardboard box ${boxName}`);
+    await this.rpc.call("member.remove", { box: box.id, member: found.id });
+    this.boxCache = null;
+  }
+
+  /** Leaves a box someone shared with you. */
+  async leaveBox(boxName: string) {
+    const box = await this.box(boxName);
+    if (!box.shared) throw fail("own_box", 409, `${boxName} is your own box: you can't leave it.`, "Shred it, or take people off it.");
+    await this.rpc.call("member.leave", { box: box.id });
+    this.boxCache?.delete(box.id);
+  }
+
   // ── Smart (worked out here, never on the server) ─────────────────────────
 
   /** What a box holds, worked out from its opened data. Cached until the box changes. */
@@ -688,8 +975,9 @@ export class Account {
       url: this.url,
       recovery: { plan: me.recovery, ready: me.recoveryReady },
       devices: me.devices,
+      // Box advice is about settings only the owner can change, so boxes shared with you sit this out.
       boxes: await Promise.all(
-        boxes.map(async (b) => ({
+        boxes.filter((b) => !b.shared).map(async (b) => ({
           name: b.name,
           settings: b.settings,
           createdAt: b.createdAt,
@@ -730,7 +1018,11 @@ export class Account {
     const boxId = options.box ? (await this.box(options.box)).id : undefined;
     const res = await this.rpc.call<{
       entries: Array<{ id: number; at: number; box: string | null; dock: string | null; actor: string; action: string; outcome: Outcome; count: number | null; note: string | null; ref: { sealed: string; ctx: string } | null; detail: string | null }>;
-      actors: Record<string, { kind: "device" | "tape"; gone?: boolean; label?: string | null; deviceKind?: DeviceKind; box?: string; tapeKind?: string; app?: string | null }>;
+      actors: Record<
+        string,
+        | { kind: "device" | "tape"; gone?: boolean; label?: string | null; deviceKind?: DeviceKind; box?: string; tapeKind?: string; app?: string | null }
+        | { kind: "person"; via: "device" | "app"; box: string; label: string | null; labelCtx: string; owner: boolean }
+      >;
     }>("log", { box: boxId, limit: options.limit, before: options.before });
     const boxes = await this.cache();
     const dockNames = new Map<string, string>();
@@ -742,6 +1034,13 @@ export class Account {
       if (actor === "anonymous") return "Someone without a valid token";
       if (actor === "host") return "Whoever runs Cardboard";
       const info = res.actors[actor];
+      if (info?.kind === "person") {
+        // Someone you share a box with, named the way they asked to be.
+        const box = boxes.get(info.box);
+        const name = box && info.label ? await openText(box.keys.seal, fromB64u(info.label), info.labelCtx).catch(() => null) : null;
+        const who = name ?? (info.owner ? "The box's owner" : "Someone you share with");
+        return info.via === "app" ? `${who} (in an app)` : who;
+      }
       if (!info || info.gone) return actor.startsWith("tape:") ? "A tape that no longer exists" : "A device that was removed";
       if (info.kind === "device") {
         if (actor === `device:${this.deviceId}`) return "You (this device)";
@@ -775,7 +1074,7 @@ export class Account {
   private async openRef(ref: { sealed: string; ctx: string }, boxes: Map<string, BoxInfo>): Promise<string | null> {
     const [kind, owner] = ref.ctx.split("|");
     try {
-      if (kind === "item-name" || kind === "dock-ask") {
+      if (kind === "item-name" || kind === "dock-ask" || kind === "member-label") {
         const box = boxes.get(owner ?? "");
         return box ? await openText(box.keys.seal, fromB64u(ref.sealed), ref.ctx) : null;
       }
@@ -1007,7 +1306,7 @@ export class Account {
    * sealed to the app's own key, so the server only relays them. An app that
    * didn't send a key only gets a name/email if you pass `claims` yourself.
    */
-  async approveSignIn(id: string, options: { claims?: { name?: string; email?: string }; appKey?: string | null } = {}): Promise<string> {
+  async approveSignIn(id: string, options: { claims?: { name?: string; email?: string }; appKey?: string | null; box?: string } = {}): Promise<string> {
     const req = await this.signInRequest(id);
     if (options.appKey && options.appKey !== req.appKey) {
       throw new CardboardError(
@@ -1020,7 +1319,10 @@ export class Account {
     let boxId: string | null = null;
     const sealed: { v: 1; box?: ReturnType<typeof bundle>; profile?: { name?: string; email?: string } } = { v: 1 };
     if (req.scopes.includes("box")) {
-      let box = req.box ? await this.boxById(req.box) : undefined;
+      // `box` picks one (e.g. a box shared with you, so the app shares it too); otherwise the app's own.
+      let box = options.box ? await this.boxById(options.box) : req.box ? await this.boxById(req.box) : undefined;
+      if (options.box && !box) throw fail("no_such_box", 404, "You don't have that box.");
+      if (box?.shared && !box.shared.write) throw fail("read_only", 403, `${box.name} was shared with you read-only, so an app can't keep its data there.`, "Pick another box.");
       if (!box) {
         box = await this.createBox(await this.freeName(slug(req.client.name)));
         await this.setBoxProfile(box.name, { title: req.client.name.slice(0, 60), ...(req.client.uri ? { url: req.client.uri } : {}) });

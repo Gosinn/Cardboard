@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { CardboardError, fail } from "../shared/errors.ts";
 import { parseDuration } from "../shared/duration.ts";
 import { ctx } from "../shared/contexts.ts";
-import { DEVICE_KINDS, RECOVERY_PLANS, type Account, type Accounts, type Device, type DeviceKind, type RecoveryPlan } from "./accounts.ts";
+import { DEVICE_KINDS, DEVICE_LOCKS, RECOVERY_PLANS, type Account, type Accounts, type Device, type DeviceKind, type DeviceLock, type RecoveryPlan } from "./accounts.ts";
 import type { Audit, LogInput, Outcome } from "./audit.ts";
 import { newId, sameBytes, sha256 } from "./crypto.ts";
 import { getMeta, setMeta, type DB } from "./db.ts";
@@ -12,6 +12,7 @@ import type { Hub } from "./hub.ts";
 import { hostInsights, type ServerInfo } from "./insights.ts";
 import { OAuthError, type OAuth } from "./oauth.ts";
 import { runShake, type ShakeReport } from "./shake.ts";
+import { noShare, type Member, type Sharing } from "./sharing.ts";
 import { tapeView, type Tape, type Tapes } from "./tapes.ts";
 import type { Box, Sealed, StoredItem, Vault } from "./vault.ts";
 import {
@@ -73,6 +74,7 @@ export interface Context {
   hub: Hub;
   docks: Docks;
   oauth: OAuth;
+  sharing: Sharing;
   info: ServerInfo;
 }
 
@@ -86,6 +88,10 @@ export interface AppAuth {
   account: Account;
   box: Box;
   tape: Tape;
+  /** Set when the box was shared with the tape's account (it's someone else's box). */
+  member: Member | null;
+  /** The tape may write, and (in a shared box) its account may too. */
+  write: boolean;
   actor: string;
   cors: Record<string, string>;
 }
@@ -115,6 +121,9 @@ const MAX_KEY_BLOB = 512;
 const MAX_LABEL = 1024;
 const MAX_PROFILE = 4096;
 const MAX_DETAIL = 2048;
+const WRITE_OPS = new Set(["put", "delete", "undo", "batch", "rewind"]);
+/** What the people a box is shared with see of its log: what happened to the data, and who joined. */
+const SHARED_LOG_ACTIONS = ["read", "put", "delete", "purge", "list", "query", "history", "undo", "batch", "watch", "expire", "box.rewind", "member.join", "member.leave", "member.remove"];
 
 /** Slows down anyone guessing: 30 failed attempts per 5 minutes per address. */
 export class FailureLimiter {
@@ -169,6 +178,14 @@ export class Api {
     context.oauth.onRevoke = (tapeIds) => context.hub.closeWhere((w) => w.tapeId !== null && tapeIds.includes(w.tapeId));
     context.oauth.onAlarm = (grant, message) =>
       context.audit.record({ accountId: grant.accountId, boxId: grant.boxId, actor: "system", action: "alarm", outcome: "denied", note: message });
+    // Apps can keep data in boxes shared with you, as long as you may change them.
+    context.oauth.boxAllowed = (accountId, boxId) => {
+      try {
+        return context.sharing.reach(accountId, boxId).write;
+      } catch {
+        return false;
+      }
+    };
     this.itemOps = this.buildItemOps();
     this.publicOps = this.buildPublicOps();
     this.deviceOps = this.buildDeviceOps();
@@ -245,10 +262,16 @@ export class Api {
     const account = this.ctx.accounts.account(tape.accountId);
     if (!box || !account) throw fail("bad_tape", 401, "That tape's box no longer exists.");
     const actor = `tape:${tape.id}`;
+    // A tape on someone else's box only works while they still share it with you.
+    const member = box.accountId === account.id ? null : (this.ctx.sharing.member(box.id, account.id) ?? null);
+    if (box.accountId !== account.id && !member) {
+      this.denyAuth(req, "A tape on a box that isn't shared with its account any more.", box.accountId, box.id, actor);
+      throw fail("bad_tape", 401, "That tape's box isn't shared with you any more.", "Ask the box's owner to share it again.");
+    }
     let cors: Record<string, string> = {};
     if (req.origin) {
       if (!box.settings.origins.includes(req.origin)) {
-        this.log(req, { accountId: account.id, boxId: box.id, actor, action: "auth", outcome: "denied", note: `${req.origin} isn't an allowed origin` });
+        this.log(req, { accountId: box.accountId, boxId: box.id, actor, action: "auth", outcome: "denied", note: `${req.origin} isn't an allowed origin` });
         throw fail(
           "origin_not_allowed",
           403,
@@ -258,7 +281,7 @@ export class Api {
       }
       cors = { "access-control-allow-origin": req.origin, vary: "Origin" };
     }
-    return { account, box, tape, actor, cors };
+    return { account, box, tape, member, write: tape.write && (member ? member.write : true), actor, cors };
   }
 
   private authenticateDevice(req: ApiRequest, token: string): DeviceAuth {
@@ -305,8 +328,11 @@ export class Api {
     const body = asBody(req.body);
     const item = this.itemOps[req.op];
     if (item) {
-      const box = this.ctx.vault.ownBox(auth.account.id, requireString(body, "box", 64));
-      const scope: ItemScope = { accountId: auth.account.id, box, actor: auth.actor, read: true, write: true, quietReads: true };
+      const { box, member, write } = this.ctx.sharing.reach(auth.account.id, requireString(body, "box", 64));
+      if (member && req.op === "rewind") throw fail("owner_only", 403, "Only the box's owner can rewind it.", "Undo single changes instead, or ask the owner.");
+      if (!write && WRITE_OPS.has(req.op)) throw fail("read_only", 403, "This box was shared with you read-only.", "Ask its owner to share it again with changes allowed.");
+      // Changes to a shared box are filed under its owner's log, where everyone in the box can see them.
+      const scope: ItemScope = { accountId: box.accountId, box, actor: auth.actor, read: true, write, quietReads: true };
       return { status: 200, headers: {}, body: item(scope, body, req) };
     }
     const handler = this.deviceOps[req.op];
@@ -323,7 +349,7 @@ export class Api {
       const body = asBody(req.body);
       const item = this.itemOps[req.op];
       if (item && req.op !== "rewind") {
-        const scope: ItemScope = { accountId: auth.account.id, box: auth.box, actor: auth.actor, read: auth.tape.read, write: auth.tape.write, quietReads: false };
+        const scope: ItemScope = { accountId: auth.box.accountId, box: auth.box, actor: auth.actor, read: auth.tape.read, write: auth.write, quietReads: false };
         return { status: 200, headers: auth.cors, body: item(scope, body, req) };
       }
       const handler = this.appOps[req.op];
@@ -331,7 +357,7 @@ export class Api {
       return { status: 200, headers: auth.cors, body: handler(auth, body, req) };
     } catch (err) {
       if (err instanceof CardboardError && err.status === 403 && err.code !== "dock_pending") {
-        this.log(req, { accountId: auth.account.id, boxId: auth.box.id, actor: auth.actor, action: req.op, outcome: "denied", note: err.reason });
+        this.log(req, { accountId: auth.box.accountId, boxId: auth.box.id, actor: auth.actor, action: req.op, outcome: "denied", note: err.reason });
       }
       const res = errorResponse(err);
       return { ...res, headers: { ...res.headers, ...auth.cors } };
@@ -349,7 +375,7 @@ export class Api {
   authorizeWatch(req: ApiRequest): AppAuth {
     const auth = this.authenticateApp(req);
     requireRead(auth.tape);
-    this.log(req, { accountId: auth.account.id, boxId: auth.box.id, actor: auth.actor, action: "watch" });
+    this.log(req, { accountId: auth.box.accountId, boxId: auth.box.id, actor: auth.actor, action: "watch" });
     return auth;
   }
 
@@ -584,7 +610,7 @@ export class Api {
 
   /** Facts about one of your boxes that the server knows without opening anything. */
   boxSummary(box: Box) {
-    const { vault, tapes, audit, docks } = this.ctx;
+    const { vault, tapes, audit, docks, sharing } = this.ctx;
     const since = this.now() - DAY;
     return {
       id: box.id,
@@ -595,12 +621,82 @@ export class Api {
       settings: box.settings,
       createdAt: box.createdAt,
       ...vault.stats(box.id),
-      tapes: tapes.list(box.id).map((t) => tapeView(t, tapes.state(t))),
+      tapes: tapes.list(box.id, box.accountId).map((t) => tapeView(t, tapes.state(t))),
       lastActivity: audit.lastActivity(box.id),
       denied24h: audit.deniedSince(box.id, since, { excludeAction: "dock.customs" }),
       customs24h: audit.deniedSince(box.id, since, { action: "dock.customs" }),
       docks: docks.berthsOf(box.id).map((b) => ({ dock: b.dockId, send: b.send, receive: b.receive, waiting: (b.wantSend && !b.send) || (b.wantReceive && !b.receive) })),
+      ownerLabel: b64(sharing.ownerLabel(box.id)),
+      members: this.membersView(box, box.accountId),
+      shares: sharing.sharesOf(box.id).map((sh) => ({ id: sh.id, label: b64(sh.label), write: sh.write, createdAt: sh.createdAt, expiresAt: sh.expiresAt })),
+      shared: null,
     };
+  }
+
+  /** A box shared with you: your own sealed copy of its key and name, never the owner's. */
+  memberSummary(box: Box, member: Member) {
+    const { vault, tapes, audit, sharing } = this.ctx;
+    return {
+      id: box.id,
+      idx: null,
+      name: b64(member.name),
+      key: b64(member.key),
+      profile: b64(box.profile),
+      settings: box.settings,
+      createdAt: box.createdAt,
+      ...vault.stats(box.id),
+      tapes: tapes.list(box.id, member.accountId).map((t) => tapeView(t, tapes.state(t))),
+      lastActivity: audit.lastActivity(box.id),
+      denied24h: 0,
+      customs24h: 0,
+      docks: [],
+      ownerLabel: b64(sharing.ownerLabel(box.id)),
+      members: this.membersView(box, member.accountId),
+      shares: [],
+      shared: { member: member.id, write: member.write, joinedAt: member.createdAt },
+    };
+  }
+
+  /** Who a box is shared with, as everyone in it sees it (their labels are sealed by the box key). */
+  private membersView(box: Box, viewer: string) {
+    const { sharing, tapes } = this.ctx;
+    return sharing.membersOf(box.id).map((m) => ({
+      id: m.id,
+      label: b64(m.label),
+      write: m.write,
+      joinedAt: m.createdAt,
+      you: m.accountId === viewer,
+      apps: tapes.list(box.id, m.accountId).filter((t) => tapes.state(t) === "active").length,
+    }));
+  }
+
+  /** Every box this account can open: its own, then those shared with it. */
+  private reachableSummaries(accountId: string) {
+    const { vault, sharing } = this.ctx;
+    const shared = sharing.membershipsOf(accountId).flatMap((m) => {
+      const box = vault.box(m.boxId);
+      return box ? [this.memberSummary(box, m)] : [];
+    });
+    return [...vault.boxes(accountId).map((b) => this.boxSummary(b)), ...shared];
+  }
+
+  /**
+   * Someone leaves a box (or is taken off it): their apps' tapes on it stop
+   * working, apps they signed in with it are disconnected, and live streams close.
+   */
+  private cutOff(member: Member) {
+    const { db, hub, oauth, sharing } = this.ctx;
+    const tapeIds = (db.prepare("SELECT id FROM tapes WHERE box_id = ? AND account_id = ? AND revoked_at IS NULL").all(member.boxId, member.accountId) as Array<{ id: string }>).map((r) => r.id);
+    db.prepare("UPDATE tapes SET revoked_at = ?, bundle = NULL WHERE box_id = ? AND account_id = ? AND revoked_at IS NULL").run(this.now(), member.boxId, member.accountId);
+    for (const grant of oauth.grants(member.accountId)) if (grant.boxId === member.boxId) oauth.revokeGrant(grant.id);
+    hub.closeWhere((w) => w.tapeId !== null && tapeIds.includes(w.tapeId));
+    sharing.remove(member.id);
+  }
+
+  /** Before an account goes: close its apps' streams on boxes other people shared with it. */
+  private closeStreamsOf(accountId: string) {
+    const ids = (this.ctx.db.prepare("SELECT id FROM tapes WHERE account_id = ?").all(accountId) as Array<{ id: string }>).map((r) => r.id);
+    this.ctx.hub.closeWhere((w) => w.tapeId !== null && ids.includes(w.tapeId));
   }
 
   dockSummary(dock: Dock) {
@@ -629,7 +725,7 @@ export class Api {
   }
 
   private buildDeviceOps(): Record<string, DeviceOp> {
-    const { accounts, vault, tapes, audit, hub, docks, oauth, info } = this.ctx;
+    const { accounts, vault, tapes, audit, hub, docks, oauth, info, sharing } = this.ctx;
     const record = (a: DeviceAuth, req: ApiRequest, action: string, extra: Partial<LogInput> = {}) =>
       this.log(req, { accountId: a.account.id, actor: a.actor, action, ...extra });
     const boxFrom = (a: DeviceAuth, body: Body, field = "box") => vault.ownBox(a.account.id, requireString(body, field, 64));
@@ -652,11 +748,12 @@ export class Api {
             profile: b64(a.account.profile),
             quota: { used: vault.accountBytes(a.account.id), limit: vault.accountQuota(a.account.id) },
           },
-          device: { id: a.device.id, kind: a.device.kind },
+          device: { id: a.device.id, kind: a.device.kind, lock: a.device.lock },
           envelope: b64(a.device.envelope),
           devices: accounts.devices(a.account.id).map((d) => ({
             id: d.id,
             kind: d.kind,
+            lock: d.lock,
             label: b64(d.label),
             createdAt: d.createdAt,
             lastSeenAt: d.lastSeenAt,
@@ -667,9 +764,21 @@ export class Api {
         };
       },
 
-      "device.envelope": (a, body) => {
-        accounts.setEnvelope(a.device.id, requireBlob(body, "envelope", MAX_KEY_BLOB));
-        return { ok: true };
+      // A device's own copy of the account key. Locking it (Face ID…) or unlocking it swaps its token too.
+      "device.envelope": (a, body, req) => {
+        const raw = body["lock"];
+        if (raw !== undefined && raw !== null && !(DEVICE_LOCKS as readonly unknown[]).includes(raw)) {
+          throw fail("bad_request", 400, `\`lock\` is ${DEVICE_LOCKS.map((l) => `"${l}"`).join(" or ")}, or null to unlock.`);
+        }
+        const lock = raw === undefined ? undefined : (raw as DeviceLock | null);
+        const tokenHash = optBlob(body, "tokenHash", 32);
+        if (lock !== undefined && !tokenHash) throw fail("bad_request", 400, "Locking or unlocking a device also swaps its token: send `tokenHash` for the new one.");
+        if (tokenHash && tokenHash.length !== 32) throw fail("bad_request", 400, "`tokenHash` is a 32-byte SHA-256 hash.");
+        accounts.setEnvelope(a.device.id, requireBlob(body, "envelope", MAX_KEY_BLOB), { lock, tokenHash });
+        if (lock !== undefined && lock !== a.device.lock) {
+          record(a, req, lock ? "device.lock" : "device.unlock", { ref: a.device.label ? { sealed: a.device.label, ctx: ctx.deviceLabel } : null, note: lock ?? undefined });
+        }
+        return { ok: true, lock: lock === undefined ? a.device.lock : lock };
       },
 
       "device.label": (a, body) => {
@@ -714,13 +823,14 @@ export class Api {
           throw fail("confirm_delete", 400, "Deleting your account deletes everything in it, for good.", `Confirm by sending confirm: "${a.account.id}".`);
         }
         for (const box of vault.boxes(a.account.id)) hub.closeWhere((w) => w.boxId === box.id);
+        this.closeStreamsOf(a.account.id);
         accounts.deleteAccount(a.account.id);
         this.log(req, { accountId: null, actor: "anonymous", action: "account.delete", note: a.account.id });
         return { deleted: a.account.id };
       },
 
       boxes: (a) => ({
-        boxes: vault.boxes(a.account.id).map((b) => this.boxSummary(b)),
+        boxes: this.reachableSummaries(a.account.id),
         quota: { used: vault.accountBytes(a.account.id), limit: vault.accountQuota(a.account.id) },
       }),
 
@@ -764,10 +874,12 @@ export class Api {
         return { shredded: box.id };
       },
 
-      tapes: (a, body) => ({ tapes: tapes.list(boxFrom(a, body).id).map((t) => tapeView(t, tapes.state(t))) }),
+      tapes: (a, body) => ({ tapes: tapes.list(sharing.reach(a.account.id, requireString(body, "box", 64)).box.id, a.account.id).map((t) => tapeView(t, tapes.state(t))) }),
 
+      // Tapes for boxes shared with you work too, for your own apps (and never write more than you may).
       "tape.create": (a, body, req) => {
-        const box = boxFrom(a, body);
+        const reach = sharing.reach(a.account.id, requireString(body, "box", 64));
+        const box = reach.box;
         const kind = optString(body, "kind") ?? "app";
         if (kind !== "app" && kind !== "assistant") throw fail("bad_request", 400, '`kind` is "app" or "assistant".');
         const idle = optDuration(body, "idle");
@@ -779,29 +891,116 @@ export class Api {
           label,
           kind,
           read: optBoolean(body, "read"),
-          write: optBoolean(body, "write"),
+          write: reach.write ? optBoolean(body, "write") : false,
           idleMs: idle,
           expiresAt: expires ? this.now() + expires : null,
         });
-        record(a, req, "tape.create", { boxId: box.id, ref: { sealed: label, ctx: ctx.tapeLabel(box.id) } });
+        if (!reach.member) record(a, req, "tape.create", { boxId: box.id, ref: { sealed: label, ctx: ctx.tapeLabel(box.id) } });
+        else record(a, req, "tape.create", { ref: { sealed: label, ctx: ctx.tapeLabel(box.id) } });
         return { tape: tapeView(tape, "active") };
       },
 
       "tape.revoke": (a, body, req) => {
         const tape = tapes.revoke(tapes.own(a.account.id, requireString(body, "id", 64)).id);
         hub.closeWhere((w) => w.tapeId === tape.id);
-        record(a, req, "tape.revoke", { boxId: tape.boxId, ref: tape.label ? { sealed: tape.label, ctx: ctx.tapeLabel(tape.boxId) } : null });
+        const owned = vault.box(tape.boxId)?.accountId === a.account.id;
+        record(a, req, "tape.revoke", { boxId: owned ? tape.boxId : null, ref: tape.label ? { sealed: tape.label, ctx: ctx.tapeLabel(tape.boxId) } : null });
         return { tape: tapeView(tape, tapes.state(tape)) };
       },
 
+      // Your log, plus what happened in boxes shared with you (filed under their owners).
       log: (a, body) => {
-        const box = optString(body, "box", 64);
-        const entries = audit.read(a.account.id, {
-          boxId: box ? vault.ownBox(a.account.id, box).id : undefined,
-          limit: optNumber(body, "limit"),
-          before: optNumber(body, "before"),
+        const boxId = optString(body, "box", 64);
+        const page = { limit: optNumber(body, "limit"), before: optNumber(body, "before") };
+        const shared = sharing.membershipsOf(a.account.id).map((m) => m.boxId);
+        let entries;
+        if (boxId) {
+          const reach = sharing.reach(a.account.id, boxId);
+          entries = reach.member ? audit.read(reach.box.accountId, { ...page, boxId, actions: SHARED_LOG_ACTIONS }) : audit.read(a.account.id, { ...page, boxId });
+        } else {
+          entries = audit.read(a.account.id, { ...page, sharedBoxes: shared, sharedActions: SHARED_LOG_ACTIONS });
+        }
+        return { entries, actors: this.actorsFor(a.account.id, entries) };
+      },
+
+      // ── Sharing boxes with people ──
+
+      "share.create": (a, body, req) => {
+        const box = boxFrom(a, body);
+        const label = optBlob(body, "label", MAX_LABEL) ?? null;
+        const share = sharing.createShare(box, {
+          lookup: requireBlob(body, "lookup", 32, 32),
+          envelope: requireBlob(body, "envelope", MAX_PROFILE),
+          label,
+          write: optBoolean(body, "write") ?? true,
+          ttlMs: optDuration(body, "ttl"),
+          ownerLabel: body["ownerLabel"] === undefined ? undefined : (optBlob(body, "ownerLabel", MAX_LABEL) ?? null),
         });
-        return { entries, actors: this.actorsFor(a.account.id, entries.map((e) => e.actor)) };
+        record(a, req, "share.create", { boxId: box.id, ref: label ? { sealed: label, ctx: ctx.shareLabel(box.id) } : null, note: share.write ? "they can change it" : "read only" });
+        return { share: { id: share.id, label: b64(share.label), write: share.write, createdAt: share.createdAt, expiresAt: share.expiresAt } };
+      },
+
+      "share.revoke": (a, body, req) => {
+        const share = sharing.revokeShare(a.account.id, requireString(body, "id", 64));
+        record(a, req, "share.revoke", { boxId: share.boxId, ref: share.label ? { sealed: share.label, ctx: ctx.shareLabel(share.boxId) } : null });
+        return { revoked: share.id };
+      },
+
+      // You opened a share link: what it's for (still sealed by a key only the link has).
+      "share.view": (a, body, req) => {
+        const share = this.countMisses(req, () => sharing.findShare(sha256(requireBlob(body, "secret", 32, 32))) ?? (() => { throw noShare(); })());
+        return {
+          box: share.boxId,
+          envelope: b64(share.envelope),
+          write: share.write,
+          expiresAt: share.expiresAt,
+          own: share.accountId === a.account.id,
+          member: Boolean(sharing.member(share.boxId, a.account.id)),
+        };
+      },
+
+      "share.accept": (a, body, req) => {
+        const share = this.countMisses(req, () => sharing.findShare(sha256(requireBlob(body, "secret", 32, 32))) ?? (() => { throw noShare(); })());
+        const member = sharing.accept(share, a.account.id, {
+          id: requireClientId(body, "id", "mem"),
+          key: requireBlob(body, "key", MAX_KEY_BLOB),
+          name: requireBlob(body, "name", MAX_LABEL),
+          label: optBlob(body, "label", MAX_LABEL) ?? null,
+        });
+        this.log(req, {
+          accountId: share.accountId,
+          boxId: share.boxId,
+          actor: a.actor,
+          action: "member.join",
+          note: member.write ? "can change it" : "read only",
+        });
+        return { box: this.memberSummary(vault.box(share.boxId)!, member) };
+      },
+
+      // The owner takes someone off a box.
+      "member.remove": (a, body, req) => {
+        const box = boxFrom(a, body);
+        const member = sharing.memberById(requireString(body, "member", 64));
+        if (!member || member.boxId !== box.id) throw fail("no_such_member", 404, "That person isn't in this box.");
+        this.cutOff(member);
+        record(a, req, "member.remove", { boxId: box.id, ref: member.label ? { sealed: member.label, ctx: ctx.memberLabel(box.id, member.id) } : null });
+        return { removed: member.id };
+      },
+
+      // You leave a box someone shared with you.
+      "member.leave": (a, body, req) => {
+        const { box, member } = sharing.reach(a.account.id, requireString(body, "box", 64));
+        if (!member) throw fail("own_box", 409, "That's your own box: you can't leave it.", "Shred it instead, or take people off it.");
+        this.cutOff(member);
+        this.log(req, { accountId: box.accountId, boxId: box.id, actor: a.actor, action: "member.leave" });
+        return { left: box.id };
+      },
+
+      "member.rename": (a, body) => {
+        const { member } = sharing.reach(a.account.id, requireString(body, "box", 64));
+        if (!member) throw fail("own_box", 409, "That's your own box: rename it with box.rename.");
+        sharing.rename(member.id, requireBlob(body, "name", MAX_LABEL));
+        return { ok: true };
       },
 
       docks: (a) => ({
@@ -975,7 +1174,7 @@ export class Api {
           appKey: b64(request.appKey),
           prompt: request.prompt,
           returning: active ? { scopes: active.scopes, box: active.boxId } : null,
-          box: box && vault.box(box)?.accountId === a.account.id ? box : null,
+          box: box && sharing.canReach(a.account.id, box) ? box : null,
         };
       },
 
@@ -988,7 +1187,12 @@ export class Api {
           return { redirect: oauth.redirectWith(request.redirectUri, { error: "access_denied", error_description: "You said no.", state: request.state }) };
         }
         const wantsBox = request.scopes.includes("box");
-        const boxId = wantsBox ? vault.ownBox(a.account.id, requireString(body, "box", 64)).id : null;
+        let boxId: string | null = null;
+        if (wantsBox) {
+          const reach = sharing.reach(a.account.id, requireString(body, "box", 64));
+          if (!reach.write) throw fail("read_only", 403, "That box was shared with you read-only, so an app can't keep its data there.", "Pick another box, or a new one.");
+          boxId = reach.box.id;
+        }
         const bundle = optBlob(body, "bundle", 4096) ?? null;
         if (request.appKey && !bundle) throw fail("bad_request", 400, "This app takes sealed data, so send its bundle (sealed to its key).");
         if (!request.appKey && bundle) throw fail("bad_request", 400, "This app didn't send a key, so it can't take a sealed bundle.");
@@ -1011,26 +1215,48 @@ export class Api {
     };
   }
 
-  /** Guessing pairing codes counts as failing, like guessing tokens. */
+  /** Guessing pairing codes or share links counts as failing, like guessing tokens. */
   private countMisses<T>(req: ApiRequest, fn: () => T): T {
     try {
       return fn();
     } catch (err) {
-      if (err instanceof CardboardError && err.code === "no_such_pairing") this.limiter.fail(req.ip, this.now());
+      if (err instanceof CardboardError && (err.code === "no_such_pairing" || err.code === "no_such_share")) this.limiter.fail(req.ip, this.now());
       throw err;
     }
   }
 
-  /** Enough about each actor in a log for your device to name it (labels stay sealed). */
-  private actorsFor(accountId: string, actors: string[]) {
+  /**
+   * Enough about each actor in a log for your device to name it (labels stay
+   * sealed). Someone else in a shared box is named by what that box's people
+   * call them, sealed by the box key; never by their device or app names.
+   */
+  private actorsFor(accountId: string, entries: Array<{ actor: string; box: string | null }>) {
     const out: Record<string, unknown> = {};
-    for (const actor of new Set(actors)) {
+    const person = (otherAccount: string, boxId: string | null, via: "device" | "app") => {
+      const box = boxId ? this.ctx.vault.box(boxId) : undefined;
+      if (!box || !this.ctx.sharing.canReach(accountId, box.id)) return null;
+      if (box.accountId === otherAccount) return { kind: "person", via, box: box.id, label: b64(this.ctx.sharing.ownerLabel(box.id)), labelCtx: ctx.ownerLabel(box.id), owner: true };
+      const member = this.ctx.sharing.formerOrCurrent(box.id, otherAccount);
+      return member ? { kind: "person", via, box: box.id, label: b64(member.label), labelCtx: ctx.memberLabel(box.id, member.id), owner: false } : null;
+    };
+    const seen = new Set<string>();
+    for (const { actor, box } of entries) {
+      if (seen.has(actor)) continue;
+      seen.add(actor);
       if (actor.startsWith("device:")) {
         const device = this.ctx.accounts.device(actor.slice(7));
-        out[actor] = device && device.accountId === accountId ? { kind: "device", deviceKind: device.kind, label: b64(device.label) } : { kind: "device", gone: true };
+        if (device && device.accountId !== accountId) {
+          out[actor] = person(device.accountId, box, "device") ?? { kind: "device", gone: true };
+          continue;
+        }
+        out[actor] = device ? { kind: "device", deviceKind: device.kind, label: b64(device.label) } : { kind: "device", gone: true };
       } else if (actor.startsWith("tape:")) {
         const tape = this.ctx.tapes.get(actor.slice(5));
-        if (!tape || tape.accountId !== accountId) {
+        if (tape && tape.accountId !== accountId) {
+          out[actor] = person(tape.accountId, tape.boxId, "app") ?? { kind: "tape", gone: true };
+          continue;
+        }
+        if (!tape) {
           out[actor] = { kind: "tape", gone: true };
           continue;
         }
@@ -1050,6 +1276,7 @@ export class Api {
    */
   private dockAccess(a: AppAuth, body: Body, want: "send" | "receive", req: ApiRequest): { dock: Dock; berth: Berth } {
     const { docks } = this.ctx;
+    if (a.member) throw sharedNoDocks();
     const idx = requireIndex(body, "dock");
     const dock = docks.find(a.account.id, idx);
     const berth = dock ? docks.berth(dock.id, a.box.id) : undefined;
@@ -1085,12 +1312,15 @@ export class Api {
 
       introduce: (a, body, req) => {
         requireWrite(a.tape);
+        // It's someone else's box: their app already introduced it.
+        if (a.member) return { ok: true, skipped: "shared box" };
         vault.setProfile(a.box.id, requireBlob(body, "profile", MAX_PROFILE));
         this.log(req, { accountId: a.account.id, boxId: a.box.id, actor: a.actor, action: "introduce" });
         return { ok: true };
       },
 
       "dock.status": (a, body) => {
+        if (a.member) throw sharedNoDocks();
         const idx = requireIndex(body, "dock");
         const dock = docks.find(a.account.id, idx);
         const berth = dock ? docks.berth(dock.id, a.box.id) : undefined;
@@ -1186,6 +1416,36 @@ export class Api {
     return this.lastShake;
   }
 
+  /**
+   * A snapshot of the database in <data>/backups, keeping the newest 10. Only
+   * sealed data is inside, so a copy can live anywhere; restoring also needs
+   * the server key file (for sign-in keys and apps' private IDs, not data).
+   */
+  backup(): { file: string; bytes: number; kept: number } {
+    const { db, info } = this.ctx;
+    const dir = join(info.dataDir, "backups");
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const stamp = new Date(this.now()).toISOString().replace(/[:.]/g, "-");
+    const file = join(dir, `cardboard-${stamp}.db`);
+    db.prepare("VACUUM INTO ?").run(file);
+    setMeta(db, "last_backup_at", String(this.now()));
+    const old = readdirSync(dir)
+      .filter((f) => /^cardboard-.*\.db$/.test(f))
+      .sort()
+      .slice(0, -KEEP_BACKUPS);
+    for (const f of old) rmSync(join(dir, f));
+    return { file, bytes: statSync(file).size, kept: KEEP_BACKUPS };
+  }
+
+  /** Makes a backup if the last one is older than `everyMs` (checked by a timer; survives restarts). */
+  backupIfDue(everyMs: number): boolean {
+    const last = Number(getMeta(this.ctx.db, "last_backup_at") ?? 0);
+    if (this.now() - last < everyMs) return false;
+    this.backup();
+    this.ctx.audit.record({ accountId: null, actor: "system", action: "backup", note: "scheduled" });
+    return true;
+  }
+
   /** What the host can know about each person: counts, sizes and dates. */
   hostAccountsView() {
     const { accounts, vault } = this.ctx;
@@ -1253,6 +1513,7 @@ export class Api {
         if (!accounts.account(id)) throw fail("no_such_account", 404, "There's no account with that id.");
         if (body["confirm"] !== id) throw fail("confirm_delete", 400, "Deleting an account deletes everything in it, for good.", `Confirm by sending confirm: "${id}".`);
         for (const box of vault.boxes(id)) hub.closeWhere((w) => w.boxId === box.id);
+        this.closeStreamsOf(id);
         accounts.deleteAccount(id);
         host(req, "account.delete", id);
         return { deleted: id };
@@ -1273,19 +1534,9 @@ export class Api {
       "host.shake": () => undefined,
 
       "host.backup": (_body, req) => {
-        const dir = join(info.dataDir, "backups");
-        mkdirSync(dir, { recursive: true, mode: 0o700 });
-        const stamp = new Date(this.now()).toISOString().replace(/[:.]/g, "-");
-        const file = join(dir, `cardboard-${stamp}.db`);
-        db.prepare("VACUUM INTO ?").run(file);
-        setMeta(db, "last_backup_at", String(this.now()));
-        const old = readdirSync(dir)
-          .filter((f) => /^cardboard-.*\.db$/.test(f))
-          .sort()
-          .slice(0, -KEEP_BACKUPS);
-        for (const f of old) rmSync(join(dir, f));
+        const result = this.backup();
         host(req, "backup");
-        return { file, bytes: statSync(file).size, kept: KEEP_BACKUPS };
+        return result;
       },
     };
   }
@@ -1319,6 +1570,10 @@ function dockRef(dock: Dock) {
 function directions(b: { send: boolean; receive: boolean } | undefined): string | undefined {
   if (!b) return undefined;
   return b.send && b.receive ? "send and receive" : b.send ? "send" : "receive";
+}
+
+function sharedNoDocks() {
+  return fail("dock_shared_box", 403, "Docks connect boxes you own, and this app's box was shared with you.", "Ask the box's owner to dock their app instead.");
 }
 
 function slowDown() {

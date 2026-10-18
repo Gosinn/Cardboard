@@ -277,6 +277,13 @@ button.link {
   border: 0;
   font-weight: 400;
   padding: 6px 10px;
+  color: var(--muted);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+nav button.link {
+  text-decoration: none;
 }
 
 button.tiny {

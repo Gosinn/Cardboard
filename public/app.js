@@ -2,7 +2,8 @@
 // browser, so everything is opened right here: the server only ever sends
 // sealed bytes. Anything that came from an app (key names, values, labels) is
 // inserted with textContent, never as HTML.
-import { cleanInvite, recoverWithFriends, recoverWithKit, signUp, startPairing, unlock } from "/lib/client/account.ts";
+import { cleanInvite, deviceLock, recoverWithFriends, recoverWithKit, signUp, startPairing, unlock } from "/lib/client/account.ts";
+import { createPasskey, hasBuiltInPasskeys, passkeyBlocker, passkeySecret } from "/lib/client/passkey.ts";
 import { Rpc } from "/lib/client/rpc.ts";
 import { browserName, browserStore, makeKey } from "/device.js";
 
@@ -15,6 +16,8 @@ const ORIGIN = location.origin;
 let account = null;
 /** A sign-in request from an app, waiting for this browser to be signed in. */
 let pendingConnect = null;
+/** A share link someone sent you (its code), waiting for this browser to be signed in. */
+let pendingShare = null;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -226,6 +229,153 @@ async function signOutHere() {
 
 document.getElementById("signout").addEventListener("click", signOutHere);
 
+// ── Locking (Face ID…) ──────────────────────────────────────────────────────
+
+const lockButton = document.getElementById("lock");
+let lastActive = Date.now();
+for (const event of ["pointerdown", "keydown", "wheel", "touchstart"]) addEventListener(event, () => (lastActive = Date.now()), { passive: true });
+
+/** Drops the opened account (and its keys) from this page and shows the lock screen. */
+function lockNow() {
+  if (!account?.lock) return;
+  account = null;
+  delete modal.dataset.sticky;
+  closeModal(false);
+  render();
+}
+lockButton.addEventListener("click", lockNow);
+
+function lockIfIdle() {
+  const idle = account?.lock?.idleMs;
+  // A recovery kit on screen waits for you to save it first.
+  if (idle && Date.now() - lastActive > idle && !modal.dataset.sticky) lockNow();
+}
+setInterval(lockIfIdle, 15_000);
+document.addEventListener("visibilitychange", lockIfIdle);
+
+const IDLE_CHOICES = [
+  [60_000, "1 minute"],
+  [5 * 60_000, "5 minutes"],
+  [15 * 60_000, "15 minutes"],
+  [60 * 60_000, "1 hour"],
+  [4 * 60 * 60_000, "4 hours"],
+  [null, "only when I press Lock"],
+];
+
+function renderLocked() {
+  nav.hidden = true;
+  const logo = document.querySelector(".brand svg").cloneNode(true);
+  const status = h("div");
+  const button = h("button", { type: "button" }, "Unlock");
+  button.addEventListener("click", () =>
+    withBusy(button, async () => {
+      status.replaceChildren();
+      try {
+        account = await unlock(browserStore, { passkey: passkeySecret });
+        lastActive = Date.now();
+        render();
+      } catch (err) {
+        if (err.code === "bad_device") {
+          await browserStore.clear();
+          return render();
+        }
+        status.replaceChildren(errorBox(err));
+      }
+    }),
+  );
+  const other = h("button", { type: "button", class: "link small" }, "Lost the passkey? Sign in another way");
+  other.addEventListener("click", async () => {
+    if (!confirm("Forget this browser's sign-in and start again? You'd pair it from another device or use your recovery kit. Then remove its old entry from your device list.")) return;
+    await browserStore.clear();
+    render();
+  });
+  fill(
+    app,
+    h(
+      "section",
+      { class: "card stack login" },
+      h("div", { class: "row" }, logo, h("h1", {}, "Cardboard is locked")),
+      pendingConnect
+        ? h("p", {}, "An app wants you to sign in with Cardboard. Unlock first.")
+        : pendingShare
+          ? h("p", {}, "Someone shared a box with you. Unlock first, then you can join it.")
+        : h("p", { class: "muted" }, "Unlock with Face ID, Touch ID, Windows Hello or your passkey. Without it, this browser can't open anything, even with its storage copied."),
+      h("div", { class: "row" }, button),
+      status,
+      h("div", {}, other),
+    ),
+  );
+  button.focus();
+}
+
+/** The "This browser" card on You: lock it with a passkey, or change how it locks. */
+async function lockCard() {
+  const status = h("div");
+  if (!account.lock) {
+    const blocker = await passkeyBlocker();
+    if (blocker) return h("section", { class: "card stack" }, h("h2", {}, "Lock with Face ID"), h("p", { class: "small muted" }, blocker));
+    const builtIn = await hasBuiltInPasskeys();
+    const button = h("button", { type: "button" }, "Lock with Face ID");
+    button.addEventListener("click", () =>
+      withBusy(button, async () => {
+        status.replaceChildren();
+        try {
+          const me = await account.me();
+          const passkey = await createPasskey({ name: `Cardboard on ${me.devices.find((d) => d.current)?.name ?? browserName()}`, site: `Cardboard (${location.host})` });
+          await account.lockWithPasskey(passkey);
+          lastActive = Date.now();
+          render();
+        } catch (err) {
+          status.replaceChildren(errorBox(err));
+        }
+      }),
+    );
+    return h(
+      "section",
+      { class: "card stack" },
+      h("h2", {}, "Lock with Face ID"),
+      h(
+        "p",
+        { class: "small" },
+        "Make a passkey for this browser. After that, opening your Cardboard here takes your face, fingerprint or PIN, and it locks again when you leave it alone. Someone with your unlocked phone or laptop, or a copy of its storage, gets nothing.",
+      ),
+      builtIn ? null : h("p", { class: "small muted" }, "This device has no built-in Face ID or fingerprint, so your browser will offer a security key or your phone instead."),
+      h("div", { class: "row" }, button),
+      status,
+    );
+  }
+  const idle = h(
+    "select",
+    { "aria-label": "Lock again after" },
+    IDLE_CHOICES.map(([ms, label]) => h("option", { value: String(ms), selected: ms === account.lock.idleMs }, label)),
+  );
+  idle.addEventListener("change", async () => {
+    try {
+      await account.setLockIdle(idle.value === "null" ? null : Number(idle.value));
+      status.replaceChildren(h("span", { class: "chip ok" }, "Saved"));
+    } catch (err) {
+      status.replaceChildren(errorBox(err));
+    }
+  });
+  const remove = h("button", { type: "button", class: "secondary tiny" }, "Remove the lock");
+  remove.addEventListener("click", () =>
+    withBusy(remove, async () => {
+      if (!confirm("Take the Face ID lock off this browser? Anyone using it could open your Cardboard again.")) return;
+      await account.removeLock();
+      render();
+    }),
+  );
+  return h(
+    "section",
+    { class: "card stack" },
+    h("h2", {}, "Locked with Face ID ", h("span", { class: "chip ok" }, "on")),
+    h("p", { class: "small" }, "Opening your Cardboard in this browser takes your passkey. Your data never leaves sealed form without it."),
+    h("label", { class: "row small" }, "Lock again after", idle),
+    h("div", { class: "row" }, h("button", { type: "button", class: "secondary tiny", onclick: lockNow }, "Lock now"), remove),
+    status,
+  );
+}
+
 // ── Getting in ──────────────────────────────────────────────────────────────
 
 function hashParam(name) {
@@ -248,7 +398,9 @@ function renderWelcome(info) {
   const remembers = browserStore.remembers ? null : h("p", { class: "error small" }, "This browser won't remember you (private window?). You'll need to sign in again next time.");
   const intro = pendingConnect
     ? h("p", {}, h("strong", {}, pendingConnect.appName ?? "An app"), " wants you to sign in with Cardboard. First, open your Cardboard in this browser.")
-    : h("p", { class: "muted" }, "Your private, end-to-end encrypted deposit box. Your keys live on your devices: whoever runs this server can't read anything you keep here.");
+    : pendingShare
+      ? h("p", {}, "Someone shared a box with you. First, open your Cardboard in this browser. No account here yet? Ask whoever runs this Cardboard for an invite, then open the link again.")
+      : h("p", { class: "muted" }, "Your private, end-to-end encrypted deposit box. Your keys live on your devices: whoever runs this server can't read anything you keep here.");
 
   const panes = {
     invite: inviteForm(invite),
@@ -448,6 +600,7 @@ async function renderShelf() {
       b.profile.description ? h("div", { class: "muted small" }, b.profile.description, b.profile.version ? ` · v${b.profile.version}` : "") : null,
       summary,
       b.docks.length ? h("div", { class: "row" }, b.docks.map((d) => h("span", { class: `chip ${d.waiting ? "warn" : ""}` }, `⚓ ${docks.docks.find((x) => x.id === d.dock)?.name ?? "dock"}`))) : null,
+      peopleChip(b),
       chips,
       h("div", { class: "stats" }, `${plural(b.items, "item")} · ${bytes(b.bytes)} · ${plural(b.tapes.filter((t) => t.state === "active").length, "tape")} · ${b.lastActivity ? `active ${ago(b.lastActivity)}` : "never used"}`),
     );
@@ -472,6 +625,12 @@ async function renderShelf() {
     insightsBox,
     insights.length ? [h("h2", {}, "Worth a look"), insights.map(insightCard)] : [h("h2", {}, "All good"), h("p", { class: "muted" }, "Nothing needs fixing right now.")],
   );
+}
+
+function peopleChip(b) {
+  if (b.shared) return h("div", { class: "row" }, h("span", { class: "chip" }, `Shared by ${b.shared.from}${b.shared.write ? "" : " · read only"}`));
+  if (b.people.members.length) return h("div", { class: "row" }, h("span", { class: "chip" }, `Shared with ${b.people.members.map((m) => m.name).join(", ")}`));
+  return null;
 }
 
 function newBoxCard() {
@@ -508,6 +667,7 @@ async function renderBox(name, openKey) {
       h("a", { href: "#/", class: "small" }, "← Shelf"),
       h("h1", { class: "mono" }, box.name),
       h("div", { class: "muted" }, `${plural(box.items, "item")} · ${bytes(box.bytes)} · made ${ago(box.createdAt)}`),
+      peopleChip(box),
     ),
   );
 
@@ -554,10 +714,167 @@ async function renderBox(name, openKey) {
 
   fill(app, 
     head,
-    h("div", { class: "two" }, h("div", {}, inside, await browser(box, openKey)), h("div", {}, await tapesSection(box), activitySection(log))),
-    h("div", { class: "two" }, settingsSection(box), timeMachine(box.name)),
+    h("div", { class: "two" }, h("div", {}, inside, await browser(box, openKey)), h("div", {}, await peopleSection(box), await tapesSection(box), activitySection(log))),
+    box.shared ? null : h("div", { class: "two" }, settingsSection(box), timeMachine(box.name)),
     dangerZone(box),
   );
+}
+
+// ── Sharing a box with people ───────────────────────────────────────────────
+
+const SHARE_FOR = [
+  ["1d", "1 day"],
+  ["3d", "3 days"],
+  ["7d", "a week"],
+  ["30d", "30 days"],
+];
+
+async function peopleSection(box) {
+  const status = h("div");
+  const member = (m) => {
+    const remove = box.shared ? null : h("button", { type: "button", class: "secondary tiny" }, "Take off");
+    remove?.addEventListener("click", () =>
+      withBusy(remove, async () => {
+        if (!confirm(`Take ${m.name} off ${box.name}? They can't reach it any more and their apps are cut off. (Anything they already saw, they keep.)`)) return;
+        await account.removeMember(box.name, m.id);
+        render();
+      }),
+    );
+    return h(
+      "li",
+      { class: "row spread" },
+      h("div", {}, h("strong", {}, m.name), m.you ? h("span", { class: "chip ok" }, "you") : null, h("div", { class: "muted small" }, `${m.write ? "can change it" : "read only"} · ${plural(m.apps, "app")} · joined ${ago(m.joinedAt)}`)),
+      remove,
+    );
+  };
+
+  if (box.shared) {
+    const leave = h("button", { type: "button", class: "secondary" }, "Leave this box");
+    leave.addEventListener("click", () =>
+      withBusy(leave, async () => {
+        if (!confirm(`Leave ${box.name}? You'd need a new link from ${box.shared.from} to come back.`)) return;
+        await account.leaveBox(box.name);
+        location.hash = "#/";
+      }),
+    );
+    return h(
+      "section",
+      { class: "card stack" },
+      h("h2", {}, "People"),
+      h("ul", { class: "list" }, h("li", {}, h("strong", {}, box.shared.from), h("div", { class: "muted small" }, "owner: shared it with you")), box.people.members.map(member)),
+      h("p", { class: "muted small" }, box.shared.write ? "You can read and change everything here, and so can your apps." : "You can read everything here, but not change it."),
+      h("div", { class: "row" }, leave),
+    );
+  }
+
+  const links = box.people.links.map((l) => {
+    const cancel = h("button", { type: "button", class: "secondary tiny" }, "Cancel");
+    cancel.addEventListener("click", () =>
+      withBusy(cancel, async () => {
+        await account.cancelShare(l.id);
+        render();
+      }),
+    );
+    return h("li", { class: "row spread" }, h("div", { class: "muted small" }, `Link${l.label ? ` for ${l.label}` : ""}, not opened yet · ${l.write ? "can change it" : "read only"} · works until ${new Date(l.expiresAt).toLocaleDateString()}`), cancel);
+  });
+
+  const { profile } = await account.me();
+  const forWhom = h("input", { placeholder: "e.g. Anna", maxlength: 60 });
+  const as = h("input", { value: profile.name || "", placeholder: "e.g. Gosinn", maxlength: 60, required: true });
+  const write = h("input", { type: "checkbox", checked: true });
+  const ttl = h("select", {}, SHARE_FOR.map(([v, label]) => h("option", { value: v, selected: v === "3d" }, label)));
+  const form = h(
+    "form",
+    { class: "stack" },
+    h("div", { class: "two" }, h("label", { class: "field" }, "Who's it for (just for you)", forWhom), h("label", { class: "field" }, "Your name, as they'll see it", as)),
+    h("label", { class: "check small" }, write, "They can change things too (not just look)"),
+    h("label", { class: "row small" }, "The link works for", ttl),
+    h("button", { type: "submit" }, "Make a share link"),
+    status,
+  );
+  onSubmit(form, status, async () => {
+    const result = await account.shareBox(box.name, { label: forWhom.value.trim() || undefined, as: as.value.trim(), write: write.checked, expires: ttl.value });
+    showShareLink(box.name, forWhom.value.trim(), result, render);
+  });
+  return h(
+    "section",
+    { class: "card stack" },
+    h("h2", {}, "People"),
+    box.people.members.length || links.length ? h("ul", { class: "list" }, box.people.members.map(member), links) : h("p", { class: "muted small" }, "Only you. Share this box with family or a friend who has a Cardboard account here: you'll both see (and your apps will both use) the same data."),
+    h("details", {}, h("summary", {}, "Share with someone"), form),
+  );
+}
+
+function showShareLink(boxName, forWhom, result, onDone) {
+  const send = navigator.share
+    ? h("button", { type: "button", class: "secondary", onclick: () => navigator.share({ title: `Join ${boxName} on Cardboard`, url: result.link }).catch(() => {}) }, "Send…")
+    : null;
+  openModal(
+    onDone,
+    h("h2", {}, `Share ${boxName}${forWhom ? ` with ${forWhom}` : ""}`),
+    h("p", {}, "Send this link privately (Signal, iMessage, in person). Whoever opens it first, with their own Cardboard here, joins the box. Then it stops working."),
+    h("code", { class: "secret" }, result.link),
+    h("div", { class: "row" }, copyButton(result.link, "Copy link"), send),
+    h("p", { class: "muted small" }, `The secret is the part after #, which browsers never send to a server, so Cardboard can't open it either. It works until ${new Date(result.expiresAt).toLocaleString()}.`),
+    h("div", { class: "row" }, h("button", { type: "button", onclick: () => closeModal() }, "Done")),
+  );
+}
+
+/** Someone sent you a share link. */
+async function renderJoin(code) {
+  nav.hidden = false;
+  const done = (hash) => {
+    pendingShare = null;
+    location.hash = hash;
+  };
+  let preview;
+  try {
+    preview = await account.viewShare(code);
+  } catch (err) {
+    pendingShare = null;
+    fill(app, h("section", { class: "card stack login" }, h("h1", {}, "That link doesn't work"), errorBox(err), h("a", { href: "#/" }, "Go to your shelf")));
+    return;
+  }
+  if (preview.own || preview.member) {
+    pendingShare = null;
+    const box = (await account.boxes()).find((b) => b.id === preview.boxId);
+    fill(
+      app,
+      h(
+        "section",
+        { class: "card stack login" },
+        h("h1", {}, preview.own ? "That's your own box" : "You're already in this box"),
+        h("p", { class: "muted" }, preview.own ? "Send the link to the person you want to share it with." : "It's on your shelf."),
+        box ? h("a", { href: `#/box/${encodeURIComponent(box.name)}` }, `Open ${box.name}`) : h("a", { href: "#/" }, "Go to your shelf"),
+      ),
+    );
+    return;
+  }
+  const { profile } = await account.me();
+  const as = h("input", { value: profile.name || "", placeholder: "e.g. Anna", maxlength: 60, required: true });
+  const status = h("div");
+  const join = h("button", { type: "submit" }, "Join");
+  const no = h("button", { type: "button", class: "secondary", onclick: () => done("#/") }, "No thanks");
+  const form = h(
+    "form",
+    { class: "card stack login" },
+    h("h1", {}, h("span", {}, preview.from), " wants to share ", h("span", { class: "mono" }, preview.name), " with you"),
+    h(
+      "ul",
+      { class: "list perms" },
+      h("li", {}, h("strong", {}, preview.write ? "You can read and change it" : "You can read it"), h("div", { class: "muted small" }, preview.write ? "So can your apps, if you connect them to it." : "Changes stay theirs to make.")),
+      h("li", {}, h("strong", {}, "Everyone in it sees what changes, and who changed it"), h("div", { class: "muted small" }, "By the name you give below. Your devices and other boxes stay private.")),
+      h("li", {}, h("strong", {}, "Still end-to-end encrypted"), h("div", { class: "muted small" }, "The box key comes to you sealed; whoever runs this server can't open it.")),
+    ),
+    h("label", { class: "field" }, "Your name, as they'll see it", as),
+    h("div", { class: "row" }, join, no),
+    status,
+  );
+  onSubmit(form, status, async () => {
+    const box = await account.joinShare(code, { as: as.value.trim() });
+    done(`#/box/${encodeURIComponent(box.name)}`);
+  });
+  fill(app, form);
 }
 
 async function browser(info, openKey) {
@@ -786,6 +1103,14 @@ function dangerZone(box) {
       setTimeout(() => URL.revokeObjectURL(url), 1000);
     }),
   );
+  if (box.shared) {
+    return h(
+      "section",
+      { class: "card stack danger-zone" },
+      h("h2", {}, "Moving day"),
+      h("div", { class: "row" }, exportBtn, h("span", { class: "muted small" }, "Everything, opened, in plain JSON. Keep the file somewhere private.")),
+    );
+  }
   const confirmName = h("input", { placeholder: box.name, "aria-label": "Type the box name to confirm" });
   const shredBtn = h("button", { type: "button", class: "danger" }, "Shred this box");
   const status = h("div");
@@ -805,7 +1130,7 @@ function dangerZone(box) {
     { class: "card stack danger-zone" },
     h("h2", {}, "Moving day & shredding"),
     h("div", { class: "row" }, exportBtn, h("span", { class: "muted small" }, "Everything, opened, in plain JSON. Keep the file somewhere private.")),
-    h("p", { class: "small" }, "Shredding deletes the box's key with everything else, so every item, version, tape and log line is gone for good, backups included. Type the name to confirm."),
+    h("p", { class: "small" }, `Shredding deletes the box's key with everything else, so every item, version, tape and log line is gone for good, backups included${box.people.members.length ? ", for everyone you share it with too" : ""}. Type the name to confirm.`),
     h("div", { class: "row" }, confirmName, shredBtn),
     status,
   );
@@ -1166,6 +1491,16 @@ async function renderConnect(id) {
       return req.site;
     }
   })();
+  // An app can keep its data in a box someone shared with you, so you both use the same data.
+  const sharedBoxes = req.scopes.includes("box") ? (await account.boxes()).filter((b) => b.shared?.write) : [];
+  const where = sharedBoxes.length
+    ? h(
+        "select",
+        { "aria-label": "Where it keeps its data" },
+        h("option", { value: "" }, req.boxName ? `its own box (${req.boxName})` : "a new box of its own"),
+        sharedBoxes.map((b) => h("option", { value: b.id, selected: b.id === req.box }, `${b.name}, shared with you by ${b.shared.from}`)),
+      )
+    : null;
   const status = h("div");
   const allow = h("button", { type: "button" }, "Let it in");
   const deny = h("button", { type: "button", class: "secondary" }, "No thanks");
@@ -1173,7 +1508,7 @@ async function renderConnect(id) {
     withBusy(allow, async () => {
       try {
         const claims = passName.checked ? { ...(req.scopes.includes("profile") && profile.name ? { name: profile.name } : {}), ...(req.scopes.includes("email") && profile.email ? { email: profile.email } : {}) } : undefined;
-        go(await account.approveSignIn(id, { claims, appKey }));
+        go(await account.approveSignIn(id, { claims, appKey, box: where?.value || undefined }));
       } catch (err) {
         status.replaceChildren(errorBox(err));
       }
@@ -1187,6 +1522,7 @@ async function renderConnect(id) {
       h("h1", {}, "Let ", h("span", { class: "mono" }, req.client.name), " in?"),
       h("p", { class: "muted" }, "It's asking to:"),
       h("ul", { class: "list perms" }, perms),
+      where ? h("label", { class: "field" }, "Keep its data in", where) : null,
       plainShare,
       h("p", { class: "small" }, "It stays connected until you disconnect it on your Apps page, or until it goes unused for 30 days."),
       req.client.selfRegistered
@@ -1300,7 +1636,7 @@ async function renderYou() {
     return h(
       "li",
       { class: "row spread" },
-      h("div", {}, h("strong", {}, d.name), d.current ? h("span", { class: "chip ok" }, "this browser") : null, h("div", { class: "muted small" }, `${d.kind} · last seen ${ago(d.lastSeenAt)} · added ${ago(d.createdAt)}`)),
+      h("div", {}, h("strong", {}, d.name), d.current ? h("span", { class: "chip ok" }, "this browser") : null, d.lock ? h("span", { class: "chip" }, "Face ID") : null, h("div", { class: "muted small" }, `${d.kind} · last seen ${ago(d.lastSeenAt)} · added ${ago(d.createdAt)}`)),
       h("div", { class: "row" }, rename, remove),
     );
   });
@@ -1385,6 +1721,7 @@ async function renderYou() {
         "div",
         {},
         h("section", { class: "card stack" }, h("h2", {}, "Devices"), h("ul", { class: "list" }, devices), h("details", {}, h("summary", {}, "Add a device"), add)),
+        await lockCard(),
         h("section", { class: "card stack" }, h("h2", {}, "Your name and email"), profile),
       ),
       h(
@@ -1414,10 +1751,20 @@ function takeConnectFromUrl() {
   if (fromHash && pendingConnect?.id !== fromHash) pendingConnect = { id: fromHash, appKey: null, appName: null };
 }
 
+/** A share link: #share=<code>. The code is taken out of the address bar (and this history entry) straight away. */
+function takeShareFromUrl() {
+  const code = hashParam("share");
+  if (!code) return;
+  pendingShare = code;
+  history.replaceState(null, "", "#/join");
+}
+
 async function render() {
   closeModal(false);
   takeConnectFromUrl();
+  takeShareFromUrl();
   if (!account) {
+    if (await deviceLock(browserStore)) return renderLocked();
     try {
       account = await unlock(browserStore);
     } catch (err) {
@@ -1428,12 +1775,14 @@ async function render() {
       }
     }
   }
+  lockButton.hidden = !account?.lock;
   if (!account) return renderWelcome(await hello().catch(() => null));
   if (pendingConnect) {
     const id = pendingConnect.id;
     if (!location.hash.startsWith("#connect=")) history.replaceState(null, "", `#connect=${id}`);
     return renderConnect(id);
   }
+  if (pendingShare) return renderJoin(pendingShare);
   nav.hidden = false;
   const [, page, arg, key] = location.hash.split("/");
   for (const a of nav.querySelectorAll("a")) a.classList.toggle("active", a.getAttribute("href") === `#/${page && page !== "box" ? page : ""}`);
@@ -1457,6 +1806,7 @@ async function render() {
 
 window.addEventListener("hashchange", () => {
   if (!hashParam("connect")) pendingConnect = null;
+  if (location.hash !== "#/join" && !hashParam("share")) pendingShare = null;
   render();
 });
 render();

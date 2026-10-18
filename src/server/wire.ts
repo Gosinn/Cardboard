@@ -76,7 +76,7 @@ export function requireIndex(body: Body, field = "idx"): Buffer {
 }
 
 /** Ids that devices choose themselves (so they can seal things to an id before the server has seen it). */
-export function requireClientId(body: Body, field: string, prefix: "box" | "dock" | "pcl"): string {
+export function requireClientId(body: Body, field: string, prefix: "box" | "dock" | "pcl" | "mem"): string {
   const value = body[field];
   if (typeof value !== "string" || !new RegExp(`^${prefix}_[A-Za-z0-9]{12,32}$`).test(value)) {
     throw fail("bad_request", 400, `\`${field}\` must look like ${prefix}_ followed by 12–32 letters and digits.`);

@@ -101,7 +101,7 @@ export function readBundle(value: unknown): { boxId: string; box: Uint8Array; na
 }
 
 /** Client-chosen ids, so things can be sealed to their own id before the server has seen them. */
-export function newClientId(prefix: "box" | "dock" | "pcl"): string {
+export function newClientId(prefix: "box" | "dock" | "pcl" | "mem"): string {
   const alphabet = "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
   return `${prefix}_${[...random(16)].map((b) => alphabet[b % alphabet.length]).join("")}`;
 }

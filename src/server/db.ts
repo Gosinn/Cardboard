@@ -262,6 +262,50 @@ const MIGRATIONS: string[] = [
   ) WITHOUT ROWID;
   CREATE INDEX oauth_tokens_grant ON oauth_tokens(grant_id);
   `,
+  `
+  -- 'passkey' when the device is locked with Face ID, Touch ID, Windows Hello…:
+  -- its envelope then also needs a secret only the passkey can produce.
+  ALTER TABLE devices ADD COLUMN lock TEXT;
+
+  -- The owner's name as the people a box is shared with see it, sealed by the box key.
+  ALTER TABLE boxes ADD COLUMN owner_label BLOB;
+
+  -- A box shared by link, waiting for someone to accept. The secret is in the
+  -- link (a fragment the server never sees); lookup is a hash of a key made
+  -- from it, and envelope (the box key and name) is sealed by another. One
+  -- use, then it's gone. label is the owner's note on who it's for.
+  CREATE TABLE shares (
+    id         TEXT PRIMARY KEY,
+    box_id     TEXT NOT NULL REFERENCES boxes(id) ON DELETE CASCADE,
+    account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    lookup     BLOB NOT NULL UNIQUE,
+    envelope   BLOB NOT NULL,
+    label      BLOB,
+    can_write  INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL
+  );
+  CREATE INDEX shares_box ON shares(box_id);
+
+  -- People a box is shared with. key is the box key sealed by the member's own
+  -- account key, name is what they call the box (sealed by them), label is
+  -- what the box's people see them as (sealed by the box key). When someone
+  -- leaves, their key and name go; the label stays so the log can still say
+  -- who did what.
+  CREATE TABLE members (
+    id         TEXT PRIMARY KEY,
+    box_id     TEXT NOT NULL REFERENCES boxes(id) ON DELETE CASCADE,
+    account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    key        BLOB,
+    name       BLOB,
+    label      BLOB,
+    can_write  INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    removed_at INTEGER,
+    UNIQUE (box_id, account_id)
+  );
+  CREATE INDEX members_account ON members(account_id);
+  `,
 ];
 
 export function openDb(path: string): DB {

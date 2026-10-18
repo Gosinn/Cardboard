@@ -63,6 +63,20 @@ export function describe(e: OpenedEntry): string {
       return `${who} added a device${e.what ? `: “${e.what}”` : ""}`;
     case "device.remove":
       return `${who} removed a device${e.what ? `: “${e.what}”` : ""}`;
+    case "device.lock":
+      return `${who} locked ${e.what ? `“${e.what}”` : "a device"} with Face ID (a passkey)`;
+    case "device.unlock":
+      return `${who} took the Face ID lock off ${e.what ? `“${e.what}”` : "a device"}`;
+    case "share.create":
+      return `${who} made a link to share ${box}${e.what ? ` with ${e.what}` : ""}${e.note ? ` (${e.note})` : ""}`;
+    case "share.revoke":
+      return `${who} cancelled a link to share ${box}${e.what ? ` with ${e.what}` : ""}`;
+    case "member.join":
+      return `${who} joined ${box}${e.note ? ` (${e.note})` : ""}`;
+    case "member.leave":
+      return `${who} left ${box}`;
+    case "member.remove":
+      return `${who} took ${e.what ?? "someone"} off ${box}`;
     case "recovery.set":
       return `${who} changed the recovery plan to ${planName(e.note)}`;
     case "profile.set":

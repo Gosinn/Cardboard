@@ -46,7 +46,7 @@ export interface AccountFacts {
   /** Where this device reaches Cardboard. */
   url: string;
   recovery: { plan: RecoveryPlan; ready: boolean };
-  devices: Array<{ name: string; lastSeenAt: number | null; createdAt: number; current: boolean }>;
+  devices: Array<{ name: string; kind?: string; lock?: string | null; lastSeenAt: number | null; createdAt: number; current: boolean }>;
   boxes: BoxFacts[];
   pendingDocks: Array<{ dock: string; box: string; send: boolean; receive: boolean }>;
   docks: Array<{ name: string; unclaimed: number }>;
@@ -112,6 +112,18 @@ export function insights(facts: AccountFacts): Insight[] {
         fix: "cardboard devices",
       });
     }
+  }
+
+  // Phones and laptops get picked up by other people; a passkey lock means they still can't open anything.
+  const unlocked = facts.devices.filter((d) => d.kind === "browser" && !d.lock);
+  if (unlocked.length > 0) {
+    const self = unlocked.find((d) => d.current);
+    out.push({
+      level: "tip",
+      title: self ? "Lock this browser with Face ID" : `Lock ${unlocked.length === 1 ? `“${unlocked[0]!.name}”` : `${unlocked.length} browsers`} with Face ID`,
+      detail:
+        "Then anyone who picks up your device (or copies its storage) still can't open your Cardboard without your face, fingerprint or PIN. Works with Face ID, Touch ID, Windows Hello and phone passkeys. Turn it on under You, in each browser.",
+    });
   }
 
   if (facts.quota.used > facts.quota.limit * 0.8) {

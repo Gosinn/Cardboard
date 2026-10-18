@@ -4,6 +4,7 @@ import { createServer as createHttpsServer } from "node:https";
 import { stripTypeScriptTypes } from "node:module";
 import type { AddressInfo } from "node:net";
 import { join, normalize } from "node:path";
+import { parseDuration } from "../shared/duration.ts";
 import { CardboardError, fail } from "../shared/errors.ts";
 import { VERSION } from "../shared/version.ts";
 import { Accounts } from "./accounts.ts";
@@ -16,6 +17,7 @@ import { createOAuthHandler } from "./oauth-http.ts";
 import type { ServerInfo } from "./insights.ts";
 import { openStore, resolvePaths, type Paths } from "./setup.ts";
 import type { ShakeReport } from "./shake.ts";
+import { Sharing } from "./sharing.ts";
 import { Tapes } from "./tapes.ts";
 import { DEFAULT_ACCOUNT_QUOTA, Vault, type Change } from "./vault.ts";
 
@@ -36,6 +38,8 @@ export interface StartOptions {
   accountQuotaBytes?: number;
   /** Run the shake test on startup (default true). */
   shake?: boolean;
+  /** Back up the database this often (ms) into <data>/backups, keeping the newest 10. Off unless set. */
+  backupEveryMs?: number | null;
   sweepEveryMs?: number;
   now?: () => number;
 }
@@ -66,6 +70,10 @@ const STATIC: Record<string, string> = {
   "/device.js": "text/javascript; charset=utf-8",
   "/style.css": "text/css; charset=utf-8",
   "/favicon.svg": "image/svg+xml",
+  "/manifest.webmanifest": "application/manifest+json",
+  "/icon-192.png": "image/png",
+  "/icon-512.png": "image/png",
+  "/apple-touch-icon.png": "image/png",
 };
 const CSP = [
   "default-src 'none'",
@@ -73,6 +81,7 @@ const CSP = [
   "style-src 'self'",
   "img-src 'self' data:",
   "connect-src 'self'",
+  "manifest-src 'self'",
   "base-uri 'none'",
   "form-action 'none'",
   "frame-ancestors 'none'",
@@ -103,13 +112,16 @@ export async function startServer(options: StartOptions = {}): Promise<RunningCa
     host,
     port,
     tls: Boolean(options.tls),
-    trustProxy: Boolean(options.trustProxy),
+    trustProxy: Boolean(options.trustProxy ?? process.env["CARDBOARD_TRUST_PROXY"] === "1"),
     publicUrl: "",
     startedAt: now(),
     signup: options.openSignup || process.env["CARDBOARD_OPEN_SIGNUP"] === "1" ? "open" : "invite",
   };
   const oauth = new OAuth(db, vault, tapes, keys, () => info.publicUrl);
-  const api = new Api({ db, accounts, vault, tapes, audit, hub, docks, oauth, info });
+  const sharing = new Sharing(db, vault, now);
+  const backupEvery = options.backupEveryMs !== undefined ? options.backupEveryMs : process.env["CARDBOARD_BACKUP_EVERY"];
+  const backupEveryMs = typeof backupEvery === "string" ? (backupEvery === "never" ? null : parseDuration(backupEvery)) : (backupEvery ?? null);
+  const api = new Api({ db, accounts, vault, tapes, audit, hub, docks, oauth, sharing, info });
   const oauthHandler = createOAuthHandler({ oauth, api, ip: (req) => clientIp(req, info.trustProxy) });
   const statics = loadStatics();
   const modules = new Map<string, Buffer | null>();
@@ -280,6 +292,8 @@ export async function startServer(options: StartOptions = {}): Promise<RunningCa
       docks.sweep();
       oauth.sweep();
       accounts.sweep();
+      sharing.sweep();
+      if (backupEveryMs) api.backupIfDue(backupEveryMs);
       audit.prune();
     } catch (err) {
       console.error("[cardboard] housekeeping failed:", err);
@@ -353,7 +367,8 @@ function header(req: IncomingMessage, name: string): string | undefined {
 
 function clientIp(req: IncomingMessage, trustProxy: boolean): string {
   if (trustProxy) {
-    const forwarded = header(req, "x-forwarded-for")?.split(",")[0]?.trim();
+    // The last entry is the one your own proxy added; anything before it, the client could have made up.
+    const forwarded = header(req, "x-forwarded-for")?.split(",").at(-1)?.trim();
     if (forwarded) return forwarded;
   }
   return (req.socket.remoteAddress ?? "unknown").replace(/^::ffff:/, "");

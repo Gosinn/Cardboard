@@ -155,6 +155,8 @@ export class OAuth {
   onRevoke: (tapeIds: string[]) => void = () => {};
   /** Called when something looks like an attack (a replayed code or refresh token). */
   onAlarm: (grant: Grant, message: string) => void = () => {};
+  /** Whether an account may keep an app's data in a box (its own, or one shared with it that it may change). */
+  boxAllowed: (accountId: string, boxId: string) => boolean = (accountId, boxId) => this.vault.box(boxId)?.accountId === accountId;
 
   constructor(db: DB, vault: Vault, tapes: Tapes, keys: ServerKeys, issuer: () => string) {
     this.db = db;
@@ -423,7 +425,7 @@ export class OAuth {
     const rows = this.db
       .prepare("SELECT box_id FROM oauth_grants WHERE account_id = ? AND sector = ? AND box_id IS NOT NULL ORDER BY created_at DESC")
       .all(accountId, sector) as Array<{ box_id: string }>;
-    for (const row of rows) if (this.vault.box(row.box_id)?.accountId === accountId) return row.box_id;
+    for (const row of rows) if (this.boxAllowed(accountId, row.box_id)) return row.box_id;
     return null;
   }
 
@@ -450,7 +452,7 @@ export class OAuth {
           .run(grant.id, accountId, client.id, sector, scopes.join(" "), now);
       }
       if (options.boxId) {
-        this.vault.ownBox(accountId, options.boxId);
+        if (!this.boxAllowed(accountId, options.boxId)) throw fail("no_such_box", 404, "You don't have that box.", "List your boxes with: cardboard boxes");
         this.db.prepare("UPDATE oauth_grants SET box_id = ? WHERE id = ?").run(options.boxId, grant.id);
         grant = { ...grant, boxId: options.boxId };
       }

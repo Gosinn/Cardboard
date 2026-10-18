@@ -164,6 +164,23 @@ describe("cardboard CLI", () => {
     assert.ok(!existsSync(config));
   });
 
+  it("shares a box with someone else's Cardboard, and takes them off again", async () => {
+    await cli(["tape", "my-notes", "--label", "share-test"]);
+    const { stdout } = await cli(["share", "my-notes", "--for", "Anna", "--as", "Gosinn"]);
+    const link = /(http\S+#share=\S+)/.exec(stdout)?.[1];
+    assert.ok(link, stdout);
+    assert.match((await cli(["shares"])).stdout, /link share_\w+ for Anna: not used yet/);
+
+    const { account: anna } = await t.newAccount();
+    await anna.setProfile({ name: "Anna" });
+    await anna.joinShare(link);
+    assert.match((await cli(["shares"])).stdout, /my-notes\n  Anna  can change it/);
+    assert.match((await cli(["box", "my-notes"])).stdout, /People[\s\S]*Anna/);
+    await cli(["people", "remove", "my-notes", "Anna"]);
+    assert.ok(!(await anna.boxes()).some((b) => b.shared));
+    await assert.rejects(cli(["leave", "my-notes", "--yes", "my-notes"]), /your own box/);
+  });
+
   it("runs the server side: invites, accounts, backups", async () => {
     const invite = await cli(["host", "invite", "--note", "for Siggi"]);
     assert.match(invite.stdout, /#invite=cbi_/);

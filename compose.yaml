@@ -1,0 +1,40 @@
+# Cardboard behind Caddy, which gets and renews the HTTPS certificate by itself.
+#
+#   echo CARDBOARD_DOMAIN=cardboard.example.com > .env
+#   docker compose up -d --build
+#   docker compose logs cardboard        # the host token and your first invite link
+#
+# See docs/DEPLOY.md for the whole walk-through.
+services:
+  cardboard:
+    build: .
+    restart: unless-stopped
+    environment:
+      CARDBOARD_PUBLIC_URL: https://${CARDBOARD_DOMAIN:?Set CARDBOARD_DOMAIN in .env, e.g. cardboard.example.com}
+      CARDBOARD_TRUST_PROXY: "1"
+      CARDBOARD_BACKUP_EVERY: 1d
+    volumes:
+      - cardboard-data:/data
+    expose:
+      - "8787"
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      CARDBOARD_DOMAIN: ${CARDBOARD_DOMAIN}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - cardboard
+
+volumes:
+  cardboard-data:
+  caddy-data:
+  caddy-config:

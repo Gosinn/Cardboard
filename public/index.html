@@ -5,7 +5,11 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="light dark" />
     <title>Cardboard</title>
+    <meta name="theme-color" content="#f3eadb" />
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <meta name="apple-mobile-web-app-title" content="Cardboard" />
     <link rel="stylesheet" href="/style.css" />
     <script type="module" src="/app.js"></script>
   </head>
@@ -27,6 +31,7 @@
         <a href="#/activity">Activity</a>
         <a href="#/security">Security</a>
         <a href="#/you">You</a>
+        <button id="lock" class="link" hidden>Lock</button>
         <button id="signout" class="link">Sign out</button>
       </nav>
     </header>
