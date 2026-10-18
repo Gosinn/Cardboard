@@ -9,6 +9,8 @@ import { describeCounts, luhn, scan, validIban, validKennitala } from "../src/sh
 import { matches, sortItems } from "../src/shared/query.ts";
 import { qrEncode, qrPath } from "../src/shared/qr.ts";
 import { createHash } from "node:crypto";
+import { win32 } from "node:path";
+import { isModulePath } from "../src/server/http.ts";
 
 describe("durations and sizes", () => {
   it("parses the ways people write durations", () => {
@@ -235,5 +237,15 @@ describe("QR codes", () => {
   it("renders to an SVG path with a quiet zone", () => {
     const path = qrPath([[true, false], [false, true]], 4);
     assert.equal(path, "M4 4h1v1h-1zM5 5h1v1h-1z");
+  });
+});
+
+describe("serving the dashboard's code", () => {
+  it("checks module paths the same way on every system (Windows turned / into \\ and refused them all)", () => {
+    assert.notEqual(win32.normalize("client/account.ts"), "client/account.ts", "why the check can't use the system's own normalize");
+    for (const ok of ["client/account.ts", "shared/qr.ts", "sdk/index.ts", "sdk/login.js"]) assert.ok(isModulePath(ok), ok);
+    for (const bad of ["client\\account.ts", "client/../server/api.ts", "server/api.ts", "client//account.ts", "client/Account.ts", "../client/account.ts"]) {
+      assert.ok(!isModulePath(bad), bad);
+    }
   });
 });

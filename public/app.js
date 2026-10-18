@@ -10,6 +10,8 @@ import { Rpc } from "/lib/client/rpc.ts";
 import { browserName, browserStore, makeKey } from "/device.js";
 
 const app = document.getElementById("app");
+// Everything imported fine: tell boot.js the dashboard is running.
+app.dataset.started = "1";
 const nav = document.getElementById("nav");
 const modal = document.getElementById("modal");
 const ORIGIN = location.origin;

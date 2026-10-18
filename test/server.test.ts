@@ -422,6 +422,7 @@ describe("HTTP edges", () => {
     assert.doesNotMatch(code, /: Uint8Array/, "types are stripped");
     assert.equal((await fetch(`${t.cb.url}/lib/server/crypto.ts`)).status, 404, "server code isn't served");
     assert.equal((await fetch(`${t.cb.url}/lib/client/../server/db.ts`)).status, 404);
+    assert.equal((await fetch(`${t.cb.url}/boot.js`)).status, 200, "the safety net that says when the dashboard's code didn't load");
   });
 
   it("only speaks JSON", async () => {

@@ -3,7 +3,7 @@ import { createServer as createHttpServer, type IncomingMessage, type Server, ty
 import { createServer as createHttpsServer } from "node:https";
 import { stripTypeScriptTypes } from "node:module";
 import type { AddressInfo } from "node:net";
-import { join, normalize } from "node:path";
+import { join, posix } from "node:path";
 import { parseDuration } from "../shared/duration.ts";
 import { CardboardError, fail } from "../shared/errors.ts";
 import { VERSION } from "../shared/version.ts";
@@ -71,6 +71,7 @@ const STATIC: Record<string, string> = {
   "/index.html": "text/html; charset=utf-8",
   "/app.js": "text/javascript; charset=utf-8",
   "/device.js": "text/javascript; charset=utf-8",
+  "/boot.js": "text/javascript; charset=utf-8",
   "/style.css": "text/css; charset=utf-8",
   "/favicon.svg": "image/svg+xml",
   "/manifest.webmanifest": "application/manifest+json",
@@ -351,8 +352,13 @@ function loadStatics(): Map<string, { body: Buffer; type: string }> {
  * src/sdk), served to the browser with its types stripped. From an installed
  * package, the compiled dist/ files are served instead.
  */
+/** A URL path for one of the dashboard's modules, e.g. client/account.ts. (URL paths always use "/", on Windows too.) */
+export function isModulePath(path: string): boolean {
+  return /^(client|shared|sdk)\/[a-z0-9-]+\.(ts|js)$/.test(path) && posix.normalize(path) === path;
+}
+
 function clientModule(path: string, cache: Map<string, Buffer | null>): Buffer | null {
-  if (!/^(client|shared|sdk)\/[a-z0-9-]+\.(ts|js)$/.test(path) || normalize(path) !== path) return null;
+  if (!isModulePath(path)) return null;
   if (cache.has(path)) return cache.get(path)!;
   let body: Buffer | null = null;
   const source = join(ROOT, "src", path.replace(/\.js$/, ".ts"));
