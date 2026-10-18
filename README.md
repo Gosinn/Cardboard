@@ -4,7 +4,7 @@
 
 Every app you build gets its own **box**. Apps open their box with a **tape**. Everything is sealed on your devices and inside your apps before it leaves them, so the Cardboard server only ever stores bytes it can't open: not your data, not your key names, not even your box names. Cardboard still remembers every version, tells you in plain English who touched what, and attacks itself to prove the locks hold.
 
-It's one small Node server with **zero runtime dependencies** and a single SQLite file, so it runs on a laptop, a Raspberry Pi, or a $5 VPS, for you alone or for your family and friends: each person has their own keys, can lock their phone's copy with **Face ID**, can **share a box** with someone else (a family shopping list, a shared trip) without the server ever seeing inside, and can leave **emergency access** for someone they trust.
+It's one small Node server with **zero runtime dependencies** and a single SQLite file, so it runs on a laptop, a Raspberry Pi, or a $5 VPS, for you alone or for your family and friends: each person has their own keys, a **personal box** for notes, passwords, links and files that opens on every device they sign in on, can lock their phone's copy with **Face ID**, can **share a box** with someone else (a family shopping list, a shared trip) without the server ever seeing inside, and can leave **emergency access** for someone they trust.
 
 ```ts
 import { open } from "cardboard";
@@ -91,6 +91,19 @@ Nobody can reset your account for you, not even whoever runs Cardboard. That's t
 On *You → Lock with Face ID*, a browser makes a passkey (Face ID, Touch ID, Windows Hello, or a phone's fingerprint). From then on, opening your Cardboard there takes your face, finger or PIN, and it locks itself again when you leave it alone (15 minutes by default; you pick).
 
 This is a real lock, not a screen: the passkey makes a secret (WebAuthn's PRF extension) that the browser never stores, and this device's copy of your account key is sealed by it **and** by the device's own key. The device's token is swapped for a new one and kept sealed too. So someone who picks up your unlocked phone, or copies the browser's storage off a laptop, gets nothing. Passkeys are tied to your Cardboard's address, so a look-alike site can't ask for the same secret. Works in Safari 18+ (iPhone, iPad, Mac), Chrome and Edge 132+, Firefox 135+, over HTTPS.
+
+## Your personal box
+
+Not everything belongs to an app. On your shelf, *Make my personal box* gives you one box that's just for you: **notes, passwords, links and files** (photos, PDFs, up to 100 MB each), added and edited right in the dashboard, on your phone or your laptop. Every device you've signed in on opens it.
+
+- **Sealed before it leaves the device**, like everything else: titles, passwords, file names and file contents. Which box is your personal one is sealed in your profile, so the server can't even tell.
+- **Passwords** stay hidden until you tap *Show*, copy in one tap, and *Make a strong one* makes a 20-character password with no look-alike characters. Search finds them by name, website or username, never by the password itself.
+- **Files** are sealed in parts and checked against a SHA-256 hash (sealed too) when you open them. Images show a preview; anything else downloads, and is never opened as a page inside the dashboard. On a phone, *Send or save…* hands it to the share sheet (Save to Photos, Files…).
+- **Every change can be undone**: *Earlier versions* brings an old note or password back, and a deleted thing comes back with *Undo*.
+- **Changed on another device while you had it open?** It tells you, instead of silently overwriting.
+- No app can read it unless you give one a tape, and Cardboard warns you if one can.
+
+It's an ordinary box underneath (`notes/…`, `passwords/…`, `links/…`, `files/…`), so `cardboard export personal` backs it up and your own scripts can use it.
 
 ## What makes it smart
 
@@ -267,10 +280,11 @@ cardboard reset-host                    new host token (on the server)
 | | |
 |---|---|
 | `get(key)` / `getItem(key)` / `has(key)` | read (null when missing) |
+| `getMany(keys)` | several items in one request, in your order (missing ones left out) |
 | `put(key, value, { ttl: "30d", ifVersion })` | write; `ifVersion` prevents lost updates |
 | `patch(key, changes)` | JSON merge patch (`null` removes a field); retries by itself if someone else wrote in between |
 | `delete(key, { purge })` | delete (undoable unless `purge`) |
-| `list(prefix)` / `keys(prefix)` / `items(prefix)` | list (and open) everything under a prefix |
+| `list(prefix)` / `keys(prefix)` / `items(prefix, { skip })` | list (and open) everything under a prefix; with a prefix or `skip(key)`, only the values you want are downloaded |
 | `query({ prefix, where, sort, limit, offset })` | `where` supports equality, dot paths, array contains, `$gt $gte $lt $lte $ne $in $nin $exists $contains $startsWith $or $and $not`; runs in the SDK |
 | `history(key)` / `undo(key, { to })` | versions, newest first; undo again to redo |
 | `batch([...])` | several writes that all happen or none do |
@@ -282,7 +296,7 @@ cardboard reset-host                    new host token (on the server)
 
 Errors are `CardboardError`s with a `code`, a plain message and a `hint`. Everything runs in Node and in browsers (WebCrypto), with zero dependencies. Querying opens every item under the prefix, which is fine at personal scale (tens of thousands of items).
 
-**Your own tools:** `cardboard/account` is the library the CLI and dashboard are built on: `signUp`, `unlock`, `startPairing`, `recoverWithKit`, and an `Account` with boxes, tapes, docks, apps, sharing (`shareBox`, `joinShare`, `removeMember`, `leaveBox`), Face ID locks (`lockWithPasskey`, `removeLock`), emergency access (`addEmergencyLink`, `stopEmergency`, and `viewEmergency`/`requestEmergency`/`claimEmergency` for the person holding the link), friend invites, the log, insights and search, all opened on the device.
+**Your own tools:** `cardboard/account` is the library the CLI and dashboard are built on: `signUp`, `unlock`, `startPairing`, `recoverWithKit`, and an `Account` with boxes (and `makePersonalBox`; `cardboard/personal` reads and writes its notes, passwords, links and files), tapes, docks, apps, sharing (`shareBox`, `joinShare`, `removeMember`, `leaveBox`), Face ID locks (`lockWithPasskey`, `removeLock`), emergency access (`addEmergencyLink`, `stopEmergency`, and `viewEmergency`/`requestEmergency`/`claimEmergency` for the person holding the link), friend invites, the log, insights and search, all opened on the device.
 
 ## The wire
 
@@ -319,7 +333,7 @@ Coming from Cardboard 0.1 (keys on the server)? 0.2 and later start from a new d
 - **Emergency access for parts of your Cardboard** (chosen boxes only), and warnings by email or push, not just on your devices
 - **Signed dashboard releases**, so a turned server can't quietly serve you different code
 - **Courier**: Cardboard holds your third-party API keys and makes calls for your apps, so apps never see the keys
-- **Files** next to JSON, offline sync, a Python SDK
+- **Offline** use of your personal box, file sharing by link, a Python SDK
 
 ## Development
 

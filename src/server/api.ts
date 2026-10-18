@@ -118,6 +118,8 @@ type ItemOp = (scope: ItemScope, body: Body, req: ApiRequest) => unknown;
 
 const DAY = 24 * 60 * 60 * 1000;
 const MAX_BATCH = 500;
+/** Items one get.many can ask for. */
+const MAX_GET_MANY = 1000;
 const KEEP_BACKUPS = 10;
 const MAX_NAME = 4096;
 const MAX_KEY_BLOB = 512;
@@ -424,6 +426,16 @@ export class Api {
         const item = vault.get(s.box.id, idx);
         if (!s.quietReads) logged(s, req, "read", { ref: item ? nameRef(s, idx, item.name) : null });
         return { item: item ? wireItem(item) : null };
+      },
+
+      // Just the items you name: list keys first, then fetch only the values you need.
+      "get.many": (s, body, req) => {
+        requireRead(s);
+        const raw = body["idxs"];
+        if (!Array.isArray(raw) || raw.length > MAX_GET_MANY) throw fail("bad_request", 400, `\`idxs\` must be a list of at most ${MAX_GET_MANY} item indexes.`, "Ask in smaller pages.");
+        const items = raw.map((idx) => vault.get(s.box.id, requireIndex({ idx }))).filter((i) => i !== null);
+        if (!s.quietReads) logged(s, req, "query", { count: items.length });
+        return { items: items.map((i) => wireItem(i)) };
       },
 
       put: (s, body, req) => {

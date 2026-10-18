@@ -7,6 +7,7 @@ import { qrEncode, qrPath } from "/lib/shared/qr.ts";
 import { describeDuration } from "/lib/shared/duration.ts";
 import { toName } from "/lib/shared/names.ts";
 import { createPasskey, hasBuiltInPasskeys, passkeyBlocker, passkeySecret } from "/lib/client/passkey.ts";
+import { addFile, KINDS, listThings, MAX_FILE_BYTES, readFile, removeThing, restoreThing, safeUrl, saveFileDetails, saveThing, searchText, strongPassword, subtitle } from "/lib/client/personal.ts";
 import { Rpc } from "/lib/client/rpc.ts";
 import { browserName, browserStore, makeKey } from "/device.js";
 
@@ -163,6 +164,7 @@ function openModal(onClose, ...content) {
 function closeModal(notify = true) {
   if (modal.hidden) return;
   modal.hidden = true;
+  delete modal.dataset.keep;
   modal.replaceChildren();
   const hook = onModalClose;
   onModalClose = null;
@@ -170,7 +172,7 @@ function closeModal(notify = true) {
 }
 
 modal.addEventListener("click", (e) => {
-  if (e.target === modal && !modal.dataset.sticky) closeModal();
+  if (e.target === modal && !modal.dataset.sticky && !modal.dataset.keep) closeModal();
 });
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && !modal.hidden && !modal.dataset.sticky) closeModal();
@@ -589,6 +591,7 @@ function friendsForm() {
 
 async function renderShelf() {
   const [boxes, me, docks] = await Promise.all([account.boxes(), account.me(), account.docks()]);
+  const personal = await account.personalBox(me);
   const searchInput = h("input", { type: "search", placeholder: "Find anything in any box…", "aria-label": "Search every box" });
   const results = h("div");
   const search = h("form", { class: "search" }, searchInput, h("button", { type: "submit", class: "secondary" }, "Search"));
@@ -623,7 +626,7 @@ async function renderShelf() {
   const shakeChip = shake ? h("a", { href: "#/security", class: `chip ${shake.ok ? "ok" : "danger"}` }, `${shake.ok ? "✓" : "✗"} Server self-test: ${shake.summary}`) : null;
 
   const insightsBox = h("section", { class: "card" }, h("h2", {}, "Worth a look"), h("p", { class: "muted small" }, "Looking through your boxes…"));
-  const cards = boxes.map((b) => {
+  const cards = boxes.filter((b) => b.id !== personal?.id).map((b) => {
     const summary = h("div", { class: "muted" }, "…");
     const chips = h("div", { class: "row" });
     account
@@ -657,6 +660,7 @@ async function renderShelf() {
     search,
     results,
     pendingCard(docks.pending),
+    personalCard(personal),
     insightsBox,
     h("div", { class: "grid" }, cards, newBoxCard()),
   );
@@ -665,6 +669,50 @@ async function renderShelf() {
   fill(
     insightsBox,
     insights.length ? [h("h2", {}, "Worth a look"), insights.map(insightCard)] : [h("h2", {}, "All good"), h("p", { class: "muted" }, "Nothing needs fixing right now.")],
+  );
+}
+
+/** Your personal box on the shelf, or the button that makes it. */
+function personalCard(box) {
+  if (!box) {
+    const make = h("button", { type: "button" }, "Make my personal box");
+    const status = h("div");
+    make.addEventListener("click", () =>
+      withBusy(make, async () => {
+        try {
+          const made = await account.makePersonalBox();
+          location.hash = `#/box/${encodeURIComponent(made.name)}`;
+        } catch (err) {
+          status.replaceChildren(errorBox(err));
+        }
+      }),
+    );
+    return h(
+      "section",
+      { class: "card stack personal-card" },
+      h("h2", {}, "Your personal box"),
+      h("p", {}, "A place for anything that's just for you: notes, passwords, links and files. It's sealed on this device before it leaves, and it opens on every device you've signed in on."),
+      h("div", { class: "row" }, make),
+      status,
+    );
+  }
+  const counts = h("div", { class: "muted" }, "…");
+  account
+    .inventory(box)
+    .then((inv) => {
+      const parts = Object.entries(KINDS)
+        .map(([, k]) => [inv.collections.find((c) => c.name === k.collection)?.items ?? 0, k])
+        .filter(([n]) => n > 0)
+        .map(([n, k]) => `${n} ${n === 1 ? k.one : k.many}`);
+      counts.textContent = parts.length ? parts.join(" · ") : "Empty so far: add your first note, password, link or file.";
+    })
+    .catch((err) => (counts.textContent = err.message));
+  return h(
+    "a",
+    { class: "boxcard personal-card", href: `#/box/${encodeURIComponent(box.name)}` },
+    h("h3", {}, "Your personal box ", h("span", { class: "chip ok" }, box.people.members.length ? "shared" : "only you")),
+    counts,
+    h("div", { class: "stats" }, `${bytes(box.bytes)} · ${box.lastActivity ? `changed ${ago(box.lastActivity)}` : "never used"}`),
   );
 }
 
@@ -721,6 +769,8 @@ function newBoxCard() {
 
 async function renderBox(name, openKey) {
   const box = await account.box(name);
+  const me = await account.me();
+  if (box.id === me.profile.personal && !box.shared) return renderPersonal(box, me, openKey);
   const [inventory, log] = await Promise.all([account.inventory(box), account.log({ box: name, limit: 30 })]);
   const head = h(
     "div",
@@ -782,6 +832,353 @@ async function renderBox(name, openKey) {
     box.shared ? null : h("div", { class: "two" }, settingsSection(box), timeMachine(box.name)),
     dangerZone(box),
   );
+}
+
+// ── Your personal box ───────────────────────────────────────────────────────
+
+const ICON = { note: "📝", password: "🔑", link: "🔗", file: "📎" };
+const NEW_LABEL = { note: "Note", password: "Password", link: "Link", file: "File" };
+
+async function renderPersonal(info, me, openKey) {
+  const box = await account.open(info);
+  let things = [];
+  let other = 0;
+  let show = "all";
+  const find = h("input", { type: "search", placeholder: "Find in your personal box…", "aria-label": "Find in your personal box" });
+  const tabs = h("div", { class: "row tabs" });
+  const list = h("ul", { class: "list things" });
+  const notice = h("div", { class: "stack" });
+  const files = h("input", { type: "file", multiple: true, hidden: true });
+
+  async function load() {
+    ({ things, other } = await listThings(box));
+    draw();
+  }
+
+  function draw() {
+    const q = find.value.trim().toLowerCase();
+    fill(
+      tabs,
+      ["all", "note", "password", "link", "file"].map((k) => {
+        const n = k === "all" ? things.length : things.filter((t) => t.kind === k).length;
+        if (k !== "all" && n === 0) return null;
+        const label = k === "all" ? "Everything" : KINDS[k].many[0].toUpperCase() + KINDS[k].many.slice(1);
+        return h("button", { type: "button", class: `secondary tiny ${show === k ? "active" : ""}`, onclick: () => ((show = k), draw()) }, `${label} ${n}`);
+      }),
+    );
+    const shown = things.filter((t) => (show === "all" || t.kind === show) && (!q || searchText(t.value).toLowerCase().includes(q)));
+    fill(
+      list,
+      shown.length
+        ? shown.map(thingRow)
+        : h("li", { class: "muted" }, things.length ? "Nothing matches." : "Empty so far. Add a note, a password, a link or a file: it's sealed on this device before it leaves."),
+    );
+  }
+
+  function thingRow(t) {
+    const url = t.kind === "link" || t.kind === "password" ? safeUrl(t.value.url) : null;
+    return h(
+      "li",
+      { class: "thing" },
+      h(
+        "button",
+        { type: "button", class: "thing-open", onclick: () => editThing(t.kind, t) },
+        h("span", { class: "thing-icon", "aria-hidden": "true" }, ICON[t.kind]),
+        h("span", { class: "thing-text" }, h("strong", {}, t.value.title), h("span", { class: "muted small" }, subtitle(t) || " ")),
+        h("span", { class: "muted small thing-when" }, ago(t.updatedAt)),
+      ),
+      h(
+        "span",
+        { class: "row thing-actions" },
+        t.kind === "password" && t.value.username ? copyButton(t.value.username, "Copy name") : null,
+        t.kind === "password" ? copyButton(t.value.password, "Copy password") : null,
+        t.kind === "link" && url ? h("a", { class: "button secondary tiny", href: url, target: "_blank", rel: "noopener noreferrer" }, "Open") : null,
+      ),
+    );
+  }
+
+  function say(...content) {
+    fill(notice, content.length ? h("div", { class: "insight tip row spread" }, ...content) : null);
+  }
+
+  async function removed(t) {
+    const undo = h("button", { type: "button", class: "secondary tiny" }, "Undo");
+    undo.addEventListener("click", () =>
+      withBusy(undo, async () => {
+        await restoreThing(box, t);
+        say();
+        await load();
+      }),
+    );
+    say(h("span", {}, `Deleted “${t.value.title}”.`), undo);
+    await load();
+  }
+
+  async function upload(chosen) {
+    for (const file of chosen) {
+      if (file.size > MAX_FILE_BYTES) {
+        say(h("span", {}, `${file.name} is ${bytes(file.size)}: a file can be at most ${bytes(MAX_FILE_BYTES)}.`));
+        continue;
+      }
+      const progress = h("span", {}, `Sealing ${file.name}…`);
+      say(progress);
+      try {
+        await addFile(box, { name: file.name, type: file.type, bytes: new Uint8Array(await file.arrayBuffer()) }, {
+          onProgress: (f) => (progress.textContent = `Sealing ${file.name}… ${Math.round(f * 100)}%`),
+        });
+        say(h("span", {}, `Added ${file.name}. Sealed here before it left this device.`));
+      } catch (err) {
+        say(errorBox(err));
+        return load();
+      }
+    }
+    await load();
+  }
+
+  /** The editor for a note, password or link (new without `thing`), and the viewer for a file. */
+  function editThing(kind, thing = null) {
+    const v = thing?.value ?? {};
+    const status = h("div");
+    const title = h("input", { value: v.title ?? "", maxlength: 500, placeholder: { note: "e.g. Ideas", password: "e.g. Gmail", link: "e.g. Recipe I liked", file: "" }[kind] });
+    const area = (value, rows, placeholder) => {
+      const el = h("textarea", { rows, placeholder, class: "plain" });
+      el.value = value ?? "";
+      return el;
+    };
+    const plainInput = (value, attrs = {}) => h("input", { value: value ?? "", autocomplete: "off", autocapitalize: "off", spellcheck: "false", ...attrs });
+    const fields = {};
+    const body = [h("label", { class: "field" }, "Title", title)];
+    let preview = null;
+    if (kind === "note") {
+      fields.text = area(v.text, 12, "Write anything…");
+      body.push(h("label", { class: "field" }, "Note", fields.text));
+    } else if (kind === "password") {
+      fields.username = plainInput(v.username, { placeholder: "e.g. you@example.com" });
+      // A masked text field, not type=password, so the browser doesn't offer to save it as a password for Cardboard itself.
+      fields.password = plainInput(v.password, { class: "masked mono", placeholder: "the password" });
+      const reveal = h("button", { type: "button", class: "secondary tiny" }, "Show");
+      reveal.addEventListener("click", () => {
+        const hidden = fields.password.classList.toggle("masked");
+        reveal.textContent = hidden ? "Show" : "Hide";
+      });
+      const make = h("button", { type: "button", class: "secondary tiny" }, "Make a strong one");
+      make.addEventListener("click", () => {
+        if (fields.password.value && !confirm("Replace the password that's there with a new one?")) return;
+        fields.password.value = strongPassword();
+        fields.password.classList.remove("masked");
+        reveal.textContent = "Hide";
+      });
+      fields.url = plainInput(v.url, { placeholder: "e.g. gmail.com", inputmode: "url" });
+      fields.notes = area(v.notes, 3, "Security questions, PIN, anything else…");
+      body.push(
+        h("label", { class: "field" }, "Username or email", fields.username),
+        h("label", { class: "field" }, "Password", fields.password),
+        h("div", { class: "row" }, reveal, make, thing ? copyButton(v.password, "Copy saved password") : null),
+        h("label", { class: "field" }, "Website", fields.url),
+        h("label", { class: "field" }, "Notes", fields.notes),
+      );
+    } else if (kind === "link") {
+      fields.url = plainInput(v.url, { placeholder: "e.g. https://example.com/page", inputmode: "url", required: true });
+      fields.notes = area(v.notes, 4, "Why you kept it…");
+      const url = safeUrl(v.url);
+      body.push(
+        h("label", { class: "field" }, "Address", fields.url),
+        url ? h("div", { class: "row" }, h("a", { class: "button secondary tiny", href: url, target: "_blank", rel: "noopener noreferrer" }, "Open"), copyButton(url, "Copy address")) : null,
+        h("label", { class: "field" }, "Notes", fields.notes),
+      );
+    } else {
+      fields.notes = area(v.notes, 3, "Notes about it…");
+      preview = h("div", { class: "file-preview" });
+      const save = h("button", { type: "button" }, "Download");
+      const send = navigator.canShare ? h("button", { type: "button", class: "secondary" }, "Send or save…") : null;
+      const progress = h("span", { class: "muted small" });
+      let loaded = null;
+      const fetchBytes = async () => (loaded ??= await readFile(box, thing, (f) => (progress.textContent = f < 1 ? `Opening… ${Math.round(f * 100)}%` : "")));
+      save.addEventListener("click", () =>
+        withBusy(save, async () => {
+          try {
+            // As a plain download, never opened as a page here: a file can't run anything in the dashboard.
+            const url = URL.createObjectURL(new Blob([await fetchBytes()], { type: "application/octet-stream" }));
+            const a = h("a", { href: url, download: v.name || "file" });
+            document.body.append(a);
+            a.click();
+            a.remove();
+            setTimeout(() => URL.revokeObjectURL(url), 60_000);
+          } catch (err) {
+            status.replaceChildren(errorBox(err));
+          }
+        }),
+      );
+      send?.addEventListener("click", () =>
+        withBusy(send, async () => {
+          try {
+            const file = new File([await fetchBytes()], v.name || "file", { type: v.type || "application/octet-stream" });
+            if (!navigator.canShare({ files: [file] })) throw new Error("This browser can't send this kind of file. Use Download instead.");
+            await navigator.share({ files: [file], title: v.title }).catch((err) => {
+              if (err.name !== "AbortError") throw err;
+            });
+          } catch (err) {
+            status.replaceChildren(errorBox(err));
+          }
+        }),
+      );
+      body.push(
+        h("div", { class: "muted small" }, `${v.name} · ${bytes(v.size)}${v.type ? ` · ${v.type}` : ""}`),
+        preview,
+        h("div", { class: "row" }, save, send, progress),
+        h("label", { class: "field" }, "Notes", fields.notes),
+      );
+      if (/^image\/(png|jpe?g|gif|webp|avif|bmp)$/.test(v.type) && v.size <= 25 * 1024 * 1024) {
+        fetchBytes()
+          .then((data) => {
+            const url = URL.createObjectURL(new Blob([data], { type: v.type }));
+            const img = h("img", { src: url, alt: v.title });
+            img.addEventListener("load", () => setTimeout(() => URL.revokeObjectURL(url), 1000));
+            fill(preview, img);
+          })
+          .catch((err) => fill(preview, errorBox(err)));
+      }
+    }
+
+    const saveButton = h("button", { type: "submit" }, thing ? "Save" : "Keep it");
+    const cancel = h("button", { type: "button", class: "secondary", onclick: () => closeModal() }, thing ? "Close" : "Cancel");
+    const del = thing ? h("button", { type: "button", class: "secondary" }, "Delete") : null;
+    del?.addEventListener("click", () =>
+      withBusy(del, async () => {
+        if (!confirm(`Delete “${v.title}”? You can undo it straight after.`)) return;
+        try {
+          await removeThing(box, thing);
+          closeModal(false);
+          await removed(thing);
+        } catch (err) {
+          status.replaceChildren(errorBox(err));
+        }
+      }),
+    );
+
+    const versions = thing ? h("details", {}, h("summary", { class: "small" }, "Earlier versions")) : null;
+    versions?.addEventListener("toggle", async () => {
+      if (!versions.open || versions.dataset.loaded) return;
+      versions.dataset.loaded = "1";
+      try {
+        const all = (await box.history(thing.key)).filter((x) => !x.deleted && x.version !== thing.version);
+        versions.append(
+          all.length
+            ? h(
+                "ul",
+                { class: "list small" },
+                all.map((x) => {
+                  const back = h("button", { type: "button", class: "secondary tiny" }, "Bring this back");
+                  back.addEventListener("click", () =>
+                    withBusy(back, async () => {
+                      await box.undo(thing.key, { to: x.version });
+                      closeModal(false);
+                      await load();
+                    }),
+                  );
+                  return h("li", { class: "row spread" }, h("span", {}, `${x.value?.title ?? "Version " + x.version} · ${ago(x.at)}`), back);
+                }),
+              )
+            : h("p", { class: "muted small" }, "No earlier versions."),
+        );
+      } catch (err) {
+        versions.append(errorBox(err));
+      }
+    });
+
+    const form = h(
+      "form",
+      { class: "stack" },
+      h("h2", {}, h("span", { "aria-hidden": "true" }, `${ICON[kind]} `), thing ? v.title : `New ${KINDS[kind].one}`),
+      body,
+      h("div", { class: "row" }, saveButton, cancel, del),
+      thing ? h("div", { class: "muted small" }, `Changed ${ago(thing.updatedAt)} · version ${thing.version}`) : null,
+      versions,
+      status,
+    );
+    const save = async (version) => {
+      const input = { title: title.value, ...Object.fromEntries(Object.entries(fields).map(([k, el]) => [k, el.value])) };
+      if (kind === "file") await saveFileDetails(box, thing, input, { version });
+      else await saveThing(box, kind, input, thing ? { id: thing.id, version } : {});
+      closeModal(false);
+      await load();
+    };
+    onSubmit(form, status, async () => {
+      try {
+        await save(thing?.version);
+      } catch (err) {
+        if (err.code !== "version_conflict") throw err;
+        const anyway = h("button", { type: "button", class: "secondary tiny" }, "Save mine anyway");
+        anyway.addEventListener("click", () => withBusy(anyway, () => save(undefined).catch((e) => status.replaceChildren(errorBox(e)))));
+        status.replaceChildren(h("div", { class: "error" }, "This changed on another device while you had it open.", h("div", { class: "row" }, anyway)));
+      }
+    });
+    openModal(null, form);
+    // A stray tap outside shouldn't throw away what you typed. (Unlike `sticky`, this doesn't hold off the idle lock.)
+    modal.dataset.keep = "1";
+    if (!thing) (kind === "note" ? fields.text : kind === "link" ? fields.url : title).focus();
+  }
+
+  const add = h(
+    "div",
+    { class: "row" },
+    ["note", "password", "link"].map((k) => h("button", { type: "button", onclick: () => editThing(k) }, `+ ${NEW_LABEL[k]}`)),
+    h("button", { type: "button", onclick: () => files.click() }, "+ File"),
+    files,
+  );
+  files.addEventListener("change", () => {
+    const chosen = [...files.files];
+    files.value = "";
+    upload(chosen);
+  });
+  find.addEventListener("input", draw);
+
+  const log = await account.log({ box: info.name, limit: 30 });
+  const page = h(
+    "div",
+    { class: "personal" },
+    h(
+      "div",
+      { class: "page-head" },
+      h(
+        "div",
+        { class: "stack" },
+        h("a", { href: "#/", class: "small" }, "← Shelf"),
+        h("h1", {}, "Your personal box"),
+        h("div", { class: "muted" }, "Just for you. Everything is sealed on this device before it leaves, and opens on every device you've signed in on."),
+        peopleChip(info),
+      ),
+    ),
+    me.device.lock ? null : h("p", { class: "insight tip small" }, "Tip: ", h("a", { href: "#/you" }, "lock this browser with Face ID"), " so nobody who picks up this device can open your personal box."),
+    h("section", { class: "card stack" }, add, find, tabs, notice, list, h("p", { class: "muted small drop-hint" }, "You can also drop files here.")),
+    h(
+      "details",
+      { class: "card" },
+      h("summary", {}, "Sharing, apps, history and settings"),
+      h("div", { class: "stack" }, h("p", { class: "muted small" }, other ? `${plural(other, "other item")} here came from apps or the CLI. They're in Browse.` : "Everything a regular box has, for when you need it."), h("div", { class: "two" }, h("div", {}, await browser(info)), h("div", {}, await peopleSection(info), await tapesSection(info), activitySection(log))), h("div", { class: "two" }, settingsSection(info), timeMachine(info.name)), dangerZone(info)),
+    ),
+  );
+  page.addEventListener("dragover", (e) => {
+    if ([...(e.dataTransfer?.types ?? [])].includes("Files")) e.preventDefault();
+  });
+  page.addEventListener("drop", (e) => {
+    if (!e.dataTransfer?.files.length) return;
+    e.preventDefault();
+    upload([...e.dataTransfer.files]);
+  });
+  // Back on this tab after using another device: show what changed there.
+  const refresh = () => {
+    if (!app.contains(list)) return document.removeEventListener("visibilitychange", refresh);
+    if (document.visibilityState === "visible" && modal.hidden) load().catch(() => {});
+  };
+  document.addEventListener("visibilitychange", refresh);
+
+  fill(app, page);
+  await load();
+  if (openKey) {
+    const wanted = things.find((t) => t.key === openKey);
+    if (wanted) editThing(wanted.kind, wanted);
+  }
 }
 
 // ── Sharing a box with people ───────────────────────────────────────────────

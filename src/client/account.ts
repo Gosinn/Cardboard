@@ -33,6 +33,7 @@ import {
 } from "./crypto.ts";
 import type { DeviceLock, DeviceRecord, DeviceStore } from "./device.ts";
 import { accountKeys, boxIndex, boxKeys, bundle, dockIndex, dockKeys, newClientId, newKey, type AccountKeys, type BoxKeys } from "./keys.ts";
+import { isFileData, kindOfKey, searchText } from "./personal.ts";
 import { Rpc } from "./rpc.ts";
 
 /**
@@ -61,7 +62,8 @@ export interface Me {
   createdAt: number;
   recovery: RecoveryPlan;
   recoveryReady: boolean;
-  profile: { name?: string; email?: string };
+  /** Sealed: only your devices read it. `personal` is the id of your personal box. */
+  profile: { name?: string; email?: string; personal?: string };
   quota: { used: number; limit: number };
   device: { id: string; kind: DeviceKind; lock: "passkey" | null };
   devices: Array<{ id: string; kind: DeviceKind; lock: "passkey" | null; name: string; createdAt: number; lastSeenAt: number | null; current: boolean }>;
@@ -647,8 +649,30 @@ export class Account {
         next[field] = value;
       }
     }
-    await this.rpc.call("profile.set", { profile: toB64u(await sealJson(this.keys.meta, next, ctx.profile)) });
+    await this.writeProfile(next);
     return next;
+  }
+
+  private async writeProfile(profile: Me["profile"]) {
+    await this.rpc.call("profile.set", { profile: toB64u(await sealJson(this.keys.meta, profile, ctx.profile)) });
+  }
+
+  /** Your personal box (notes, passwords, links, files): just for you, on every device you sign in on. null until you make it. */
+  async personalBox(me?: Me): Promise<BoxInfo | null> {
+    const id = (me ?? (await this.me())).profile.personal;
+    if (!id) return null;
+    const box = await this.boxById(id);
+    return box && !box.shared ? box : null;
+  }
+
+  /** Makes your personal box (or finds the one you already have). Which box it is stays sealed in your profile. */
+  async makePersonalBox(): Promise<BoxInfo> {
+    const me = await this.me();
+    const existing = await this.personalBox(me);
+    if (existing) return existing;
+    const box = await this.createBox(await this.freeName("personal"));
+    await this.writeProfile({ ...me.profile, personal: box.id });
+    return box;
   }
 
   /**
@@ -1105,7 +1129,8 @@ export class Account {
     const stamp = `${info.items}:${info.bytes}:${info.lastActivity}`;
     const cached = this.inventories.get(info.id);
     if (cached?.stamp === stamp) return cached.inventory;
-    const result = inventory((await (await this.open(info)).items()) as Item[]);
+    // A file's bytes (in the personal box) are skipped: there's nothing to label in them, and they're big.
+    const result = inventory((await (await this.open(info)).items("", { skip: isFileData })) as Item[]);
     this.inventories.set(info.id, { stamp, inventory: result });
     return result;
   }
@@ -1125,6 +1150,7 @@ export class Account {
       boxes: await Promise.all(
         boxes.filter((b) => !b.shared).map(async (b) => ({
           name: b.name,
+          personal: b.id === me.profile.personal,
           settings: b.settings,
           createdAt: b.createdAt,
           stats: { items: b.items, bytes: b.bytes },
@@ -1146,13 +1172,16 @@ export class Account {
     const q = query.trim().toLowerCase();
     if (q.length < 2) throw fail("bad_search", 400, "Search for at least 2 characters.");
     const results: Array<{ box: string; key: string; snippet: string | null }> = [];
+    const personal = (await this.me()).profile.personal;
     for (const box of await this.boxes()) {
-      for (const item of await (await this.open(box)).items()) {
+      for (const item of await (await this.open(box)).items("", { skip: isFileData })) {
         if (results.length >= 50) return results;
-        const json = JSON.stringify(item.value);
-        const at = json.toLowerCase().indexOf(q);
-        if (at >= 0 || item.key.toLowerCase().includes(q)) {
-          results.push({ box: box.name, key: item.key, snippet: at >= 0 ? json.slice(Math.max(0, at - 40), at + q.length + 40) : null });
+        // In your personal box, search what you'd read (titles, notes, usernames), never a password.
+        const thing = box.id === personal && kindOfKey(item.key) !== null;
+        const text = thing ? searchText(item.value) : JSON.stringify(item.value);
+        const at = text.toLowerCase().indexOf(q);
+        if (at >= 0 || (!thing && item.key.toLowerCase().includes(q))) {
+          results.push({ box: box.name, key: item.key, snippet: at >= 0 ? text.slice(Math.max(0, at - 40), at + q.length + 40).replace(/\s+/g, " ") : null });
         }
       }
     }

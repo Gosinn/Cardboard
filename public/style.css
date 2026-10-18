@@ -257,13 +257,15 @@ button:disabled {
   cursor: progress;
 }
 
-button.secondary {
+button.secondary,
+.button.secondary {
   background: transparent;
   color: var(--ink);
   border-color: var(--line);
 }
 
-button.secondary:hover {
+button.secondary:hover,
+.button.secondary:hover {
   background: var(--card-2);
 }
 
@@ -286,7 +288,8 @@ nav button.link {
   text-decoration: none;
 }
 
-button.tiny {
+button.tiny,
+.button.tiny {
   padding: 3px 8px;
   font-size: 0.8rem;
 }
@@ -501,6 +504,90 @@ pre {
   align-items: center;
   margin-top: 6px;
   flex-wrap: wrap;
+}
+
+/* ── Your personal box ──────────────────────────────────── */
+
+a.button {
+  display: inline-block;
+  text-decoration: none;
+}
+
+.personal-card h3 {
+  font-family: var(--sans);
+}
+
+.things > li.thing {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  padding: 4px 0;
+}
+
+.thing-open {
+  flex: 1 1 260px;
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  min-width: 0;
+  padding: 8px 6px;
+  text-align: left;
+  font-weight: 400;
+  color: var(--ink);
+  background: none;
+}
+
+.thing-open:hover {
+  background: var(--card-2);
+}
+
+.thing-icon {
+  font-size: 1.2rem;
+  text-align: center;
+}
+
+.thing-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.thing-text > * {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.thing-when {
+  white-space: nowrap;
+}
+
+.thing-actions {
+  gap: 6px;
+}
+
+.masked {
+  -webkit-text-security: disc;
+}
+
+textarea.plain {
+  font-family: var(--sans);
+  font-size: 0.95rem;
+}
+
+.file-preview img {
+  display: block;
+  max-width: 100%;
+  max-height: 50vh;
+  border-radius: 8px;
+}
+
+@media (hover: none) {
+  .drop-hint {
+    display: none;
+  }
 }
 
 /* ── Lists & tables ─────────────────────────────────────── */

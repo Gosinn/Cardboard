@@ -32,6 +32,8 @@ export interface TapeFacts {
 
 export interface BoxFacts {
   name: string;
+  /** Your personal box: passwords belong there, so they're only worth a word if an app can read them. */
+  personal?: boolean;
   settings: { quotaBytes: number; secrets: "warn" | "block" };
   createdAt: number;
   stats: { items: number; bytes: number };
@@ -182,7 +184,16 @@ export function insights(facts: AccountFacts): Insight[] {
       });
     }
     const inv = box.inventory;
-    if (inv && inv.secretPaths.length > 0) {
+    const readers = box.tapes.filter((t) => t.state === "active");
+    if (box.personal && inv && inv.secretPaths.length > 0 && readers.length > 0) {
+      out.push({
+        level: "warn",
+        box: box.name,
+        title: `${readers.length === 1 ? "An app" : `${readers.length} apps`} can read the passwords in ${box.name}`,
+        detail: `${readers.map((t) => t.label).join(", ")} ${readers.length === 1 ? "has a tape" : "have tapes"} for your personal box. Unless you meant that, cut ${readers.length === 1 ? "it" : "them"} off.`,
+        fix: `cardboard box ${box.name}`,
+      });
+    } else if (!box.personal && inv && inv.secretPaths.length > 0) {
       const secrets = Object.fromEntries(Object.entries(inv.sensitive).filter(([kind]) => SECRET_KINDS.has(kind as SensitiveKind))) as Inventory["sensitive"];
       out.push({
         level: "warn",

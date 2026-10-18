@@ -147,14 +147,16 @@ export async function runShake(api: Api): Promise<ShakeReport> {
     await check("isolation", "Boxes can't see into each other", async () => {
       const appB = sdk(b.secret);
       const listed = await appB.items();
-      const raw = call("get", tokenOf(b.secret), { idx: (call("list", tokenOf(a.secret), {}).body as { items: Array<{ idx: string }> }).items[0]!.idx }).body as { item: unknown };
-      return listed.length === 0 && raw.item === null
+      const idx = (call("list", tokenOf(a.secret), {}).body as { items: Array<{ idx: string }> }).items[0]!.idx;
+      const raw = call("get", tokenOf(b.secret), { idx }).body as { item: unknown };
+      const many = call("get.many", tokenOf(b.secret), { idxs: [idx] }).body as { items: unknown[] };
+      return listed.length === 0 && raw.item === null && many.items.length === 0
         ? pass("Another app's tape couldn't read or list the test box, even when it asked for an item by its exact id.")
         : failed("A tape for one box could see data in another box.");
     });
 
     await check("accounts", "Accounts can't see into each other", async () => {
-      const peek = await rejects(() => stranger.rpc.call("list", { box: boxA.id }), "no_such_box");
+      const peek = (await rejects(() => stranger.rpc.call("list", { box: boxA.id }), "no_such_box")) && (await rejects(() => stranger.rpc.call("get.many", { box: boxA.id, idxs: [] }), "no_such_box"));
       const tape = await rejects(() => stranger.rpc.call("tape.revoke", { id: a.tape.id }), "no_such_tape");
       const log = (await stranger.rpc.call<{ entries: unknown[] }>("log", {})).entries.length;
       const mine = await rejects(() => me.rpc.call("list", { box: theirs.id }), "no_such_box");

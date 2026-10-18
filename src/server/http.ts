@@ -83,7 +83,8 @@ const CSP = [
   "default-src 'none'",
   "script-src 'self'",
   "style-src 'self'",
-  "img-src 'self' data:",
+  // blob: for previews of images in your personal box, opened on the device.
+  "img-src 'self' data: blob:",
   "connect-src 'self'",
   "manifest-src 'self'",
   "base-uri 'none'",

@@ -358,6 +358,27 @@ export class Box {
     return item ? this.openItem<T>(o, item) : null;
   }
 
+  /** Several items in as few requests as possible, in the order asked (missing ones are left out). */
+  async getMany<T = unknown>(keys: string[]): Promise<Item<T>[]> {
+    keys.forEach(validateKey);
+    return this.fetchSome<T>(keys.map((key) => ({ key, size: 0 })));
+  }
+
+  /** Fetches the values of these items, a page at a time (at most 1000 items or about 8 MB per request). */
+  private async fetchSome<T>(entries: Array<{ key: string; size: number }>): Promise<Item<T>[]> {
+    const o = await this.ready();
+    const idxs = await Promise.all(entries.map((e) => itemIndex(o.keys, e.key)));
+    const found = new Map<string, Item<T>>();
+    for (let i = 0; i < idxs.length; ) {
+      let end = i + 1;
+      for (let bytes = entries[i]!.size; end < idxs.length && end - i < 1000 && bytes + entries[end]!.size <= 8 * 1024 * 1024; end++) bytes += entries[end]!.size;
+      const { items } = await this.request<{ items: WireItem[] }>("get.many", { idxs: idxs.slice(i, end) });
+      for (const item of await Promise.all(items.map((w) => this.openItem<T>(o, w)))) found.set(item.key, item);
+      i = end;
+    }
+    return entries.flatMap((e) => found.get(e.key) ?? []);
+  }
+
   async has(key: string): Promise<boolean> {
     return (await this.getItem(key)) !== null;
   }
@@ -414,9 +435,14 @@ export class Box {
     return out.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
   }
 
-  /** Every item under `prefix`, opened, sorted by key. Fine at personal scale (tens of thousands of items). */
-  async items<T = unknown>(prefix = ""): Promise<Item<T>[]> {
-    return (await this.fetchAll(true)).filter((i) => i.key.startsWith(prefix)) as Item<T>[];
+  /**
+   * Every item under `prefix`, opened, sorted by key. Fine at personal scale
+   * (tens of thousands of items). With a prefix (or `skip`), the keys come
+   * first and only the values you want are fetched.
+   */
+  async items<T = unknown>(prefix = "", options: { skip?: (key: string) => boolean } = {}): Promise<Item<T>[]> {
+    if (!prefix && !options.skip) return (await this.fetchAll(true)) as Item<T>[];
+    return this.fetchSome<T>((await this.fetchAll(false)).filter((i) => i.key.startsWith(prefix) && !options.skip?.(i.key)));
   }
 
   /** Every key under `prefix`, with metadata. */
