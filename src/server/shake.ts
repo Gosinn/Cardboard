@@ -1,7 +1,8 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { statSync } from "node:fs";
 import type { Api, ApiRequest, ApiResponse } from "./api.ts";
 import { isLoopback } from "./insights.ts";
+import { OAuthError, type Client } from "./oauth.ts";
 
 export interface ShakeResult {
   id: string;
@@ -29,7 +30,7 @@ const PROBE_IP = "198.51.100.77";
  * afterwards, so your real data is never touched.
  */
 export function runShake(api: Api): ShakeReport {
-  const { vault, tapes, db, info, docks } = api.ctx;
+  const { vault, tapes, db, info, docks, oauth } = api.ctx;
   const results: ShakeResult[] = [];
   const check = (id: string, title: string, run: () => Omit<ShakeResult, "id" | "title">) => {
     try {
@@ -60,6 +61,8 @@ export function runShake(api: Api): ShakeReport {
   const boxC = vault.createBox(`__shake-${tag}-c`, { system: true });
   const dock1 = docks.create(`__shake-${tag}-1`, { internal: true });
   const dock2 = docks.create(`__shake-${tag}-2`, { internal: true });
+  const shakeApps: Client[] = [];
+  const shakeBoxes: string[] = [];
   try {
     const a = tapes.create(boxA.id, { label: "shake" });
     const b = tapes.create(boxB.id, { label: "shake" });
@@ -260,9 +263,93 @@ export function runShake(api: Api): ShakeReport {
         ? pass("After being taken off the dock, an app couldn't pick anything up.")
         : failed("An app kept receiving after it was taken off the dock.");
     });
+
+    // ── Sign in with Cardboard ──
+    const register = (host: string) => {
+      const { client } = oauth.register({ client_name: "shake", redirect_uris: [`https://${host}/cb`], token_endpoint_auth_method: "none" }, "shake");
+      shakeApps.push(client);
+      return client;
+    };
+    const appA = register("shake-a.example");
+    const appB = register("shake-b.example");
+    const verifier = randomBytes(32).toString("base64url");
+    const challenge = createHash("sha256").update(verifier).digest("base64url");
+    const redirectA = appA.redirectUris[0]!;
+    let grantA = oauth.consent({ client: appA, redirectUri: redirectA, scopes: ["openid", "box"] }, { internal: true });
+    if (grantA.boxId) shakeBoxes.push(grantA.boxId);
+    const signIn = () => {
+      const code = oauth.issueCode(grantA, { client: appA, redirectUri: redirectA, codeChallenge: challenge, nonce: null }, vault.now());
+      return { code, tokens: () => oauth.exchangeCode({ code, redirectUri: redirectA, verifier, clientId: appA.id }) };
+    };
+    const refusedWith = (fn: () => unknown, error: string) => {
+      try {
+        fn();
+        return false;
+      } catch (err) {
+        return err instanceof OAuthError && err.error === error;
+      }
+    };
+    const accessRevoked = (token: string) => refusedWith(() => oauth.checkAccess(token), "invalid_token");
+
+    check("oauth-redirect", "Sign-in links can't be hijacked", () => {
+      const res = oauth.checkAuthorize(
+        new URLSearchParams({ client_id: appA.id, redirect_uri: "https://evil.example/cb", response_type: "code", code_challenge: challenge, code_challenge_method: "S256" }),
+      );
+      return res.kind === "page"
+        ? pass("A sign-in that tried to send you to an address the app never registered was stopped on Cardboard's own page.")
+        : failed("Cardboard would have redirected to an address the app never registered.");
+    });
+
+    check("oauth-pkce", "Sign-in codes need the app's proof (PKCE)", () => {
+      const noPkce = oauth.checkAuthorize(new URLSearchParams({ client_id: appA.id, redirect_uri: redirectA, response_type: "code" }));
+      const { code } = signIn();
+      const wrong = refusedWith(() => oauth.exchangeCode({ code, redirectUri: redirectA, verifier: "x".repeat(43), clientId: appA.id }), "invalid_grant");
+      return noPkce.kind === "redirect" && noPkce.location.includes("error=invalid_request") && wrong
+        ? pass("Sign-ins without PKCE were refused, and a stolen code was useless without the app's secret verifier.")
+        : failed("A sign-in code worked without the right PKCE verifier.");
+    });
+
+    check("oauth-pairwise", "Apps can't compare notes about you", () => {
+      const tokens = signIn().tokens();
+      const sub = JSON.parse(Buffer.from(tokens.id_token!.split(".")[1]!, "base64url").toString()).sub as string;
+      const other = oauth.subjectFor(new URL(appB.redirectUris[0]!).origin);
+      return sub === oauth.subjectFor(new URL(redirectA).origin) && sub !== other
+        ? pass("Two apps got two unrelated private IDs for the same person.")
+        : failed("Two apps got matching IDs for the same person.");
+    });
+
+    check("oauth-box", "Signed-in apps stay in their own box", () => {
+      const tokens = signIn().tokens();
+      const listed = call("list", tokens.access_token, {}).body as { items?: unknown[] };
+      const got = call("get", tokens.access_token, { key: secretKey }).body as { item?: unknown };
+      return listed.items?.length === 0 && got.item === null
+        ? pass("An app's sign-in token only reached the app's own box.")
+        : failed("A sign-in token reached data outside the app's box.");
+    });
+
+    check("oauth-code-once", "Sign-in codes work once", () => {
+      const attempt = signIn();
+      const tokens = attempt.tokens();
+      const replayed = refusedWith(attempt.tokens, "invalid_grant");
+      return replayed && accessRevoked(tokens.access_token)
+        ? pass("A replayed code was refused and the tokens it produced were revoked.")
+        : failed("A sign-in code worked twice.");
+    });
+
+    check("oauth-refresh-reuse", "Copied refresh tokens are caught", () => {
+      grantA = oauth.consent({ client: appA, redirectUri: redirectA, scopes: ["openid", "box"] }, { internal: true });
+      const first = signIn().tokens();
+      const second = oauth.refresh({ refreshToken: first.refresh_token, clientId: appA.id });
+      const replayed = refusedWith(() => oauth.refresh({ refreshToken: first.refresh_token, clientId: appA.id }), "invalid_grant");
+      return replayed && accessRevoked(second.access_token)
+        ? pass("Reusing an old refresh token disconnected the app, so a copied token is worthless.")
+        : failed("An old refresh token kept working after it was rotated.");
+    });
   } catch (err) {
     results.push({ id: "setup", title: "Shake test setup", status: "fail", detail: (err as Error).message });
   } finally {
+    for (const client of shakeApps) oauth.forgetClient(client.id);
+    for (const boxId of shakeBoxes) if (vault.getBox(boxId)) vault.shredBox(boxId);
     docks.shred(dock1.id);
     docks.shred(dock2.id);
     vault.shredBox(boxA.id);

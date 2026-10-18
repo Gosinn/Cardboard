@@ -310,6 +310,11 @@ export class Vault {
     return keys;
   }
 
+  /** A key for one purpose, derived from the master key (stable across restarts). */
+  systemSubkey(purpose: string): Buffer {
+    return derive(this.systemKey, purpose);
+  }
+
   /** Encrypts audit details: with the box key (so shredding a box shreds its log) or the system key. */
   sealDetail(boxId: string | null, detail: unknown): Buffer {
     const key = boxId ? this.boxKeys(boxId).enc : this.systemKey;

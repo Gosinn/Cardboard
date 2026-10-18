@@ -12,6 +12,8 @@ A personal encrypted backend: each app gets a box, opened with a tape.
 - `src/server/api.ts`: auth, scopes and every operation (pure: request in, response out, so the shake test can call it).
 - `src/server/http.ts`: Node HTTP server, static dashboard, SSE watch.
 - `src/server/docks.ts` + `customs.ts`: anonymous app-to-app parcels. Apps only ever see per-dock pseudonyms; every parcel passes customs before it's stored.
+- `src/server/oauth.ts` + `oauth-http.ts` + `pages.ts`: Sign in with Cardboard (OpenID Connect provider). Pairwise subjects, PKCE always, rotating refresh tokens; `box` scope gives the app a box in the owner's Cardboard.
+- `src/sdk/login.ts`: the app side of Sign in with Cardboard (zero deps, Node + browser).
 - `src/server/shake.ts`: the self-attack test. Add a check whenever you add a new protection.
 - `src/sdk/index.ts`: browser-safe SDK; must not import node: modules.
 - `src/cli.ts`: the `cardboard` command. `public/`: the dashboard (vanilla JS, no build).

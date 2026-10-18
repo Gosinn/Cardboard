@@ -47,6 +47,13 @@ Cardboard ${VERSION}: a smart, private deposit box for your apps.
     cardboard dock peek <dock>              What's in flight, and who really sent it
     cardboard dock shred <dock>             Destroy a dock and everything in flight
 
+  Sign in with Cardboard (apps know you, your data stays with you)
+    cardboard apps                          Apps you've signed into, and what each may do
+    cardboard apps add <name> --redirect <url>[,url] [--public]   Register an app by hand
+    cardboard apps disconnect <app> [--shred]   Cut an app off (and shred what it kept)
+    cardboard apps forget <client-id>       Remove an app's registration
+    cardboard profile [--name "Gosinn"] [--email you@example.com]   What apps may see, if you allow it
+
   Boxes
     cardboard set <box> <setting> <value>   e.g. secrets block · defaultTtl 30d · quotaBytes 1GB
     cardboard allow <box> <origin>          Let a website call this box from the browser
@@ -62,6 +69,7 @@ Cardboard ${VERSION}: a smart, private deposit box for your apps.
 
   Options for start:  --port 8787  --host 127.0.0.1  --data ./cardboard-data  --key-file <path>
                       --tls-cert <file> --tls-key <file>  --trust-proxy
+                      --public-url https://cardboard.example.com   (where apps reach you)
 `;
 
 interface Credentials {
@@ -143,6 +151,12 @@ async function main() {
       send: { type: "string" },
       receive: { type: "string" },
       as: { type: "string" },
+      redirect: { type: "string" },
+      public: { type: "boolean" },
+      shred: { type: "boolean" },
+      name: { type: "string" },
+      email: { type: "string" },
+      "public-url": { type: "string" },
       label: { type: "string" },
       idle: { type: "string" },
       expires: { type: "string" },
@@ -171,6 +185,7 @@ async function main() {
         port: values.port ? Number(values.port) : undefined,
         tls: values["tls-cert"] ? { cert: values["tls-cert"], key: values["tls-key"]! } : undefined,
         trustProxy: values["trust-proxy"],
+        publicUrl: values["public-url"],
       }).catch((err: NodeJS.ErrnoException) => {
         if (err.code === "EADDRINUSE") {
           die(`Port ${values.port ?? 8787} is already in use.`, "Is Cardboard already running? Or pick another port with --port 8788.");
@@ -180,6 +195,7 @@ async function main() {
       console.log(`\n  ${bold("Cardboard is open")} at ${cb.url}`);
       console.log(dim(`  Data: ${cb.paths.dataDir} (encrypted)`));
       console.log(dim(`  Key:  ${cb.paths.keyFile}`));
+      console.log(dim(`  Sign in with Cardboard issuer: ${cb.publicUrl}`));
       if (cb.ownerToken) {
         saveCredentials({ url: cb.url, ownerToken: cb.ownerToken });
         console.log(`\n  ${bold("Your owner token")} (shown once; the CLI saved it to ${CREDENTIALS}):`);
@@ -449,6 +465,62 @@ async function main() {
       return;
     }
 
+    case "apps": {
+      const [action, target] = args;
+      if (!action) {
+        const data = await admin<AppsView>("apps");
+        if (values.json) return console.log(JSON.stringify(data, null, 2));
+        console.log(`${bold("Sign in with Cardboard")}  ${dim(`issuer ${data.issuer}`)}`);
+        if (data.connected.length === 0) console.log(dim("  No apps connected yet."));
+        for (const a of data.connected) {
+          console.log(`\n  ${bold(a.name)} ${dim(a.site)}`);
+          console.log(`    may: ${a.scopes.join(", ")}${a.box ? `  ·  data in box ${a.box}` : ""}`);
+          console.log(dim(`    knows you as ${a.privateId} · connected ${relativeTime(a.connectedAt, Date.now())} · grant ${a.grant}`));
+        }
+        if (data.registered.length) {
+          console.log(`\n${bold("Registered, not connected")}`);
+          for (const c of data.registered) console.log(`  ${c.name}  ${dim(`${c.client} · ${c.redirectUris.join(", ")}`)}`);
+        }
+        return;
+      }
+      if (action === "add") {
+        const name = need(target, 'Usage: cardboard apps add "<name>" --redirect <url>');
+        const redirectUris = need(values.redirect, "Give the app's callback URL with --redirect https://…/callback").split(",").map((u) => u.trim());
+        const r = await admin<{ client_id: string; client_secret?: string }>("apps.register", { name, redirectUris, public: values.public });
+        console.log(`✓ Registered ${bold(name)}.\n`);
+        console.log(`  issuer         ${(await admin<AppsView>("apps")).issuer}`);
+        console.log(`  client_id      ${r.client_id}`);
+        if (r.client_secret) console.log(`  client_secret  ${r.client_secret}  ${dim("(shown once; keep it on the app's server)")}`);
+        return;
+      }
+      if (action === "disconnect") {
+        const which = need(target, "Which app? cardboard apps disconnect <name or grant id>");
+        const { connected } = await admin<AppsView>("apps");
+        const match = connected.find((a) => a.grant === which || a.name.toLowerCase() === which.toLowerCase());
+        if (!match) die(`No connected app called ${which}.`, "See them with: cardboard apps");
+        const r = await admin<{ disconnected: string; shredded: string | null }>("apps.disconnect", { grant: match.grant, shred: values.shred });
+        return console.log(`✓ Disconnected ${r.disconnected}.${r.shredded ? ` Shredded its box ${r.shredded}.` : match.box ? ` Its box ${match.box} is still yours.` : ""}`);
+      }
+      if (action === "forget") {
+        const r = await admin<{ forgotten: string }>("apps.forget", { client: need(target, "Which client id? cardboard apps forget <client-id>") });
+        return console.log(`✓ Forgot ${r.forgotten}.`);
+      }
+      return die("Usage: cardboard apps [add|disconnect|forget]", "See: cardboard help");
+    }
+
+    case "profile": {
+      const patch: Record<string, string | null> = {};
+      if (values.name !== undefined) patch["name"] = values.name || null;
+      if (values.email !== undefined) patch["email"] = values.email || null;
+      const { profile } = Object.keys(patch).length
+        ? await admin<{ profile: { name?: string; email?: string } }>("profile.set", patch)
+        : await admin<{ profile: { name?: string; email?: string } }>("apps");
+      console.log(`Name:  ${profile.name ?? dim("(not set)")}`);
+      console.log(`Email: ${profile.email ?? dim("(not set)")}`);
+      console.log(dim("Apps only see these if they ask and you say yes."));
+      return;
+    }
+
     case "set": {
       const [box, setting, ...rest] = args;
       if (!box || !setting || rest.length === 0) die("Usage: cardboard set <box> <setting> <value>", "Settings: secrets, defaultTtl, quotaBytes, maxItemBytes, historyDays, origins");
@@ -554,6 +626,13 @@ async function main() {
     default:
       die(`Unknown command "${command}".`, "Run `cardboard help` to see what Cardboard can do.");
   }
+}
+
+interface AppsView {
+  issuer: string;
+  profile: { name?: string; email?: string };
+  connected: Array<{ grant: string; name: string; site: string; scopes: string[]; box: string | null; privateId: string; connectedAt: number }>;
+  registered: Array<{ client: string; name: string; redirectUris: string[] }>;
 }
 
 interface DocksView {

@@ -128,6 +128,57 @@ const MIGRATIONS: string[] = [
   CREATE UNIQUE INDEX parcels_dock ON parcels(dock_id, seq);
   CREATE INDEX parcels_expiry ON parcels(expires_at);
   `,
+  `
+  -- Sign in with Cardboard (OpenID Connect). Apps that connect get short-lived
+  -- tapes linked to their grant, so revoking the grant revokes everything.
+  ALTER TABLE tapes ADD COLUMN grant_id TEXT;
+  CREATE INDEX tapes_grant ON tapes(grant_id) WHERE grant_id IS NOT NULL;
+
+  CREATE TABLE oauth_clients (
+    id            TEXT PRIMARY KEY,
+    secret_hash   BLOB,
+    name          TEXT NOT NULL,
+    redirect_uris TEXT NOT NULL,
+    client_uri    TEXT,
+    registered_by TEXT NOT NULL,
+    created_at    INTEGER NOT NULL,
+    last_used_at  INTEGER
+  );
+
+  -- What you said yes to. sector is the app's web origin: it decides the app's
+  -- private ID for you and which box it gets back if it reconnects.
+  CREATE TABLE oauth_grants (
+    id           TEXT PRIMARY KEY,
+    client_id    TEXT NOT NULL REFERENCES oauth_clients(id) ON DELETE CASCADE,
+    sector       TEXT NOT NULL,
+    scopes       TEXT NOT NULL,
+    box_id       TEXT REFERENCES boxes(id) ON DELETE SET NULL,
+    created_at   INTEGER NOT NULL,
+    last_used_at INTEGER,
+    revoked_at   INTEGER
+  );
+  CREATE INDEX oauth_grants_client ON oauth_grants(client_id);
+  CREATE INDEX oauth_grants_sector ON oauth_grants(sector);
+
+  -- Access and refresh tokens, stored only as hashes.
+  CREATE TABLE oauth_tokens (
+    hash       BLOB PRIMARY KEY,
+    grant_id   TEXT NOT NULL REFERENCES oauth_grants(id) ON DELETE CASCADE,
+    kind       TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    used_at    INTEGER,
+    created_at INTEGER NOT NULL
+  ) WITHOUT ROWID;
+  CREATE INDEX oauth_tokens_grant ON oauth_tokens(grant_id);
+
+  -- Browser sessions for the sign-in and consent pages (cookie value stored hashed).
+  CREATE TABLE sessions (
+    hash         BLOB PRIMARY KEY,
+    created_at   INTEGER NOT NULL,
+    expires_at   INTEGER NOT NULL,
+    last_seen_at INTEGER
+  ) WITHOUT ROWID;
+  `,
 ];
 
 export function openDb(path: string): DB {

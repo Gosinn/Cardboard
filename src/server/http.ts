@@ -9,6 +9,8 @@ import { Api, errorResponse, type ApiRequest } from "./api.ts";
 import { Audit } from "./audit.ts";
 import { Docks, type Parcel } from "./docks.ts";
 import { Hub } from "./hub.ts";
+import { OAuth } from "./oauth.ts";
+import { createOAuthHandler } from "./oauth-http.ts";
 import type { ServerInfo } from "./insights.ts";
 import { openStore, resolvePaths, type Paths } from "./setup.ts";
 import type { ShakeReport } from "./shake.ts";
@@ -24,6 +26,8 @@ export interface StartOptions {
   tls?: { cert: string; key: string };
   /** Trust X-Forwarded-For (only when Cardboard sits behind your own reverse proxy). */
   trustProxy?: boolean;
+  /** The address people and apps reach Cardboard at, e.g. https://cardboard.example.com (the OpenID issuer). */
+  publicUrl?: string;
   /** Run the shake test on startup (default true). */
   shake?: boolean;
   sweepEveryMs?: number;
@@ -32,6 +36,8 @@ export interface StartOptions {
 
 export interface RunningCardboard {
   url: string;
+  /** Where apps reach Cardboard; the issuer for Sign in with Cardboard. */
+  publicUrl: string;
   host: string;
   port: number;
   paths: Paths;
@@ -77,6 +83,7 @@ export async function startServer(options: StartOptions = {}): Promise<RunningCa
   const audit = new Audit(db, vault, tapes);
   const hub = new Hub();
   const docks = new Docks(db, vault);
+  db.prepare("DELETE FROM oauth_clients WHERE registered_by = 'shake'").run();
   for (const dock of docks.list({ includeInternal: true })) {
     if (dock.name.startsWith("__shake-")) docks.shred(dock.id);
   }
@@ -91,9 +98,17 @@ export async function startServer(options: StartOptions = {}): Promise<RunningCa
     port,
     tls: Boolean(options.tls),
     trustProxy: Boolean(options.trustProxy),
+    publicUrl: "",
     startedAt: now(),
   };
-  const api = new Api({ db, vault, tapes, audit, hub, docks, info });
+  const oauth = new OAuth(db, vault, tapes, () => info.publicUrl);
+  const api = new Api({ db, vault, tapes, audit, hub, docks, oauth, info });
+  const oauthHandler = createOAuthHandler({
+    oauth,
+    api,
+    secure: () => info.publicUrl.startsWith("https:"),
+    ip: (req) => clientIp(req, info.trustProxy),
+  });
   const statics = loadStatics();
 
   const handler = (req: IncomingMessage, res: ServerResponse) => {
@@ -109,6 +124,7 @@ export async function startServer(options: StartOptions = {}): Promise<RunningCa
     res.setHeader("referrer-policy", "no-referrer");
     res.setHeader("x-frame-options", "DENY");
     const path = new URL(req.url ?? "/", "http://cardboard.local").pathname;
+    if (await oauthHandler(req, res, path)) return;
 
     if (req.method === "GET" || req.method === "HEAD") {
       if (path === "/health") return sendJson(res, 200, { ok: true, version: VERSION });
@@ -241,11 +257,15 @@ export async function startServer(options: StartOptions = {}): Promise<RunningCa
     });
   });
   info.port = (server.address() as AddressInfo).port;
+  const displayHost = host.includes(":") ? `[${host}]` : host;
+  const localUrl = `${options.tls ? "https" : "http"}://${displayHost === "0.0.0.0" ? "127.0.0.1" : displayHost}:${info.port}`;
+  info.publicUrl = (options.publicUrl ?? process.env["CARDBOARD_PUBLIC_URL"] ?? localUrl).replace(/\/+$/, "");
 
   const sweeper = setInterval(() => {
     try {
       for (const [boxId, count] of vault.sweep().expired) audit.record(boxId, "system", "expire", "ok", { count });
       docks.sweep();
+      oauth.sweep();
       audit.prune();
     } catch (err) {
       console.error("[cardboard] housekeeping failed:", err);
@@ -254,10 +274,10 @@ export async function startServer(options: StartOptions = {}): Promise<RunningCa
   sweeper.unref();
 
   const shake = options.shake === false ? null : api.runShake();
-  const displayHost = host.includes(":") ? `[${host}]` : host;
 
   return {
-    url: `${options.tls ? "https" : "http"}://${displayHost === "0.0.0.0" ? "127.0.0.1" : displayHost}:${info.port}`,
+    url: localUrl,
+    publicUrl: info.publicUrl,
     host,
     port: info.port,
     paths,

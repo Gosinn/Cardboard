@@ -164,6 +164,7 @@ function describe(who: string, action: string, outcome: Outcome, d: LogDetail, b
   const where = d.prefix ? `under “${d.prefix}”` : `in ${box ?? "the box"}`;
   const count = (n: number | undefined, word: string) => `${n ?? 0} ${word}${n === 1 ? "" : "s"}`;
   const dock = d.name ? `dock “${d.name}”` : "a dock";
+  if (action === "app.alarm") return `Security: ${d.note ?? "something looked like an attack"}`;
   if (outcome === "denied" && action === "dock.customs") return `Customs stopped a parcel from ${who} on ${dock}: ${d.note ?? ""}`.trim();
   if (outcome === "denied") {
     return `${who} was blocked${action !== "auth" ? ` (${action}${key ? ` ${key}` : ""})` : ""}: ${d.note ?? "not allowed"}`;
@@ -246,6 +247,18 @@ function describe(who: string, action: string, outcome: Outcome, d: LogDetail, b
       return `${who} shredded ${dock}`;
     case "backup":
       return `${who} made an encrypted backup`;
+    case "session":
+      return `${who} signed in to Cardboard in a browser`;
+    case "app.register":
+      return `${d.name ?? "An app"} registered with Cardboard (${d.note ?? ""})`;
+    case "app.connect":
+      return `${who} let ${d.name ?? "an app"} in (${d.note ?? ""})`;
+    case "app.deny":
+      return `${who} turned down ${d.name ?? "an app"}`;
+    case "app.disconnect":
+      return `${who} disconnected ${d.name ?? "an app"}${d.note ? ` ${d.note}` : ""}`;
+    case "app.forget":
+      return `${who} forgot the app ${d.name ?? ""}`;
     default:
       return `${who}: ${action}${key ? ` ${key}` : ""}`;
   }

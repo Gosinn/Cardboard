@@ -8,6 +8,7 @@ import { sameBytes, sha256 } from "./crypto.ts";
 import { getMeta, setMeta, type DB } from "./db.ts";
 import type { Berth, Dock, Docks } from "./docks.ts";
 import type { Hub } from "./hub.ts";
+import type { OAuth } from "./oauth.ts";
 import { insights, type BoxFacts, type ServerInfo } from "./insights.ts";
 import { inventory, type Inventory } from "./labels.ts";
 import { runShake, type ShakeReport } from "./shake.ts";
@@ -40,6 +41,7 @@ export interface Context {
   audit: Audit;
   hub: Hub;
   docks: Docks;
+  oauth: OAuth;
   info: ServerInfo;
 }
 
@@ -105,6 +107,7 @@ export class Api {
       ctx.hub.publish(`box:${boxId}`, change);
     });
     ctx.docks.onParcel(({ dockId, parcel }) => ctx.hub.publish(`dock:${dockId}`, parcel));
+    ctx.oauth.onRevoke = (tapeIds) => ctx.hub.closeWhere((w) => w.tapeId !== null && tapeIds.includes(w.tapeId));
     this.appOps = this.buildAppOps();
     this.adminOps = this.buildAdminOps();
   }
@@ -190,6 +193,15 @@ export class Api {
         throw fail("not_dashboard", 403, "The owner API only answers Cardboard's own dashboard and CLI.");
       }
     }
+  }
+
+  /** For the browser sign-in page: checks the owner token with the same rate limits as the API. */
+  verifyOwnerSecret(secret: string | undefined, ip: string): boolean {
+    const now = this.ctx.vault.now();
+    if (this.limiter.blocked(ip, now)) throw slowDown();
+    if (secret && this.isOwner(secret)) return true;
+    this.denyAuth({ op: "session", admin: true, ip, body: null }, null, "anonymous", "Wrong owner token on the sign-in page.");
+    return false;
   }
 
   private isOwner(secret: string): boolean {
@@ -781,6 +793,70 @@ export class Api {
       },
 
       docks: () => ({ docks: docks.list().map((d) => this.dockSummary(d)), pending: this.pendingDocks() }),
+
+      apps: () => ({
+        issuer: this.ctx.oauth.discovery().issuer,
+        profile: this.ctx.oauth.profile(),
+        connected: this.ctx.oauth.grants().map((g) => ({
+          grant: g.id,
+          name: g.client.name,
+          site: g.sector,
+          scopes: g.scopes,
+          box: g.boxId ? (vault.getBox(g.boxId)?.name ?? null) : null,
+          privateId: this.ctx.oauth.subjectFor(g.sector),
+          connectedAt: g.createdAt,
+          lastUsedAt: g.lastUsedAt,
+          selfRegistered: g.client.registeredBy === "self",
+        })),
+        registered: this.ctx.oauth
+          .clients()
+          .filter((c) => !this.ctx.oauth.grantsOf(c.id).some((g) => g.revokedAt === null))
+          .map((c) => ({ client: c.id, name: c.name, redirectUris: c.redirectUris, registeredBy: c.registeredBy, createdAt: c.createdAt })),
+      }),
+
+      "apps.register": (body) => {
+        const { client, response } = this.ctx.oauth.register(
+          {
+            client_name: requireString(body, "name"),
+            redirect_uris: optStringList(body, "redirectUris"),
+            client_uri: optString(body, "clientUri"),
+            token_endpoint_auth_method: optBoolean(body, "public") ? "none" : "client_secret_basic",
+          },
+          "owner",
+        );
+        audit.record(null, owner, "app.register", "ok", { name: client.name, note: client.redirectUris.join(", ") });
+        return response;
+      },
+
+      "apps.disconnect": (body) => {
+        const grant = this.ctx.oauth.grant(requireString(body, "grant"));
+        if (!grant) throw fail("no_such_app", 404, "That app isn't connected.");
+        const client = this.ctx.oauth.client(grant.clientId);
+        this.ctx.oauth.revokeGrant(grant.id);
+        let shredded: string | null = null;
+        if (optBoolean(body, "shred") && grant.boxId) {
+          const box = vault.getBox(grant.boxId);
+          if (box) {
+            hub.closeWhere((w) => w.boxId === box.id);
+            docks.forgetBox(box.id);
+            vault.shredBox(box.id);
+            this.forgetInventory(box.id);
+            shredded = box.name;
+          }
+        }
+        audit.record(shredded ? null : grant.boxId, owner, "app.disconnect", "ok", { name: client?.name, note: shredded ? `and shredded ${shredded}` : undefined });
+        return { disconnected: client?.name ?? grant.clientId, shredded };
+      },
+
+      "apps.forget": (body) => {
+        const client = this.ctx.oauth.client(requireString(body, "client"));
+        if (!client) throw fail("no_such_app", 404, "Cardboard doesn't know that app.");
+        this.ctx.oauth.forgetClient(client.id);
+        audit.record(null, owner, "app.forget", "ok", { name: client.name });
+        return { forgotten: client.name };
+      },
+
+      "profile.set": (body) => ({ profile: this.ctx.oauth.setProfile(body) }),
 
       "dock.create": (body) => {
         const dock = docks.create(requireString(body, "name"));

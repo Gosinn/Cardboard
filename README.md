@@ -84,6 +84,36 @@ box.dock("shopping-list").on(async (parcel) => {
 - **You see everything; apps see nothing.** `cardboard dock peek` (or *Look inside* on the dashboard) shows real senders. Parcels are encrypted at rest with the dock's own key.
 - **Cardboard remembers your apps.** Approvals belong to the app's box, not its tape, so redeploys and new tapes keep their docks. `cardboard connect` reads `package.json`, so your shelf knows each app's name, description and version. Apps can also call `box.introduce({ title, version })`.
 
+## Sign in with Cardboard: the universal connector
+
+Cardboard is an **OpenID Connect provider**, the same open standard behind every "Sign in with Google" button. Any app or library with a *generic OpenID Connect* option can connect to it without custom code. Point it at your Cardboard's address and it discovers everything from `/.well-known/openid-configuration`, and can even register itself.
+
+But it's built the other way round from the big providers:
+
+- **Every app gets a private ID for you.** The ID is different at every app, so two apps can never match you up (pairwise subjects, like dock pseudonyms).
+- **Apps get nothing else unless you say so.** The consent screen spells out exactly what's asked: your name, your email, a box. Cardboard remembers your answer, so next time you're straight in.
+- **The app's data about you lives in *your* Cardboard.** With the `box` scope, the app gets a box of its own in your Cardboard instead of keeping your data in its database. Disconnect it any time (it's cut off instantly), and shred what it kept if you like.
+
+For an app, it's two calls (or use any OpenID Connect library):
+
+```ts
+import { registerApp, startSignIn, finishSignIn } from "cardboard";
+
+// once: register (or: cardboard apps add "Recipe Planner" --redirect https://recipes.example.com/callback)
+const { clientId } = await registerApp(issuer, { name: "Recipe Planner", redirectUris: [redirectUri] });
+
+const config = { issuer, clientId, redirectUri, scopes: ["openid", "profile", "box"] };
+const pending = await startSignIn(config);                        // send the person to pending.url
+const session = await finishSignIn(config, callbackUrl, pending); // on your callback
+
+session.user.id;                                           // private ID: stable for your app only
+await session.box().put("prefs", { theme: "dark" });       // stored in THEIR Cardboard; tokens refresh by themselves
+```
+
+Under the hood it follows OAuth 2.1 and current security advice: PKCE is required, redirect URIs must match exactly, codes work once (a replayed code revokes what it produced), refresh tokens rotate (a copied one disconnects the app), ID tokens are ES256-signed, and the issuer is sent back with every response. The shake test attacks all of it.
+
+Set `--public-url https://cardboard.example.com` (or `CARDBOARD_PUBLIC_URL`) so apps reach you at your real address. Manage everything on the dashboard's **Apps** page or with `cardboard apps`.
+
 ## What makes it private
 
 - **Everything is encrypted at rest** with AES-256-GCM, including key names. Each box has its own random key, wrapped by a master key that lives in a separate file.
@@ -135,6 +165,9 @@ cardboard docks                         docks, berths, and requests waiting for 
 cardboard dock create <dock> --send a,b --receive c
 cardboard dock approve|deny <dock> <app> · dock add <dock> <app> --as send|receive|both
 cardboard dock remove <dock> <app> · dock set <dock> personal block · dock peek <dock> · dock shred <dock>
+cardboard apps                          apps you've signed into, their private IDs, their boxes
+cardboard apps add "<name>" --redirect <url> [--public] · apps disconnect <app> [--shred] · apps forget <client-id>
+cardboard profile --name "…" --email …   what apps may see, if you allow it
 cardboard login <url> <owner-token> | reset-owner
 ```
 
@@ -154,12 +187,13 @@ cardboard login <url> <owner-token> | reset-owner
 | `collection(name)` | `add`, `get`, `set`, `update`, `remove`, `find`, `findOne`, `count`, `all`, `watch` with time-ordered ids |
 | `dock(name)` | `send(body, { to })`, `reply(parcel, body)`, `receive({ ack })`, `ack(parcel)`, `status()`, `on(handler, { onWaiting })` |
 | `introduce({ title, description, url, version })` | tell Cardboard who this app is |
+| `registerApp`, `startSignIn`, `finishSignIn`, `resumeSession` | Sign in with Cardboard from any app (Node or browser) |
 
 Errors are `CardboardError`s with a `code`, a plain message and a `hint`.
 
 ## HTTP API (any language)
 
-Every call is `POST /v1/<operation>` with `Authorization: Bearer <tape>` and a JSON body. The app operations are `whoami`, `get`, `put`, `patch`, `add`, `delete`, `list`, `query`, `history`, `undo`, `batch`, `watch` (server-sent events), `introduce`, and for docks `dock.send`, `dock.receive`, `dock.ack`, `dock.status` and `dock.watch`. Owner operations live under `/v1/admin/` and take the owner token.
+Every call is `POST /v1/<operation>` with `Authorization: Bearer <tape>` and a JSON body. The app operations are `whoami`, `get`, `put`, `patch`, `add`, `delete`, `list`, `query`, `history`, `undo`, `batch`, `watch` (server-sent events), `introduce`, and for docks `dock.send`, `dock.receive`, `dock.ack`, `dock.status` and `dock.watch`. Owner operations live under `/v1/admin/` and take the owner token. Sign in with Cardboard uses the standard OAuth/OpenID endpoints under `/oauth/` (discovery at `/.well-known/openid-configuration`).
 
 ```bash
 curl -s localhost:8787/v1/put -H "authorization: Bearer $CARDBOARD_TAPE" \
@@ -177,6 +211,10 @@ CARDBOARD_DATA=/srv/cardboard CARDBOARD_KEY_FILE=/root/cardboard.key cardboard s
 - `cardboard backup` writes an encrypted snapshot to `<data>/backups/` (keeps the newest 10). Snapshots are safe to sync to any cloud drive.
 
 ## Roadmap
+
+- **MCP server**: the connector standard AI assistants use. Let Claude and other AI apps work with your boxes, with the same consent screen and the same OAuth underneath
+- **Passkeys**: sign in to your Cardboard with Face ID or a fingerprint instead of the owner token
+- **Accounts for people you trust**: host Cardboards for family and friends on one server, each with their own keys
 
 - **Courier**: Cardboard holds your third-party API keys and makes calls for your apps, so apps never see the keys
 - **Files**: photos and documents next to JSON

@@ -98,6 +98,17 @@ describe("cardboard CLI", () => {
     assert.equal(after.body.error.code, "dock_pending");
   });
 
+  it("manages Sign in with Cardboard from the command line", async () => {
+    const added = await cli(["apps", "add", "Notes Web", "--redirect", "https://notes.example.com/callback"]);
+    assert.match(added.stdout, /client_id\s+cbc_/);
+    assert.match(added.stdout, /client_secret\s+cbs_/);
+    const profile = await cli(["profile", "--name", "Gosinn", "--email", "gosinn@example.is"]);
+    assert.match(profile.stdout, /Name:\s+Gosinn/);
+    const apps = await cli(["apps"]);
+    assert.match(apps.stdout, /Registered, not connected/);
+    assert.match(apps.stdout, /Notes Web/);
+  });
+
   it("starts a fresh Cardboard and prints the owner token once", async () => {
     const dataDir = join(home, "fresh-data");
     const child = spawn(process.execPath, [CLI, "start", "--port", "0", "--data", dataDir], { env });

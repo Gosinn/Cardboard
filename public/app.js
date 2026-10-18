@@ -173,6 +173,7 @@ async function withBusy(button, fn) {
 }
 
 function signOut() {
+  fetch("/oauth/logout", { method: "POST" }).catch(() => {});
   token = null;
   try {
     sessionStorage.removeItem(TOKEN_KEY);
@@ -210,6 +211,8 @@ function renderLogin() {
       } catch {
         // private mode: stay signed in for this page only
       }
+      // Also sign this browser in for "Sign in with Cardboard", so apps don't ask for the token again.
+      fetch("/oauth/session", { method: "POST", headers: { authorization: `Bearer ${token}` } }).catch(() => {});
       render();
     } catch (err) {
       token = null;
@@ -868,6 +871,132 @@ function newDockCard(boxes) {
   return form;
 }
 
+const SCOPE_LABEL = { openid: "knows you (private ID)", profile: "your name", email: "your email", box: "keeps data in your Cardboard", offline_access: "stays connected" };
+
+async function renderApps() {
+  const data = await api("apps");
+  const connected = data.connected.map((a) => {
+    const disconnect = h("button", { type: "button", class: "secondary tiny" }, "Disconnect");
+    const shred = a.box ? h("button", { type: "button", class: "danger tiny" }, "Disconnect & shred its data") : null;
+    disconnect.addEventListener("click", () => withBusy(disconnect, async () => {
+      if (!confirm(`Disconnect ${a.name}? It loses access right away.${a.box ? " Its box stays, in case you reconnect." : ""}`)) return;
+      await api("apps.disconnect", { grant: a.grant });
+      render();
+    }));
+    shred?.addEventListener("click", () => withBusy(shred, async () => {
+      if (!confirm(`Disconnect ${a.name} and shred everything it stored about you in “${a.box}”? This can't be undone.`)) return;
+      await api("apps.disconnect", { grant: a.grant, shred: true });
+      render();
+    }));
+    return h(
+      "li",
+      { class: "stack" },
+      h("div", { class: "row spread" }, h("div", {}, h("strong", {}, a.name), h("span", { class: "muted small" }, ` · ${a.site}`)), h("div", { class: "row" }, disconnect, shred)),
+      h("div", { class: "row" }, a.scopes.filter((s) => SCOPE_LABEL[s]).map((s) => h("span", { class: "chip" }, SCOPE_LABEL[s])), a.selfRegistered ? h("span", { class: "chip warn" }, "registered itself") : null),
+      h(
+        "div",
+        { class: "muted small" },
+        `Connected ${ago(a.connectedAt)} · last used ${ago(a.lastUsedAt)}`,
+        a.box ? [" · data in ", h("a", { href: `#/box/${encodeURIComponent(a.box)}` }, a.box)] : null,
+      ),
+      h("div", { class: "muted small mono" }, `knows you as ${a.privateId}`),
+    );
+  });
+
+  const registered = data.registered.map((c) => {
+    const forget = h("button", { type: "button", class: "secondary tiny" }, "Forget");
+    forget.addEventListener("click", () => withBusy(forget, async () => {
+      await api("apps.forget", { client: c.client });
+      render();
+    }));
+    return h("li", { class: "row spread" }, h("div", {}, h("strong", {}, c.name), h("div", { class: "muted small mono" }, c.redirectUris.join(", "))), forget);
+  });
+
+  app.replaceChildren(
+    h(
+      "div",
+      { class: "page-head" },
+      h("div", {}, h("h1", {}, "Apps"), h("div", { class: "muted" }, "Apps you signed into with Cardboard. Each one knows you only by a private ID made for it, and keeps its data about you here, with you.")),
+    ),
+    h(
+      "div",
+      { class: "two" },
+      h(
+        "div",
+        {},
+        h("section", { class: "card" }, h("h2", {}, "Connected"), connected.length ? h("ul", { class: "list" }, connected) : h("p", { class: "muted" }, "No apps yet. When an app shows “Sign in with Cardboard”, this is where it lands.")),
+        registered.length ? h("section", { class: "card" }, h("h2", {}, "Registered, not connected"), h("ul", { class: "list" }, registered)) : null,
+      ),
+      h("div", {}, profileCard(data.profile), connectCard(data.issuer)),
+    ),
+  );
+}
+
+function profileCard(profile) {
+  const name = h("input", { value: profile.name || "", placeholder: "How apps may greet you" });
+  const email = h("input", { type: "email", value: profile.email || "", placeholder: "you@example.com" });
+  const status = h("div");
+  const form = h(
+    "form",
+    { class: "card stack" },
+    h("h2", {}, "You"),
+    h("p", { class: "muted small" }, "Apps only see these if they ask and you say yes. By default they get nothing but their private ID for you."),
+    h("label", { class: "field" }, "Name", name),
+    h("label", { class: "field" }, "Email", email),
+    h("button", { type: "submit" }, "Save"),
+    status,
+  );
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    try {
+      await api("profile.set", { name: name.value.trim() || null, email: email.value.trim() || null });
+      status.replaceChildren(h("span", { class: "chip ok" }, "Saved"));
+    } catch (err) {
+      status.replaceChildren(errorBox(err));
+    }
+  });
+  return form;
+}
+
+function connectCard(issuer) {
+  const name = h("input", { placeholder: "My App", required: true });
+  const redirect = h("input", { placeholder: "https://myapp.example.com/callback", required: true });
+  const server = h("input", { type: "checkbox", checked: true });
+  const status = h("div");
+  const form = h(
+    "form",
+    { class: "stack" },
+    h("label", { class: "field" }, "App name", name),
+    h("label", { class: "field" }, "Callback URL", redirect),
+    h("label", { class: "check" }, server, "It has a server (gets a client secret)"),
+    h("div", {}, h("button", { type: "submit", class: "secondary" }, "Register app")),
+    status,
+  );
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    try {
+      const r = await api("apps.register", { name: name.value.trim(), redirectUris: [redirect.value.trim()], public: !server.checked });
+      status.replaceChildren(
+        h("div", { class: "stack" },
+          h("div", { class: "small" }, "client_id"), h("code", { class: "secret" }, r.client_id),
+          r.client_secret ? [h("div", { class: "small" }, "client_secret (shown once)"), h("code", { class: "secret" }, r.client_secret), copyButton(r.client_secret, "Copy secret")] : null,
+        ),
+      );
+    } catch (err) {
+      status.replaceChildren(errorBox(err));
+    }
+  });
+  return h(
+    "section",
+    { class: "card stack" },
+    h("h2", {}, "Add “Sign in with Cardboard” to an app"),
+    h("p", { class: "small" }, "Cardboard speaks OpenID Connect, so any app or library with a “generic OpenID Connect” option can use it. Give it this issuer:"),
+    h("div", { class: "row" }, h("code", { class: "secret" }, issuer), copyButton(issuer)),
+    h("p", { class: "muted small" }, "Apps can register themselves automatically, or you can register one here:"),
+    form,
+  );
+}
+
 async function renderActivity() {
   const { boxes } = await api("boxes");
   const select = h("select", { "aria-label": "Box" }, h("option", { value: "" }, "All boxes"), boxes.map((b) => h("option", { value: b.name }, b.name)));
@@ -932,6 +1061,7 @@ async function render() {
     if (page === "box" && arg) await renderBox(decodeURIComponent(arg), key ? decodeURIComponent(key) : undefined);
     else if (page === "activity") await renderActivity();
     else if (page === "docks") await renderDocks();
+    else if (page === "apps") await renderApps();
     else if (page === "shake") await renderShake();
     else await renderShelf();
   } catch (err) {

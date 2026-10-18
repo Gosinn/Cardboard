@@ -26,6 +26,8 @@ export interface OpenOptions {
    * Pass false to silence.
    */
   onNotice?: ((notice: string, key: string) => void) | false;
+  /** Gets a fresh tape when this one expires (used by Sign in with Cardboard sessions). */
+  refresh?: () => Promise<string>;
 }
 
 export interface Item<T = unknown> {
@@ -139,7 +141,8 @@ export function open(options: OpenOptions = {}): Box {
 
 export class Box {
   readonly url: string;
-  private readonly tape: string;
+  private tape: string;
+  private readonly refreshTape: (() => Promise<string>) | undefined;
   private readonly fetchImpl: typeof fetch;
   private readonly onNotice: ((notice: string, key: string) => void) | false;
   private readonly seenNotices = new Set<string>();
@@ -158,6 +161,7 @@ export class Box {
     }
     this.url = url.replace(/\/+$/, "");
     this.tape = tape;
+    this.refreshTape = options.refresh;
     this.fetchImpl = options.fetch ?? globalThis.fetch.bind(globalThis);
     this.onNotice = options.onNotice ?? ((notice) => console.warn(`[cardboard] ${notice}`));
     if (typeof (globalThis as { document?: unknown }).document !== "undefined" && !warnedBrowser) {
@@ -170,7 +174,7 @@ export class Box {
   }
 
   /** @internal Sends one operation. Used by collections; you shouldn't need it. */
-  async request<T>(op: string, body: unknown): Promise<T> {
+  async request<T>(op: string, body: unknown, retried = false): Promise<T> {
     let res: Response;
     try {
       res = await this.fetchImpl(`${this.url}/v1/${op}`, {
@@ -187,6 +191,10 @@ export class Box {
       );
     }
     const data = (await res.json().catch(() => null)) as ErrorBody;
+    if (res.status === 401 && this.refreshTape && !retried) {
+      this.tape = await this.refreshTape();
+      return this.request<T>(op, body, true);
+    }
     if (!res.ok) throw toError(res.status, data);
     return data as T;
   }
@@ -365,6 +373,7 @@ export class Box {
 
     const run = async () => {
       let delay = 1000;
+      let justRefreshed = false;
       while (!closed) {
         try {
           const res = await this.fetchImpl(`${this.url}/v1/${op}`, {
@@ -373,6 +382,18 @@ export class Box {
             body: JSON.stringify(body),
             signal: controller.signal,
           });
+          if (res.status === 401 && this.refreshTape && !justRefreshed) {
+            justRefreshed = true;
+            try {
+              this.tape = await this.refreshTape();
+            } catch (err) {
+              report(err);
+              closed = true;
+              return;
+            }
+            continue;
+          }
+          justRefreshed = false;
           if (!res.ok || !res.body) {
             const error = toError(res.status, (await res.json().catch(() => null)) as ErrorBody);
             const transient = res.status >= 500 || res.status === 429;
@@ -697,3 +718,15 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
     signal.addEventListener("abort", done);
   });
 }
+
+export {
+  finishSignIn,
+  registerApp,
+  resumeSession,
+  startSignIn,
+  type CardboardSession,
+  type CardboardUser,
+  type PendingSignIn,
+  type SignInConfig,
+  type SignInScope,
+} from "./login.ts";

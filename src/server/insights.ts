@@ -26,6 +26,7 @@ export interface ServerInfo {
   tls: boolean;
   trustProxy: boolean;
   startedAt: number;
+  publicUrl: string;
 }
 
 export interface BoxFacts {

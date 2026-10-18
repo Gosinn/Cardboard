@@ -641,3 +641,28 @@ th {
     font-size: 1.35rem;
   }
 }
+
+/* ── Sign-in & consent pages ────────────────────────────── */
+
+.auth-page {
+  max-width: 480px;
+  padding-top: 8vh;
+}
+
+.auth-card h1 {
+  font-size: 1.4rem;
+}
+
+.auth-brand {
+  font-weight: 700;
+  font-size: 1.1rem;
+}
+
+.page-logo {
+  width: 32px;
+  height: 32px;
+}
+
+.perms li strong {
+  display: block;
+}

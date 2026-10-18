@@ -21,6 +21,7 @@ export interface Tape {
   createdAt: number;
   lastUsedAt: number | null;
   revokedAt: number | null;
+  grantId: string | null;
 }
 
 export interface TapeOptions {
@@ -30,6 +31,8 @@ export interface TapeOptions {
   prefix?: string | null;
   idleMs?: number | null;
   expiresAt?: number | null;
+  /** Set for tapes handed out through Sign in with Cardboard; revoking the grant revokes them. */
+  grantId?: string | null;
 }
 
 export const DEFAULT_IDLE_MS = 90 * 24 * 60 * 60 * 1000;
@@ -47,6 +50,7 @@ interface TapeRow {
   created_at: number;
   last_used_at: number | null;
   revoked_at: number | null;
+  grant_id: string | null;
 }
 
 export type TapeCheck = { ok: true; tape: Tape } | { ok: false; reason: string; hint?: string; tape?: Tape };
@@ -81,11 +85,12 @@ export class Tapes {
       createdAt: this.now(),
       lastUsedAt: null,
       revokedAt: null,
+      grantId: options.grantId ?? null,
     };
     this.db
       .prepare(
-        `INSERT INTO tapes (id, box_id, label, secret_hash, can_read, can_write, prefix, idle_ms, expires_at, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO tapes (id, box_id, label, secret_hash, can_read, can_write, prefix, idle_ms, expires_at, created_at, grant_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         tape.id,
@@ -98,6 +103,7 @@ export class Tapes {
         tape.idleMs,
         tape.expiresAt,
         tape.createdAt,
+        tape.grantId,
       );
     return { tape, secret };
   }
@@ -144,9 +150,10 @@ export class Tapes {
     return tape;
   }
 
+  /** Tapes you made (short-lived Sign in with Cardboard tapes are listed under connected apps instead). */
   list(boxId: string): Tape[] {
     const rows = this.db
-      .prepare("SELECT * FROM tapes WHERE box_id = ? ORDER BY created_at DESC")
+      .prepare("SELECT * FROM tapes WHERE box_id = ? AND grant_id IS NULL ORDER BY created_at DESC")
       .all(boxId) as unknown as TapeRow[];
     return rows.map(toTape);
   }
@@ -163,6 +170,20 @@ export class Tapes {
       this.db.prepare("UPDATE tapes SET revoked_at = ? WHERE id = ?").run(tape.revokedAt, id);
     }
     return tape;
+  }
+
+  /** Revokes every tape handed out under a Sign in with Cardboard grant. Returns their ids. */
+  revokeGrant(grantId: string): string[] {
+    const ids = (this.db.prepare("SELECT id FROM tapes WHERE grant_id = ? AND revoked_at IS NULL").all(grantId) as Array<{ id: string }>).map(
+      (r) => r.id,
+    );
+    this.db.prepare("UPDATE tapes SET revoked_at = ? WHERE grant_id = ? AND revoked_at IS NULL").run(this.now(), grantId);
+    return ids;
+  }
+
+  /** Forgets expired Sign in with Cardboard tapes (they're re-issued all the time). */
+  sweepGrantTapes() {
+    this.db.prepare("DELETE FROM tapes WHERE grant_id IS NOT NULL AND expires_at < ?").run(this.now() - 24 * 60 * 60 * 1000);
   }
 
   /** Test/maintenance hook: change when a tape expires. */
@@ -184,6 +205,7 @@ function toTape(row: TapeRow): Tape {
     createdAt: row.created_at,
     lastUsedAt: row.last_used_at,
     revokedAt: row.revoked_at,
+    grantId: row.grant_id,
   };
 }
 

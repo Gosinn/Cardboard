@@ -87,12 +87,19 @@ export function sha256(input: string): Buffer {
   return createHash("sha256").update(input).digest();
 }
 
+export function base64url(input: Buffer | string): string {
+  return Buffer.from(input).toString("base64url");
+}
+
 export function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
   return a.byteLength === b.byteLength && timingSafeEqual(a, b);
 }
 
-/** Secrets look like `cbt_…` (app tape) or `cbo_…` (owner) so scanners can spot them. */
-export function newSecret(prefix: "cbt" | "cbo"): string {
+/**
+ * Secrets look like `cbt_…` (app tape), `cbo_…` (owner), `cbr_…` (refresh token),
+ * `cbs_…` (client secret) or `cbk_…` (browser session), so scanners can spot them.
+ */
+export function newSecret(prefix: "cbt" | "cbo" | "cbr" | "cbs" | "cbk"): string {
   return `${prefix}_${randomBytes(32).toString("base64url")}`;
 }
 
