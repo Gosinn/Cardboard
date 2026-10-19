@@ -169,7 +169,24 @@ export async function registerApp(
   return data.client_secret ? { clientId: data.client_id, clientSecret: data.client_secret } : { clientId: data.client_id };
 }
 
-export async function startSignIn(config: SignInConfig): Promise<PendingSignIn> {
+/**
+ * The invite in a link like https://yourapp.example/#cardboard_invite=cbi_…,
+ * made in Cardboard with "Invite a friend to <your app>". Pass it to
+ * startSignIn and a friend without a Cardboard account makes one on the way
+ * in. Takes it out of the address bar, so it isn't bookmarked or shared on.
+ */
+export function takeInvite(): string | null {
+  const g = globalThis as { location?: { hash: string; pathname: string; search: string }; history?: { replaceState(data: unknown, unused: string, url: string): void } };
+  const loc = g.location;
+  if (!loc) return null;
+  const match = /[#&]cardboard_invite=(cbi_[A-Za-z0-9_-]{43})/.exec(loc.hash);
+  if (!match) return null;
+  const rest = loc.hash.replace(match[0], "").replace(/^[#&]+/, "");
+  g.history?.replaceState(null, "", `${loc.pathname}${loc.search}${rest ? `#${rest}` : ""}`);
+  return match[1]!;
+}
+
+export async function startSignIn(config: SignInConfig, options: { invite?: string | null } = {}): Promise<PendingSignIn> {
   const fetchImpl = config.fetch ?? globalThis.fetch.bind(globalThis);
   const { authorization_endpoint } = await discover(config.issuer, fetchImpl);
   const verifier = randomString(32);
@@ -192,6 +209,12 @@ export async function startSignIn(config: SignInConfig): Promise<PendingSignIn> 
   // Again in the fragment, which browsers never send to servers: the person's dashboard checks the
   // two match, so a server that swapped in its own key (to read the box key) would be caught.
   url.hash = `cardboard_key=${toB64u(pair.publicKey)}`;
+  // An invite for a friend who has no account yet: it stays in the fragment too, so only their browser sees it.
+  if (options.invite) {
+    const invite = /cbi_[A-Za-z0-9_-]{43}/.exec(options.invite)?.[0];
+    if (!invite) throw new CardboardError("bad_invite", 0, "That doesn't look like a Cardboard invite.", "It starts with cbi_, as in the link #cardboard_invite=cbi_…");
+    url.hash += `&invite=${invite}`;
+  }
   return { url: url.toString(), state, verifier, nonce, key: `${toB64u(pair.publicKey)}.${await exportPrivateKey(pair.privateKey)}` };
 }
 

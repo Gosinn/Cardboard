@@ -69,6 +69,22 @@ export async function current() {
 }
 ```
 
+### Friends who don't have Cardboard yet
+
+In your Cardboard, **Apps → Invite a friend to LORE** makes a link like `https://lore.example/#cardboard_invite=cbi_…` (with a QR code). Send it to a friend. Pass the invite on when you sign them in, and they make their Cardboard account on one screen, allow LORE, and land back in LORE:
+
+```ts
+import { takeInvite } from "cardboard";
+
+const invite = takeInvite(); // reads #cardboard_invite=… and takes it out of the address bar
+if (invite) sessionStorage.setItem("cardboard-invite", invite);
+
+// In signIn():
+const pending = await startSignIn(cardboard, { invite: sessionStorage.getItem("cardboard-invite") });
+```
+
+The invite travels in the part after `#`, which browsers never send to servers, so it doesn't end up in your server's logs. It works once.
+
 - `session.user.id` is a private ID for this person, made only for your app. It never changes for your app, and other apps get a different one, so apps can't compare notes.
 - `session.user.name` arrives only if they allowed it. It comes sealed to your app; the Cardboard server never sees it.
 - **Keep `pending` and the saved session private.** The saved session holds the box key: anyone who reads it can read that person's box. Don't load third-party scripts you don't trust on pages that use it.

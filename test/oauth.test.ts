@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createPublicKey, verify } from "node:crypto";
 import { after, before, describe, it } from "node:test";
-import { CardboardError, finishSignIn, registerApp, resumeSession, startSignIn, type SignInConfig } from "../src/sdk/index.ts";
+import { CardboardError, finishSignIn, registerApp, resumeSession, startSignIn, takeInvite, type SignInConfig } from "../src/sdk/index.ts";
 import { HOUR, startTestServer, type TestServer } from "./helpers.ts";
 
 describe("Sign in with Cardboard", () => {
@@ -270,5 +270,43 @@ describe("Sign in with Cardboard", () => {
     assert.ok(!(await t.me.boxes()).some((b) => b.name === "recipe-planner"));
     const userinfo = await fetch(`${t.cb.url}/oauth/userinfo`, { headers: { authorization: `Bearer ${session.accessToken}` } });
     assert.equal(userinfo.status, 401);
+  });
+});
+
+describe("inviting a friend to your app", () => {
+  it("carries the invite in the fragment, and the app can take it out of its own address bar", async () => {
+    const t = await startTestServer({ shake: false });
+    try {
+      const app = await t.me.registerApp({ name: "LORE", redirectUris: ["https://lore.example/callback"], public: true });
+      const { mine } = await t.me.apps();
+      assert.deepEqual(mine.map((m) => [m.name, m.home]), [["LORE", "https://lore.example/"]]);
+      const { link } = await t.me.inviteToApp(mine[0]!.home);
+      assert.match(link, /^https:\/\/lore\.example\/#cardboard_invite=cbi_[A-Za-z0-9_-]{43}$/);
+      const invite = /cbi_[A-Za-z0-9_-]{43}/.exec(link)![0];
+
+      const g = globalThis as { location?: unknown; history?: unknown };
+      let replaced = "";
+      g.location = { hash: `#cardboard_invite=${invite}&tab=2`, pathname: "/", search: "?x=1" };
+      g.history = { replaceState: (_: unknown, __: string, url: string) => (replaced = url) };
+      try {
+        assert.equal(takeInvite(), invite);
+        assert.equal(replaced, "/?x=1#tab=2", "the invite leaves the address bar, the rest stays");
+      } finally {
+        delete g.location;
+        delete g.history;
+      }
+
+      const config: SignInConfig = { issuer: t.cb.url, clientId: app.client_id, redirectUri: "https://lore.example/callback" };
+      const pending = await startSignIn(config, { invite });
+      const url = new URL(pending.url);
+      assert.ok(url.hash.endsWith(`&invite=${invite}`), "in the fragment, which browsers never send to servers");
+      assert.ok(!url.search.includes("cbi_"));
+      await assert.rejects(startSignIn(config, { invite: "not-an-invite" }), (err: unknown) => err instanceof CardboardError && err.code === "bad_invite");
+
+      const res = await t.raw(null, "oauth.who", { id: new URLSearchParams((await fetch(pending.url, { redirect: "manual" })).headers.get("location")!.split("?")[1]).get("connect") });
+      assert.deepEqual(res.body, { app: "LORE", site: "https://lore.example" }, "a friend with no account yet sees which app is asking, and nothing more");
+    } finally {
+      await t.stop();
+    }
   });
 });

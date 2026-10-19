@@ -264,6 +264,26 @@ export async function runShake(api: Api): Promise<ShakeReport> {
         : failed("An app deleted history for good.");
     });
 
+    await check("join-invite", "Joining from an app still needs an invite", () => {
+      if (info.signup === "open") return pass("Anyone may sign up on this server (--open-signup), so there's no invite to check.");
+      const attempt = (invite?: string) =>
+        errorCode(
+          call("signup", undefined, {
+            invite,
+            device: { tokenHash: randomBytes(32).toString("base64url"), kind: "browser", envelope: randomBytes(77).toString("base64url") },
+            recovery: { plan: "none" },
+          }),
+        );
+      const none = attempt();
+      const made = attempt(`cbi_${randomBytes(32).toString("base64url")}`);
+      const who = errorCode(call("oauth.who", undefined, { id: "x".repeat(40) }));
+      api.signups.reset(PROBE_IP);
+      api.limiter.reset(PROBE_IP);
+      return none === "invite_required" && made === "invite_required" && who !== undefined
+        ? pass("A sign-up with no invite, or a made-up one, was refused, the same way whether it came through an app or not; an unknown sign-in request reveals nothing.")
+        : failed(`Signing up without a real invite gave ${none} / ${made}.`);
+    });
+
     await check("rate-limit", "Guessing gets you blocked", () => {
       api.limiter.reset(PROBE_IP);
       let last: ApiResponse | undefined;

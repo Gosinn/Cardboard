@@ -568,7 +568,44 @@ async function hello() {
   return new Rpc(ORIGIN, null).call("hello");
 }
 
+/**
+ * A friend arriving from an app with an invite: one screen, "Make my
+ * account", then the app's own "Allow" screen, then straight back to the app.
+ */
+async function renderAppJoin(info) {
+  nav.hidden = true;
+  const who = await new Rpc(ORIGIN, null).call("oauth.who", { id: pendingConnect.id }).catch(() => null);
+  const appName = who?.app ?? "This app";
+  const name = deviceNameField();
+  const status = h("div");
+  const other = h("button", { type: "button", class: "link small" }, "I already have Cardboard");
+  other.addEventListener("click", () => {
+    pendingConnect.invite = null;
+    renderWelcome(info);
+  });
+  const form = h(
+    "form",
+    { class: "card stack login" },
+    h("div", { class: "row" }, document.querySelector(".brand svg").cloneNode(true), h("h1", {}, `${appName} keeps your things in Cardboard`)),
+    h("p", {}, `They're locked on your device before they're saved, so whoever runs the server they're kept on can't read them. You can see what ${appName} keeps, undo it or wipe it, any time. Make your Cardboard account here, then let ${appName} in.`),
+    h("label", { class: "field" }, "What to call this device", name),
+    h("button", { type: "submit" }, "Make my account"),
+    status,
+    h("div", { class: "row" }, other),
+    info?.shake ? h("p", { class: "muted small" }, `This server's self-test: ${info.shake.summary}.`) : null,
+  );
+  onSubmit(form, status, async () => {
+    const { account: opened, kit } = await signUp({ ...getInOptions(name.value.trim()), invite: pendingConnect.invite });
+    account = opened;
+    pendingConnect.invite = null;
+    history.replaceState(null, "", `#connect=${pendingConnect.id}`);
+    showRecovery({ kit }, render);
+  });
+  fill(app, form);
+}
+
 function renderWelcome(info) {
+  if (pendingConnect?.invite) return renderAppJoin(info);
   nav.hidden = true;
   const invite = hashParam("invite");
   const logo = document.querySelector(".brand svg").cloneNode(true);
@@ -2569,7 +2606,41 @@ async function renderApps() {
         h("section", { class: "card" }, h("h2", {}, "Connected"), connected.length ? h("ul", { class: "list" }, connected) : h("p", { class: "muted" }, "No apps yet. When an app shows “Sign in with Cardboard”, this is where it lands.")),
         registered.length ? h("section", { class: "card" }, h("h2", {}, "Registered, not connected"), h("ul", { class: "list" }, registered)) : null,
       ),
-      h("div", {}, assistantCard(), connectCard(data.issuer)),
+      h("div", {}, inviteToAppsCard(data.mine), assistantCard(), connectCard(data.issuer)),
+    ),
+  );
+}
+
+/** For apps you made: an invite link that lands a friend in the app, making their account on the way. */
+function inviteToAppsCard(mine) {
+  if (!mine.length) return null;
+  return h(
+    "section",
+    { class: "card stack" },
+    h("h2", {}, "Invite a friend to your app"),
+    h("p", { class: "muted small" }, "They open the link, tap sign in, make their Cardboard account on one screen, allow the app, and they're in."),
+    h(
+      "ul",
+      { class: "list" },
+      mine.map((m) => {
+        const button = h("button", { type: "button", class: "secondary tiny" }, `Invite a friend to ${m.name}`);
+        button.addEventListener("click", () =>
+          withBusy(button, async () => {
+            const result = await account.inviteToApp(m.home);
+            openModal(
+              null,
+              h("h2", {}, `Invite a friend to ${m.name}`),
+              h("p", {}, "Send this link privately, or let them scan the code. It works once, for one new account."),
+              qrCode(result.link, `QR code of the invite to ${m.name}`),
+              h("code", { class: "secret" }, result.link),
+              sendButtons(result.link, `Join me on ${m.name}`),
+              h("p", { class: "muted small" }, `The invite is the part after #, which browsers never send to a server. It works until ${new Date(result.expiresAt).toLocaleString()}. Your app needs to pass it on when it signs them in: see docs/APPS.md.`),
+              h("div", { class: "row" }, h("button", { type: "button", onclick: () => closeModal() }, "Done")),
+            );
+          }),
+        );
+        return h("li", { class: "row spread" }, h("div", {}, h("strong", {}, m.name), h("div", { class: "muted small" }, m.home)), button);
+      }),
     ),
   );
 }
@@ -2942,7 +3013,8 @@ async function renderYou() {
 function takeConnectFromUrl() {
   const fromQuery = new URLSearchParams(location.search).get("connect");
   if (fromQuery) {
-    pendingConnect = { id: fromQuery, appKey: hashParam("cardboard_key"), appName: null };
+    // An app can bring an invite along (a friend who has no account yet): it stays in memory only.
+    pendingConnect = { id: fromQuery, appKey: hashParam("cardboard_key"), appName: null, invite: hashParam("invite") };
     history.replaceState(null, "", `/#connect=${encodeURIComponent(fromQuery)}`);
     return;
   }

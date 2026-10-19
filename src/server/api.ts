@@ -568,6 +568,13 @@ export class Api {
     return {
       hello: () => ({ name: "cardboard", version: info.version, signup: info.signup, issuer: info.publicUrl, shake: this.lastShake }),
 
+      // Which app is asking you to sign in, for the page a new friend sees before they have an account.
+      // Only what that app's own sign-in screen would show anyway: its name and site.
+      "oauth.who": (body) => {
+        const request = this.ctx.oauth.pendingRequest(requireString(body, "id", 64));
+        return { app: request.client.name, site: this.ctx.oauth.sectorOf(request.redirectUri) };
+      },
+
       signup: (body, req) => {
         if (this.signups.blocked(req.ip, this.now())) throw slowDown();
         const recovery = asBody(body["recovery"]);
@@ -1274,6 +1281,8 @@ export class Api {
           .clientsOf(a.account.id)
           .filter((c) => !oauth.activeGrant(a.account.id, c.id))
           .map((c) => ({ client: c.id, name: c.name, redirectUris: c.redirectUris, createdAt: c.createdAt })),
+        // Apps you made: where friends you invite to them should land.
+        mine: oauth.clientsOf(a.account.id).map((c) => ({ client: c.id, name: c.name, home: c.clientUri ?? `${new URL(c.redirectUris[0]!).origin}/` })),
       }),
 
       "apps.register": (a, body, req) => {

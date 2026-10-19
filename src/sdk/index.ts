@@ -1093,6 +1093,7 @@ export {
   registerApp,
   resumeSession,
   startSignIn,
+  takeInvite,
   type CardboardSession,
   type CardboardUser,
   type PendingSignIn,

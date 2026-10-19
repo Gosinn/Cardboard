@@ -628,6 +628,18 @@ export class Account {
     return { link: res.link, code: res.code, expiresAt: res.invite.expiresAt };
   }
 
+  /**
+   * An invite that lands a friend in one of your apps: they open the app, sign
+   * in, make their Cardboard account on the way, and come straight back. The
+   * invite rides in the link's fragment, which browsers never send to servers.
+   */
+  async inviteToApp(home: string, options: { expires?: string } = {}): Promise<{ link: string; expiresAt: number }> {
+    const { code, expiresAt } = await this.inviteFriend(options);
+    const url = new URL(home);
+    url.hash = `cardboard_invite=${code}`;
+    return { link: url.toString(), expiresAt };
+  }
+
   async invites(): Promise<{ allowed: boolean; invites: Array<{ id: string; createdAt: number; expiresAt: number }> }> {
     return this.rpc.call("invites");
   }
@@ -1489,6 +1501,7 @@ export class Account {
       issuer: string;
       connected: Array<{ grant: string; client: string; name: string; site: string; scopes: string[]; box: string | null; privateId: string; connectedAt: number; lastUsedAt: number | null; selfRegistered: boolean }>;
       registered: Array<{ client: string; name: string; redirectUris: string[]; createdAt: number }>;
+      mine: Array<{ client: string; name: string; home: string }>;
     }>("apps");
     const boxes = await this.cache();
     return { ...res, connected: res.connected.map((c) => ({ ...c, boxName: c.box ? (boxes.get(c.box)?.name ?? null) : null })) };
