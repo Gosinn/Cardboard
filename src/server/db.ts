@@ -339,6 +339,12 @@ const MIGRATIONS: string[] = [
    WHERE value IS NOT NULL AND EXISTS (
      SELECT 1 FROM items i WHERE i.box_id = history.box_id AND i.idx = history.idx AND i.version = history.version);
   `,
+  `
+  -- Versions written with an expiry. When an item expires, only these go:
+  -- versions meant to be kept stay in history, so an app can't wipe an item's
+  -- past by rewriting it with a short expiry.
+  ALTER TABLE history ADD COLUMN temporary INTEGER NOT NULL DEFAULT 0;
+  `,
 ];
 
 export function openDb(path: string): DB {

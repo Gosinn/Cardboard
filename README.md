@@ -284,7 +284,7 @@ cardboard reset-host                    new host token (on the server)
 | `getMany(keys)` | several items in one request, in your order (missing ones left out) |
 | `put(key, value, { ttl: "30d", ifVersion })` | write; `ifVersion` prevents lost updates. A `Uint8Array` is stored as bytes (and comes back as one) |
 | `patch(key, changes)` | JSON merge patch (`null` removes a field); retries by itself if someone else wrote in between |
-| `delete(key, { purge })` | delete (undoable unless `purge`) |
+| `delete(key, { purge })` | delete (undoable). `purge` deletes for good, from your own devices only: apps can't erase history, so whatever an app does can be undone |
 | `list(prefix)` / `keys(prefix)` / `items(prefix, { skip })` | list (and open) everything under a prefix; with a prefix or `skip(key)`, only the values you want are downloaded |
 | `query({ prefix, where, sort, limit, offset })` | `where` supports equality, dot paths, array contains, `$gt $gte $lt $lte $ne $in $nin $exists $contains $startsWith $or $and $not`; runs in the SDK |
 | `history(key)` / `undo(key, { to })` | versions, newest first; undo again to redo |
@@ -320,7 +320,7 @@ CARDBOARD_DATA=/srv/cardboard cardboard start --public-url https://cardboard.exa
 cardboard host invite --note "for Siggi"      # an invite link, one use, 7 days
 ```
 
-- **Invites by default.** `--open-signup` lets anyone in (they still can't see each other's data, but they use your disk). Each account gets 1 GB unless you set `cardboard host quota <account> 5GB`.
+- **Invites by default.** `--open-signup` lets anyone in (they still can't see each other's data, but they use your disk). Each account gets 10 GB unless you set `cardboard host quota <account> 50GB` (or `--account-quota` for everyone).
 - **HTTPS, always, beyond localhost.** Data is sealed either way, but tokens and the dashboard's own code aren't. Use Caddy (`reverse_proxy 127.0.0.1:8787`, then `--trust-proxy`), Tailscale, or `--tls-cert/--tls-key`.
 - **Backups:** `--backup-every 1d` (on in the Docker setup) or `cardboard host backup` writes a snapshot to `<data>/backups/` (keeps the newest 10, or 3 once the database is over 1 GB, and skips a backup that wouldn't fit on the disk). It holds only sealed data, so it's safe on any cloud drive. Keep `server.key` with it: it protects the server's own secrets (sign-in signing key, private IDs, dock pseudonyms). Lose it and apps see everyone as a new person; nobody loses data.
 - **What you can see:** `cardboard host accounts` lists every account's boxes, devices, storage and last-seen time. That's all there is.
@@ -343,3 +343,7 @@ npm test          # unit + integration + CLI tests
 npm run typecheck
 npm run build     # compiles to dist/ (what other apps install)
 ```
+
+## License
+
+[AGPL-3.0-or-later](LICENSE). Use it, change it, run it for your family or your company. If you run a changed copy for other people, you share your changes with them too.

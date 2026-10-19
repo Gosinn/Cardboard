@@ -69,7 +69,7 @@ Then carry on at [Make your account](#make-your-account).
    | `CARDBOARD_TRUST_PROXY` | `1` |
    | `CARDBOARD_BACKUP_EVERY` | `1d` |
 
-6. Let it redeploy, then open the deployment's **logs**. On the very first start Cardboard prints the **host token** and an **invite link** for your own account, and the shake test's result (it should say `41/41 passed`).
+6. Let it redeploy, then open the deployment's **logs**. On the very first start Cardboard prints the **host token** and an **invite link** for your own account, and the shake test's result (it should say every check passed, like `43/43 passed`).
 
 Then carry on at [Make your account](#make-your-account).
 

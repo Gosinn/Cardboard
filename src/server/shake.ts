@@ -244,6 +244,17 @@ export async function runShake(api: Api): Promise<ShakeReport> {
       return (await rejects(() => appA.get(secretKey), "locked")) ? pass("A single flipped byte was caught before the app used the data.") : failed("Modified data was used as if it were fine.");
     });
 
+    await check("no-erasing", "Apps can't erase history", async () => {
+      const app = sdk(a.secret);
+      await app.put("public/keep", { v: 1 });
+      const single = await rejects(() => app.delete("public/keep", { purge: true }), "purge_not_allowed");
+      const batched = await rejects(() => app.batch([{ op: "delete", key: "public/keep", purge: true }]), "purge_not_allowed");
+      const still = (await app.history("public/keep")).length > 0;
+      return single && batched && still
+        ? pass("An app's tape can't delete anything for good, alone or in a batch, so whatever an app does can be undone.")
+        : failed("An app deleted history for good.");
+    });
+
     await check("rate-limit", "Guessing gets you blocked", () => {
       api.limiter.reset(PROBE_IP);
       let last: ApiResponse | undefined;

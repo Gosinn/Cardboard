@@ -109,6 +109,8 @@ interface ItemScope {
   write: boolean;
   /** Owner devices: reads aren't logged (the dashboard reads everything to work out what you store). */
   quietReads: boolean;
+  /** People's own devices may delete things for good; apps may not, so whatever an app does can be undone. */
+  purge: boolean;
 }
 
 type PublicOp = (body: Body, req: ApiRequest) => unknown;
@@ -349,7 +351,7 @@ export class Api {
       if (member && req.op === "rewind") throw fail("owner_only", 403, "Only the box's owner can rewind it.", "Undo single changes instead, or ask the owner.");
       if (!write && WRITE_OPS.has(req.op)) throw fail("read_only", 403, "This box was shared with you read-only.", "Ask its owner to share it again with changes allowed.");
       // Changes to a shared box are filed under its owner's log, where everyone in the box can see them.
-      const scope: ItemScope = { accountId: box.accountId, box, actor: auth.actor, read: true, write, quietReads: true };
+      const scope: ItemScope = { accountId: box.accountId, box, actor: auth.actor, read: true, write, quietReads: true, purge: true };
       return { status: 200, headers: {}, body: item(scope, body, req) };
     }
     const handler = this.deviceOps[req.op];
@@ -366,7 +368,7 @@ export class Api {
       const body = asBody(req.body);
       const item = this.itemOps[req.op];
       if (item && req.op !== "rewind") {
-        const scope: ItemScope = { accountId: auth.box.accountId, box: auth.box, actor: auth.actor, read: auth.tape.read, write: auth.write, quietReads: false };
+        const scope: ItemScope = { accountId: auth.box.accountId, box: auth.box, actor: auth.actor, read: auth.tape.read, write: auth.write, quietReads: false, purge: false };
         return { status: 200, headers: auth.cors, body: item(scope, body, req) };
       }
       const handler = this.appOps[req.op];
@@ -414,6 +416,16 @@ export class Api {
     const logged = (s: ItemScope, req: ApiRequest, action: string, extra: Partial<LogInput> = {}) =>
       this.log(req, { accountId: s.accountId, boxId: s.box.id, actor: s.actor, action, ...extra });
 
+    const requirePurge = (s: ItemScope) => {
+      if (!s.purge) {
+        throw fail(
+          "purge_not_allowed",
+          403,
+          "Apps can't delete things for good: whatever an app does, the person can undo.",
+          "Delete without purge (it stays undoable until the box's history runs out). The person can delete it for good from their Cardboard.",
+        );
+      }
+    };
     const sealedItem = (body: Body): Sealed => ({
       idx: requireIndex(body),
       name: requireBlob(body, "name", MAX_NAME),
@@ -452,6 +464,7 @@ export class Api {
         requireWrite(s);
         const idx = requireIndex(body);
         const purge = optBoolean(body, "purge") ?? false;
+        if (purge) requirePurge(s);
         const result = vault.delete(s.box.id, idx, { purge }, s.actor);
         logged(s, req, purge ? "purge" : "delete", { ref: nameRef(s, idx, result.name) });
         return { deleted: result.deleted };
@@ -502,7 +515,9 @@ export class Api {
               }
               case "delete": {
                 const idx = requireIndex(op);
-                return { op: "delete", idx: b64(idx), deleted: vault.delete(s.box.id, idx, { purge: optBoolean(op, "purge") ?? false }, s.actor).deleted };
+                const purge = optBoolean(op, "purge") ?? false;
+                if (purge) requirePurge(s);
+                return { op: "delete", idx: b64(idx), deleted: vault.delete(s.box.id, idx, { purge }, s.actor).deleted };
               }
               default:
                 throw fail("bad_batch", 400, `Operation ${i + 1} has op "${String(op["op"])}". Use put or delete.`);

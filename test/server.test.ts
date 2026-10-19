@@ -87,8 +87,28 @@ describe("Cardboard server", () => {
     assert.deepEqual(await box.get("doc"), { v: 2 }, "deletes can be undone");
     await box.undo("doc", { to: 1 });
     assert.deepEqual(await box.get("doc"), { v: 1 });
-    await box.delete("doc", { purge: true });
-    await rejectsWith(box.undo("doc"), "nothing_to_undo");
+    await rejectsWith(box.delete("doc", { purge: true }), "purge_not_allowed");
+    await rejectsWith(box.batch([{ op: "delete", key: "doc", purge: true }]), "purge_not_allowed");
+    assert.deepEqual(await box.get("doc"), { v: 1 }, "an app can't delete anything for good");
+    await (await t.me.open("history")).delete("doc", { purge: true });
+    await rejectsWith(box.undo("doc"), "nothing_to_undo"); // your own devices can
+  });
+
+  it("keeps the versions meant to be kept when an app rewrites an item to expire", async () => {
+    const { box } = await t.newBox("expiring");
+    await box.put("diary", { day: 1 });
+    await box.put("diary", { day: 2 });
+    await box.put("diary", { gone: true }, { ttl: "1m" });
+    t.clock.advance(2 * 60_000);
+    t.cb.api.ctx.vault.sweep();
+    assert.equal(await box.get("diary"), null);
+    assert.deepEqual((await box.history("diary")).map((v) => [v.version, v.deleted]), [[4, true], [2, false], [1, false]], "the expiring version went; the kept ones stayed");
+    await box.undo("diary");
+    assert.deepEqual(await box.get("diary"), { day: 2 });
+    await box.put("temp", "x", { ttl: "1m" });
+    t.clock.advance(2 * 60_000);
+    t.cb.api.ctx.vault.sweep();
+    assert.deepEqual(await box.history("temp"), [], "something only ever meant to expire leaves nothing behind");
   });
 
   it("collections: add, find, update, count, remove", async () => {

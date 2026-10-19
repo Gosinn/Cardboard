@@ -3,7 +3,7 @@
   "version": "0.6.0",
   "description": "A smart, private, end-to-end encrypted deposit box for all your personal apps.",
   "type": "module",
-  "license": "UNLICENSED",
+  "license": "AGPL-3.0-or-later",
   "private": true,
   "engines": {
     "node": ">=22.18"

@@ -419,7 +419,7 @@ export class Box {
     }
   }
 
-  /** Deletes `key`. It stays in history (undo brings it back) unless `purge` is set. */
+  /** Deletes `key`. It stays in history (undo brings it back) unless `purge` is set, which only a person's own devices may do. */
   async delete(key: string, options: { purge?: boolean } = {}): Promise<boolean> {
     validateKey(key);
     const o = await this.ready();

@@ -358,8 +358,8 @@ export class Vault {
       this.events?.push({ boxId, type: "delete", idx, name: b64(item.name), version, at: now });
     }
     this.db
-      .prepare("INSERT INTO history (box_id, idx, version, name, value, size, at, actor) VALUES (?, ?, ?, ?, NULL, ?, ?, ?)")
-      .run(boxId, item.idx, version, item.name, item.value?.length ?? 0, now, actor);
+      .prepare("INSERT INTO history (box_id, idx, version, name, value, size, at, actor, temporary) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?)")
+      .run(boxId, item.idx, version, item.name, item.value?.length ?? 0, now, actor, item.value && expiresAt ? 1 : 0);
     return version;
   }
 
@@ -378,15 +378,32 @@ export class Vault {
     });
   }
 
-  /** Removes an item and all of its history (expiry, or `purge: true`). Returns its sealed name, if it had one. */
+  /**
+   * Removes an item: with `purge`, and all of its history; when it expires,
+   * with the versions that were written to expire. Returns its sealed name.
+   */
   private purge(boxId: string, idx: Buffer, reason: "expired" | "purged"): Buffer | null {
     const row = this.db.prepare("SELECT name FROM items WHERE box_id = ? AND idx = ?").get(boxId, idx) as { name: Uint8Array } | undefined;
     const hist = this.db.prepare("SELECT name FROM history WHERE box_id = ? AND idx = ? ORDER BY version DESC LIMIT 1").get(boxId, idx) as
       | { name: Uint8Array }
       | undefined;
+    const last = this.db
+      .prepare("SELECT MAX(version) AS v FROM (SELECT version FROM history WHERE box_id = ? AND idx = ? UNION ALL SELECT version FROM items WHERE box_id = ? AND idx = ?)")
+      .get(boxId, idx, boxId, idx) as { v: number | null };
     this.db.prepare("DELETE FROM items WHERE box_id = ? AND idx = ?").run(boxId, idx);
-    this.db.prepare("DELETE FROM history WHERE box_id = ? AND idx = ?").run(boxId, idx);
     const name = row?.name ?? hist?.name;
+    if (reason === "expired") {
+      // Expired versions go for good, but versions written to be kept stay, ending in a deletion you can undo.
+      this.db.prepare("DELETE FROM history WHERE box_id = ? AND idx = ? AND temporary = 1").run(boxId, idx);
+      const kept = this.db.prepare("SELECT COUNT(*) AS n FROM history WHERE box_id = ? AND idx = ?").get(boxId, idx) as { n: number };
+      if (kept.n > 0 && name) {
+        this.db
+          .prepare("INSERT INTO history (box_id, idx, version, name, value, size, at, actor, temporary) VALUES (?, ?, ?, ?, NULL, 0, ?, 'system', 0)")
+          .run(boxId, idx, (last.v ?? 0) + 1, name, this.now());
+      }
+    } else {
+      this.db.prepare("DELETE FROM history WHERE box_id = ? AND idx = ?").run(boxId, idx);
+    }
     if (name) this.events?.push({ boxId, type: "delete", idx: b64(idx)!, name: b64(name), version: null, at: this.now(), reason });
     return name ? Buffer.from(name) : null;
   }
