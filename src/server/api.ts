@@ -187,14 +187,8 @@ export class Api {
     context.oauth.onRevoke = (tapeIds) => context.hub.closeWhere((w) => w.tapeId !== null && tapeIds.includes(w.tapeId));
     context.oauth.onAlarm = (grant, message) =>
       context.audit.record({ accountId: grant.accountId, boxId: grant.boxId, actor: "system", action: "alarm", outcome: "denied", note: message });
-    // Apps can keep data in boxes shared with you, as long as you may change them.
-    context.oauth.boxAllowed = (accountId, boxId) => {
-      try {
-        return context.sharing.reach(accountId, boxId).write;
-      } catch {
-        return false;
-      }
-    };
+    // Apps can use boxes shared with you. Shared read-only, the app is read-only too: every call checks.
+    context.oauth.boxAllowed = (accountId, boxId) => context.sharing.canReach(accountId, boxId);
     this.itemOps = this.buildItemOps();
     this.publicOps = this.buildPublicOps();
     this.deviceOps = this.buildDeviceOps();
@@ -1354,9 +1348,8 @@ export class Api {
         const wantsBox = request.scopes.includes("box");
         let boxId: string | null = null;
         if (wantsBox) {
-          const reach = sharing.reach(a.account.id, requireString(body, "box", 64));
-          if (!reach.write) throw fail("read_only", 403, "That box was shared with you read-only, so an app can't keep its data there.", "Pick another box, or a new one.");
-          boxId = reach.box.id;
+          // A box shared with you read-only is fine: the app gets read-only too (checked on every call).
+          boxId = sharing.reach(a.account.id, requireString(body, "box", 64)).box.id;
         }
         const bundle = optBlob(body, "bundle", 4096) ?? null;
         if (request.appKey && !bundle) throw fail("bad_request", 400, "This app takes sealed data, so send its bundle (sealed to its key).");

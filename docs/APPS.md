@@ -109,6 +109,8 @@ Everything is sealed in the browser before it's sent. The full list is in the RE
 
 Two people working on the same LORE world: the owner opens the box in their dashboard, then *People → Share with someone*, and sends the link. When the friend signs in to LORE, the sign-in screen lets them choose that shared box instead of a new one, so you both read and write the same data, live, through `watch()`.
 
+Shared **read-only** works too, for the players reading a game master's world: their LORE can read the box but not change it (a write gets a `read_only` error, so show it as view-only). The sign-in screen also offers the person's own existing boxes (never their personal box).
+
 ## Going from website to phone app
 
 - **Capacitor (or any web-view wrapper): almost nothing changes.** It's the same website inside an app, with WebCrypto, so the SDK works as is. Register an app address like `com.example.lore:/callback` as a redirect URI. One small Cardboard change will be needed then: allowing the app's web-view origin (like `capacitor://localhost`) for its sign-ins.

@@ -1555,10 +1555,10 @@ export class Account {
     let boxId: string | null = null;
     const sealed: { v: 1; box?: ReturnType<typeof bundle>; profile?: { name?: string; email?: string } } = { v: 1 };
     if (req.scopes.includes("box")) {
-      // `box` picks one (e.g. a box shared with you, so the app shares it too); otherwise the app's own.
+      // `box` picks one (e.g. a box shared with you, so the app shares it too: read-only if that's how it
+      // was shared); otherwise the app's own.
       let box = options.box ? await this.boxById(options.box) : req.box ? await this.boxById(req.box) : undefined;
       if (options.box && !box) throw fail("no_such_box", 404, "You don't have that box.");
-      if (box?.shared && !box.shared.write) throw fail("read_only", 403, `${box.name} was shared with you read-only, so an app can't keep its data there.`, "Pick another box.");
       if (!box) {
         box = await this.createBox(await this.freeName(toName(req.client.name) || "connected-app"));
         await this.setBoxProfile(box.name, { title: req.client.name.slice(0, 60), ...(req.client.uri ? { url: req.client.uri } : {}) });

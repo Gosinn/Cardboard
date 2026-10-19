@@ -166,13 +166,16 @@ export async function runShake(api: Api): Promise<ShakeReport> {
           return err instanceof CardboardError && err.code === "no_such_box";
         }
       })();
+      // An app someone signs in to can't be pointed at another person's box either.
+      const signIn = !api.ctx.oauth.boxAllowed(stranger.id, boxA.id);
       const peek =
-        listen && (await rejects(() => stranger.rpc.call("list", { box: boxA.id }), "no_such_box")) && (await rejects(() => stranger.rpc.call("get.many", { box: boxA.id, idxs: [] }), "no_such_box"));
+        listen &&
+        signIn && (await rejects(() => stranger.rpc.call("list", { box: boxA.id }), "no_such_box")) && (await rejects(() => stranger.rpc.call("get.many", { box: boxA.id, idxs: [] }), "no_such_box"));
       const tape = await rejects(() => stranger.rpc.call("tape.revoke", { id: a.tape.id }), "no_such_tape");
       const log = (await stranger.rpc.call<{ entries: unknown[] }>("log", {})).entries.length;
       const mine = await rejects(() => me.rpc.call("list", { box: theirs.id }), "no_such_box");
       return peek && tape && mine && log < 10
-        ? pass("One person's device couldn't list, listen to, revoke or read the log of another person's boxes; their boxes look like no box at all.")
+        ? pass("One person's device couldn't list, listen to, sign an app in to, revoke or read the log of another person's boxes; their boxes look like no box at all.")
         : failed("One account reached another account's box.");
     });
 

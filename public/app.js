@@ -2758,16 +2758,23 @@ async function renderConnect(id) {
       return req.site;
     }
   })();
-  // An app can keep its data in a box someone shared with you, so you both use the same data.
-  const sharedBoxes = req.scopes.includes("box") ? (await account.boxes()).filter((b) => b.shared?.write) : [];
-  const where = sharedBoxes.length
+  // An app can keep its data in a box of yours, or one someone shared with you, so you both use the same
+  // data (read-only if it was shared with you that way). Never offered: your personal box.
+  const personalId = (await account.personalBox())?.id;
+  const choices = req.scopes.includes("box") ? (await account.boxes()).filter((b) => b.id !== personalId && b.id !== req.box) : [];
+  const current = req.box ? (await account.boxById(req.box)) : null;
+  const label = (b) => (b.shared ? `${b.name}, shared with you by ${b.shared.from}${b.shared.write ? "" : " (it can read, not change)"}` : `${b.name} (yours)`);
+  const where = choices.length
     ? h(
         "select",
         { "aria-label": "Where it keeps its data" },
-        h("option", { value: "" }, req.boxName ? `its own box (${req.boxName})` : "a new box of its own"),
-        sharedBoxes.map((b) => h("option", { value: b.id, selected: b.id === req.box }, `${b.name}, shared with you by ${b.shared.from}`)),
+        h("option", { value: current?.id ?? "" }, current ? `${label(current)}, as last time` : "a new box of its own"),
+        choices.some((b) => !b.shared) ? h("optgroup", { label: "Your boxes" }, choices.filter((b) => !b.shared).map((b) => h("option", { value: b.id }, label(b)))) : null,
+        choices.some((b) => b.shared) ? h("optgroup", { label: "Shared with you" }, choices.filter((b) => b.shared).map((b) => h("option", { value: b.id }, label(b)))) : null,
       )
     : null;
+  const readOnlyNote = h("p", { class: "small muted", hidden: true }, "It can read what's in that box, but not change it, because it was shared with you read-only.");
+  where?.addEventListener("change", () => (readOnlyNote.hidden = !choices.find((b) => b.id === where.value)?.shared || choices.find((b) => b.id === where.value).shared.write));
   const status = h("div");
   const allow = h("button", { type: "button" }, "Let it in");
   const deny = h("button", { type: "button", class: "secondary" }, "No thanks");
@@ -2790,6 +2797,7 @@ async function renderConnect(id) {
       h("p", { class: "muted" }, "It's asking to:"),
       h("ul", { class: "list perms" }, perms),
       where ? h("label", { class: "field" }, "Keep its data in", where) : null,
+      readOnlyNote,
       plainShare,
       h("p", { class: "small" }, "It stays connected until you disconnect it on your Apps page, or until it goes unused for 30 days."),
       req.client.selfRegistered

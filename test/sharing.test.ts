@@ -161,11 +161,31 @@ describe("sharing boxes between people", () => {
     assert.deepEqual(await session.box().get("milk"), { qty: 2 }, "Anna's app opens the family box");
     await session.box().put("apples", { qty: 6 });
     assert.deepEqual(await (await t.me.open("shopping")).get("apples"), { qty: 6 });
-    const read = await t.me.shareBox("recipes", { write: false });
-    const recipes = await anna.joinShare(read.link, { name: "recipes" }).catch(async () => anna.box("recipes"));
+    // A box shared read-only works too: the app can read it, not change it (a LORE player reading the game master's world).
+    await t.me.createBox("house-rules");
+    await (await t.me.open("house-rules")).put("soup", { serves: 4 });
+    const read = await t.me.shareBox("house-rules", { write: false });
+    const recipes = await anna.joinShare(read.link);
     const second = await startSignIn(config);
     const id2 = (await fetch(second.url, { redirect: "manual" })).headers.get("location")!.slice("/?connect=".length);
-    await rejectsWith(anna.approveSignIn(id2, { box: recipes.id }), "read_only");
+    const appKey2 = new URL(second.url).hash.match(/cardboard_key=([\w-]+)/)?.[1] ?? null;
+    const reader = await finishSignIn(config, await anna.approveSignIn(id2, { appKey: appKey2, box: recipes.id }), second);
+    assert.deepEqual(await reader.box().get("soup"), { serves: 4 }, "it reads the shared box");
+    await rejectsWith(reader.box().put("soup", { serves: 400 }), "read_only");
+    await rejectsWith(reader.box().delete("soup"), "read_only");
+    assert.deepEqual(await (await t.me.open("house-rules")).get("soup"), { serves: 4 }, "and can't change it");
+  });
+
+  it("signs an app in with one of your own boxes", async () => {
+    const app = await registerApp(t.cb.url, { name: "Second App", redirectUris: ["http://localhost:5173/callback"] });
+    const config: SignInConfig = { issuer: t.cb.url, clientId: app.clientId, redirectUri: "http://localhost:5173/callback", scopes: ["openid", "box"] };
+    await t.me.createBox("worlds");
+    await (await t.me.open("worlds")).put("eldoria", { name: "Eldoria" });
+    const pending = await startSignIn(config);
+    const id = (await fetch(pending.url, { redirect: "manual" })).headers.get("location")!.slice("/?connect=".length);
+    const appKey = new URL(pending.url).hash.match(/cardboard_key=([\w-]+)/)?.[1] ?? null;
+    const session = await finishSignIn(config, await t.me.approveSignIn(id, { appKey, box: (await t.me.box("worlds")).id }), pending);
+    assert.deepEqual(await session.box().get("eldoria"), { name: "Eldoria" });
   });
 
   it("goes when its owner deletes their account", async () => {
