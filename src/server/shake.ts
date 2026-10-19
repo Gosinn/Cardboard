@@ -158,12 +158,21 @@ export async function runShake(api: Api): Promise<ShakeReport> {
     });
 
     await check("accounts", "Accounts can't see into each other", async () => {
-      const peek = (await rejects(() => stranger.rpc.call("list", { box: boxA.id }), "no_such_box")) && (await rejects(() => stranger.rpc.call("get.many", { box: boxA.id, idxs: [] }), "no_such_box"));
+      const listen = (() => {
+        try {
+          api.authorizeDeviceWatch({ op: "watch", authorization: `Bearer ${stranger.rpc.token}`, ip: PROBE_IP, body: { box: boxA.id }, internal: true });
+          return false;
+        } catch (err) {
+          return err instanceof CardboardError && err.code === "no_such_box";
+        }
+      })();
+      const peek =
+        listen && (await rejects(() => stranger.rpc.call("list", { box: boxA.id }), "no_such_box")) && (await rejects(() => stranger.rpc.call("get.many", { box: boxA.id, idxs: [] }), "no_such_box"));
       const tape = await rejects(() => stranger.rpc.call("tape.revoke", { id: a.tape.id }), "no_such_tape");
       const log = (await stranger.rpc.call<{ entries: unknown[] }>("log", {})).entries.length;
       const mine = await rejects(() => me.rpc.call("list", { box: theirs.id }), "no_such_box");
       return peek && tape && mine && log < 10
-        ? pass("One person's device couldn't list, revoke or read the log of another person's boxes; their boxes look like no box at all.")
+        ? pass("One person's device couldn't list, listen to, revoke or read the log of another person's boxes; their boxes look like no box at all.")
         : failed("One account reached another account's box.");
     });
 

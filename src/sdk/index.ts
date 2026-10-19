@@ -562,7 +562,7 @@ export class Box {
     const onChange = (typeof a === "function" ? a : b) as (change: Change<T>) => void;
     const options = (typeof a === "function" ? b : c) as WatchOptions | undefined;
     let queue = Promise.resolve();
-    return this.stream("watch", {}, {
+    return this.stream("watch", { ...this.scope }, {
       onReady: () => options?.onReady?.(),
       onError: options?.onError,
       onEvent: (type, data) => {

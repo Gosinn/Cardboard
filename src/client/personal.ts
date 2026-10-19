@@ -31,7 +31,7 @@ export interface LinkValue {
   url: string;
   notes: string;
 }
-export interface FileValue {
+export interface FileValue extends Sent {
   title: string;
   name: string;
   type: string;
@@ -49,7 +49,14 @@ export interface FileValue {
   notes: string;
 }
 
-export interface Thing<V = NoteValue | PasswordValue | LinkValue | FileValue> {
+/** Set on something you sent yourself from another device, until you keep it or clear it. */
+export interface Sent {
+  inbox?: true;
+  /** The device it came from, as you named it. */
+  from?: string;
+}
+
+export interface Thing<V = (NoteValue | PasswordValue | LinkValue | FileValue) & Sent> {
   kind: ThingKind;
   id: string;
   key: string;
@@ -161,6 +168,8 @@ function toThing(item: Item): Thing | null {
     if (raw.hashOf === "parts") value.hashOf = "parts";
   }
   if (!value.title) value.title = `Untitled ${KINDS[kind].one}`;
+  const raw = item.value as Record<string, unknown>;
+  if (raw.inbox === true) Object.assign(value, { inbox: true, from: text(raw.from, 100) });
   return { kind, id: item.key.slice(item.key.indexOf("/") + 1), key: item.key, value: value as unknown as Thing["value"], version: item.version, createdAt: item.createdAt, updatedAt: item.updatedAt };
 }
 
@@ -186,6 +195,34 @@ export async function saveThing(box: Box, kind: Exclude<ThingKind, "file">, inpu
   const value = cleanValue(kind, input);
   await box.put(key, value, { ifVersion: options.id ? options.version : 0 });
   return toThing((await box.getItem(key))!)!;
+}
+
+/**
+ * Sends something to your other devices: a link, a bit of text, or a file. It
+ * lands in your personal box marked as just arrived, so every device you're
+ * signed in on shows it, live, until you keep it or clear it.
+ */
+export async function sendText(box: Box, text: string, from: string): Promise<Thing> {
+  const trimmed = text.trim();
+  if (!trimmed) throw fail("nothing_to_send", 400, "There's nothing to send.", "Type or paste something first, or pick a file.");
+  // A lone web address becomes a link you can open; anything else, a note you can copy.
+  const url = /^\S+$/.test(trimmed) && /^(https?:\/\/|www\.)/i.test(trimmed) ? safeUrl(trimmed) : null;
+  const kind = url ? "link" : "note";
+  const value = { ...cleanValue(kind, url ? { url } : { text: trimmed }), inbox: true, from: from.slice(0, 100) };
+  const key = thingKey(kind, sortableId(Date.now()));
+  await box.put(key, value, { ifVersion: 0 });
+  return toThing((await box.getItem(key))!)!;
+}
+
+export function sendFile(box: Box, file: Blob, from: string, options: { name?: string; signal?: AbortSignal; onProgress?: (fraction: number, bytes: number) => void } = {}) {
+  return addFile(box, file, { ...options, sentFrom: from });
+}
+
+/** Keeps something you sent yourself: it stays in your personal box as an ordinary note, link or file. */
+export async function keepThing(box: Box, thing: Thing): Promise<Thing> {
+  const { inbox: _inbox, from: _from, ...value } = thing.value as unknown as Record<string, unknown>;
+  await box.put(thing.key, value, { ifVersion: thing.version });
+  return toThing((await box.getItem(thing.key))!)!;
 }
 
 /** Renames a file or changes its notes; the bytes stay as they are. */
@@ -218,7 +255,7 @@ const hex = (bytes: Uint8Array) => [...bytes].map((b) => b.toString(16).padStart
 export async function addFile(
   box: Box,
   file: Blob,
-  options: { name?: string; type?: string; title?: string; notes?: string; signal?: AbortSignal; onProgress?: (fraction: number, bytes: number) => void } = {},
+  options: { name?: string; type?: string; title?: string; notes?: string; sentFrom?: string; signal?: AbortSignal; onProgress?: (fraction: number, bytes: number) => void } = {},
 ): Promise<Thing<FileValue>> {
   const name = (options.name ?? (file as File).name ?? "file").slice(0, 500) || "file";
   const size = file.size;
@@ -253,6 +290,7 @@ export async function addFile(
       sha256: hex(await sha256(hashes)),
       hashOf: "parts",
       notes: text(options.notes),
+      ...(options.sentFrom !== undefined ? { inbox: true as const, from: options.sentFrom.slice(0, 100) } : {}),
     };
     const key = thingKey("file", id);
     await box.put(key, value, { ifVersion: 0 });

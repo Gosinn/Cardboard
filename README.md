@@ -1,6 +1,8 @@
 # 📦 Cardboard
 
-**A smart, private deposit box for all your personal apps. End-to-end encrypted: whoever runs the server can't read what's in it.**
+**Keep, move and protect your data, and connect your apps, conveniently. End-to-end encrypted: whoever runs the server can't read any of it.**
+
+The everyday things should be easy: **send a link, a note or a photo to yourself** and it's on your other devices a second later. Keep notes, passwords, files and videos in one **personal box** you can open anywhere. Share a box with family. Let your apps keep their data with you instead of on their own servers.
 
 Every app you build gets its own **box**. Apps open their box with a **tape**. Everything is sealed on your devices and inside your apps before it leaves them, so the Cardboard server only ever stores bytes it can't open: not your data, not your key names, not even your box names. Cardboard still remembers every version, tells you in plain English who touched what, and attacks itself to prove the locks hold.
 
@@ -91,6 +93,14 @@ Nobody can reset your account for you, not even whoever runs Cardboard. That's t
 On *You → Lock with Face ID*, a browser makes a passkey (Face ID, Touch ID, Windows Hello, or a phone's fingerprint). From then on, opening your Cardboard there takes your face, finger or PIN, and it locks itself again when you leave it alone (15 minutes by default; you pick).
 
 This is a real lock, not a screen: the passkey makes a secret (WebAuthn's PRF extension) that the browser never stores, and this device's copy of your account key is sealed by it **and** by the device's own key. The device's token is swapped for a new one and kept sealed too. So someone who picks up your unlocked phone, or copies the browser's storage off a laptop, gets nothing. Passkeys are tied to your Cardboard's address, so a look-alike site can't ask for the same secret. Works in Safari 18+ (iPhone, iPad, Mac), Chrome and Edge 132+, Firefox 135+, over HTTPS.
+
+## Send to yourself
+
+The oldest annoyance on the internet: getting something from your phone to your laptop. On your shelf, **Send to yourself**: type or paste anything (a link, a note, a code), attach or drop files, and press *Send to my devices*. A second later it's on every device you're signed in on, under *Just arrived*, live, with *Copy*, *Open* or *Download* right there. *Keep* puts it in your personal box for good; *Clear* tidies it away (and can be undone).
+
+- **From any app on Android:** once Cardboard is on your home screen, it's in the **Share** menu. Share a photo, a page or some text to Cardboard and it lands on your laptop.
+- **Sealed on the device it was sent from**, like everything else. Your other devices are told *that* something arrived, then fetch and open it themselves; the server only passes sealed bytes along.
+- Files of any size, sent a piece at a time. Paste a screenshot straight into the box.
 
 ## Your personal box
 

@@ -8,6 +8,7 @@ import {
   cleanValue,
   FILE_PART_BYTES,
   filePartKey,
+  keepThing,
   keysOf,
   kindOfKey,
   listThings,
@@ -19,12 +20,16 @@ import {
   safeUrl,
   saveFileDetails,
   saveThing,
+  sendFile,
+  sendText,
   strayParts,
   strongPassword,
   type FileValue,
   type Thing,
 } from "../src/client/personal.ts";
 import { toB64u } from "../src/client/crypto.ts";
+import { recoverWithKit } from "../src/client/account.ts";
+import { MemoryStore } from "../src/client/device.ts";
 import { openDb } from "../src/server/db.ts";
 import { CardboardError, type Box } from "../src/sdk/index.ts";
 import { startTestServer, type TestServer } from "./helpers.ts";
@@ -364,6 +369,75 @@ describe("room for files", () => {
       assert.equal(check?.status, "pass", JSON.stringify(check));
       const { box } = await t.newBox("after-shake");
       await box.put("x", 1);
+    } finally {
+      await t.stop();
+    }
+  });
+});
+
+describe("sending things to yourself", () => {
+  it("lands on your other devices, live, until you keep it or clear it", async () => {
+    const t = await startTestServer({ shake: false });
+    try {
+      const laptop = await t.me.open(await t.me.makePersonalBox());
+      const phoneAccount = await recoverWithKit({ url: t.cb.url, code: t.kit, store: new MemoryStore(), kind: "browser", label: "phone" });
+      const phone = await phoneAccount.open((await phoneAccount.personalBox())!);
+      const heard: Array<{ key: string; value: unknown }> = [];
+      let ready!: () => void;
+      const listening = new Promise<void>((resolve) => (ready = resolve));
+      const watcher = phone.watch((change) => heard.push({ key: change.key, value: change.value }), { onReady: () => ready() });
+      await listening;
+
+      const link = await sendText(laptop, "https://example.com/recipe", "laptop");
+      const note = await sendText(laptop, "Door code 4512\nfor Saturday", "laptop");
+      const file = await sendFile(laptop, new File([new Uint8Array(randomBytes(FILE_PART_BYTES + 5))], "scan.pdf", { type: "application/pdf" }), "laptop");
+      assert.deepEqual([link.kind, link.value.inbox, link.value.from, (link.value as { url: string }).url], ["link", true, "laptop", "https://example.com/recipe"]);
+      assert.deepEqual([note.kind, note.value.title], ["note", "Door code 4512"]);
+      assert.equal(file.value.inbox, true);
+      await rejectsWith(sendText(laptop, "   ", "laptop"), "nothing_to_send");
+
+      await new Promise((r) => setTimeout(r, 300));
+      watcher.close();
+      const keys = heard.map((h) => h.key);
+      for (const k of [link.key, note.key, file.key]) assert.ok(keys.includes(k), `the phone heard about ${k}`);
+      assert.ok(heard.every((h) => h.value === undefined), "devices hear what changed, not the contents (no file streamed to every device)");
+
+      const arrived = (await listThings(phone)).things.filter((x) => x.value.inbox);
+      assert.equal(arrived.length, 3);
+      const kept = await keepThing(phone, arrived.find((x) => x.key === note.key)!);
+      assert.equal(kept.value.inbox, undefined);
+      assert.equal((kept.value as { text: string }).text, "Door code 4512\nfor Saturday");
+      assert.equal((await listThings(laptop)).things.filter((x) => x.value.inbox).length, 2);
+    } finally {
+      await t.stop();
+    }
+  });
+
+  it("can't be listened to by anyone else, and stops when a device is removed", async () => {
+    const t = await startTestServer({ shake: false });
+    try {
+      const mine = await t.me.makePersonalBox();
+      const { account: stranger } = await t.newAccount();
+      const res = await fetch(`${t.cb.url}/v1/watch`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${(stranger as unknown as { rpc: { token: string } }).rpc.token}`, "content-type": "application/json", origin: t.cb.url },
+        body: JSON.stringify({ box: mine.id }),
+      });
+      assert.equal(res.status, 404, "another person's box looks like no box");
+      assert.equal(((await res.json()) as { error: { code: string } }).error.code, "no_such_box");
+
+      const phoneAccount = await recoverWithKit({ url: t.cb.url, code: t.kit, store: new MemoryStore(), kind: "browser", label: "phone" });
+      const phone = await phoneAccount.open((await phoneAccount.personalBox())!);
+      let ready!: () => void;
+      let errored = false;
+      const listening = new Promise<void>((resolve) => (ready = resolve));
+      const watcher = phone.watch(() => {}, { onReady: () => ready(), onError: () => (errored = true) });
+      await listening;
+      const phoneId = (await phoneAccount.me()).devices.find((d) => d.current)!.id;
+      await t.me.removeDevice(phoneId);
+      await new Promise((r) => setTimeout(r, 1500));
+      watcher.close();
+      assert.ok(errored, "the removed phone's live connection was closed and couldn't come back");
     } finally {
       await t.stop();
     }

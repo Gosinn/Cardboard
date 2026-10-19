@@ -390,6 +390,17 @@ export class Api {
     return { status: 200, headers: {}, body: handler(asBody(req.body), req) };
   }
 
+  /**
+   * Live changes for one of your devices: your own boxes and boxes shared with
+   * you. (Reads by your own devices aren't logged.) Its stream is tagged with
+   * the account and device, so removing either closes it.
+   */
+  authorizeDeviceWatch(req: ApiRequest): { box: Box; tag: string } {
+    const auth = this.authenticateDevice(req, bearer(req.authorization) ?? "");
+    const { box } = this.ctx.sharing.reach(auth.account.id, requireString(asBody(req.body), "box", 64));
+    return { box, tag: deviceStream(auth.account.id, auth.device.id) };
+  }
+
   /** Auth + scope check for the streaming watch endpoint (served by the HTTP layer). */
   authorizeWatch(req: ApiRequest): AppAuth {
     const auth = this.authenticateApp(req);
@@ -768,14 +779,14 @@ export class Api {
     const tapeIds = (db.prepare("SELECT id FROM tapes WHERE box_id = ? AND account_id = ? AND revoked_at IS NULL").all(member.boxId, member.accountId) as Array<{ id: string }>).map((r) => r.id);
     db.prepare("UPDATE tapes SET revoked_at = ?, bundle = NULL WHERE box_id = ? AND account_id = ? AND revoked_at IS NULL").run(this.now(), member.boxId, member.accountId);
     for (const grant of oauth.grants(member.accountId)) if (grant.boxId === member.boxId) oauth.revokeGrant(grant.id);
-    hub.closeWhere((w) => w.tapeId !== null && tapeIds.includes(w.tapeId));
+    hub.closeWhere((w) => w.tapeId !== null && (tapeIds.includes(w.tapeId) || (w.boxId === member.boxId && w.tapeId.startsWith(deviceStream(member.accountId, "")))));
     sharing.remove(member.id);
   }
 
   /** Before an account goes: close its apps' streams on boxes other people shared with it. */
   private closeStreamsOf(accountId: string) {
     const ids = (this.ctx.db.prepare("SELECT id FROM tapes WHERE account_id = ?").all(accountId) as Array<{ id: string }>).map((r) => r.id);
-    this.ctx.hub.closeWhere((w) => w.tapeId !== null && ids.includes(w.tapeId));
+    this.ctx.hub.closeWhere((w) => w.tapeId !== null && (ids.includes(w.tapeId) || w.tapeId.startsWith(deviceStream(accountId, ""))));
   }
 
   dockSummary(dock: Dock) {
@@ -875,6 +886,7 @@ export class Api {
 
       "device.remove": (a, body, req) => {
         const removed = accounts.removeDevice(a.account.id, requireString(body, "id", 64));
+        hub.closeWhere((w) => w.tapeId === deviceStream(a.account.id, removed.id));
         record(a, req, "device.remove", { ref: removed.label ? { sealed: removed.label, ctx: ctx.deviceLabel } : null });
         return { removed: removed.id, self: removed.id === a.device.id };
       },
@@ -1810,3 +1822,8 @@ function requireWrite(who: { write: boolean }) {
 
 export type { Outcome };
 export { isPlainObject };
+
+/** How a device's live stream is tagged in the hub: by account and device, so either can close it. */
+function deviceStream(accountId: string, deviceId: string): string {
+  return `device:${accountId}:${deviceId}`;
+}

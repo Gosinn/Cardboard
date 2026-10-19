@@ -539,6 +539,10 @@ a.button {
   background: none;
 }
 
+a.thing-open {
+  text-decoration: none;
+}
+
 .thing-open:hover {
   background: var(--card-2);
 }
@@ -599,6 +603,14 @@ textarea.plain {
   .drop-hint {
     display: none;
   }
+}
+
+.send-card textarea {
+  width: 100%;
+}
+
+.send-card .arrived:empty {
+  display: none;
 }
 
 /* ── Lists & tables ─────────────────────────────────────── */

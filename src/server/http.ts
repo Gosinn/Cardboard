@@ -190,6 +190,16 @@ export async function startServer(options: StartOptions = {}): Promise<RunningCa
       return;
     }
 
+    // Android's share sheet posts here when Cardboard is installed. media-sw.js catches it on the phone, so
+    // what you share is sealed there first. If the helper isn't running, the post reaches us instead: send
+    // the browser on without reading a byte of it.
+    if (req.method === "POST" && path === "/share") {
+      res.writeHead(303, { location: "/#/send?unsealed" });
+      res.end();
+      req.destroy();
+      return;
+    }
+
     const route = /^\/v1\/([a-z][a-z.]{0,40})$/.exec(path);
     const origin = header(req, "origin");
     if (req.method === "OPTIONS" && route) {
@@ -230,6 +240,7 @@ export async function startServer(options: StartOptions = {}): Promise<RunningCa
     };
     const tapeCall = /^Bearer\s+cbt_/i.test(apiReq.authorization ?? "");
     if (tapeCall && apiReq.op === "watch") return watch(apiReq, res);
+    if (/^Bearer\s+cbd_/i.test(apiReq.authorization ?? "") && apiReq.op === "watch") return watchAsDevice(apiReq, res);
     if (tapeCall && apiReq.op === "dock.watch") return watchDock(apiReq, res);
     const out = apiReq.op === "host.shake" ? await api.hostShake(apiReq) : api.call(apiReq);
     sendJson(res, out.status, out.body, out.headers);
@@ -247,6 +258,22 @@ export async function startServer(options: StartOptions = {}): Promise<RunningCa
     openStream(res, auth.cors);
     res.write(`event: ready\ndata: ${JSON.stringify({ box: auth.box.id })}\n\n`);
     stream(res, `box:${auth.box.id}`, auth.box.id, auth.tape.id, (_change: Omit<Change, "boxId">) => true, "change");
+  }
+
+  /** The same, for one of your own devices (the dashboard): what arrives from your other devices, live. */
+  function watchAsDevice(apiReq: ApiRequest, res: ServerResponse) {
+    let auth: ReturnType<Api["authorizeDeviceWatch"]>;
+    try {
+      auth = api.authorizeDeviceWatch(apiReq);
+    } catch (err) {
+      const out = errorResponse(err);
+      return sendJson(res, out.status, out.body);
+    }
+    openStream(res, {});
+    res.write(`event: ready\ndata: ${JSON.stringify({ box: auth.box.id })}\n\n`);
+    // Names and versions only: a device fetches the values it wants, so a big upload on one device
+    // doesn't stream every part of it to the others.
+    stream(res, `box:${auth.box.id}`, auth.box.id, auth.tag, (_change: Omit<Change, "boxId">) => true, "change", ({ value: _value, ...rest }) => rest);
   }
 
   /** Server-sent events: one `parcel` event per parcel addressed to this app at the dock. */
@@ -274,14 +301,14 @@ export async function startServer(options: StartOptions = {}): Promise<RunningCa
     });
   }
 
-  function stream(res: ServerResponse, channel: string, boxId: string, tapeId: string, accept: (event: any) => boolean, eventName: string) {
+  function stream(res: ServerResponse, channel: string, boxId: string, tapeId: string, accept: (event: any) => boolean, eventName: string, shape: (event: any) => unknown = (e) => e) {
     const ping = setInterval(() => res.write(": ping\n\n"), 25_000);
     const unsubscribe = hub.subscribe({
       channel,
       boxId,
       tapeId,
       accept,
-      send: (event) => res.write(`event: ${eventName}\ndata: ${JSON.stringify(event)}\n\n`),
+      send: (event) => res.write(`event: ${eventName}\ndata: ${JSON.stringify(shape(event))}\n\n`),
       close: () => {
         clearInterval(ping);
         res.end();

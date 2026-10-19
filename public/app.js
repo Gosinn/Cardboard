@@ -25,6 +25,9 @@ import {
   saveFileDetails,
   saveThing,
   searchText,
+  sendFile,
+  sendText,
+  keepThing,
   strayParts,
   strongPassword,
   subtitle,
@@ -728,6 +731,8 @@ function friendsForm() {
 async function renderShelf() {
   const [boxes, me, docks] = await Promise.all([account.boxes(), account.me(), account.docks()]);
   const personal = await account.personalBox(me);
+  if (personal) PERSONAL_HOME = personal.name;
+  const sending = await sendCard(me, personal);
   const searchInput = h("input", { type: "search", placeholder: "Find anything in any box…", "aria-label": "Search every box" });
   const results = h("div");
   const search = h("form", { class: "search" }, searchInput, h("button", { type: "submit", class: "secondary" }, "Search"));
@@ -796,6 +801,7 @@ async function renderShelf() {
     search,
     results,
     pendingCard(docks.pending),
+    sending,
     personalCard(personal),
     insightsBox,
     h("div", { class: "grid" }, cards, newBoxCard()),
@@ -806,6 +812,231 @@ async function renderShelf() {
     insightsBox,
     insights.length ? [h("h2", {}, "Worth a look"), insights.map(insightCard)] : [h("h2", {}, "All good"), h("p", { class: "muted" }, "Nothing needs fixing right now.")],
   );
+}
+
+// ── Send to yourself ─────────────────────────────────────────────────────────
+//
+// Type, paste or drop something on one device; it's sealed here, lands in your
+// personal box marked "just arrived", and shows up live on your other devices.
+
+/** The live connection to your personal box while the shelf is open. */
+let shelfWatch = null;
+/** The first send re-draws the shelf (it made your personal box); this keeps its "Sent" on screen. */
+let sentJustNow = false;
+let arrivedUnseen = 0;
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") {
+    arrivedUnseen = 0;
+    document.title = "Cardboard";
+  }
+});
+
+function thisDeviceName(me) {
+  return me.devices.find((d) => d.current)?.name ?? "one of your devices";
+}
+
+/** The "Send to yourself" card: a box to type or paste into, files to attach, and what just arrived. */
+async function sendCard(me, personal) {
+  const box = personal ? await account.open(personal) : null;
+  const from = thisDeviceName(me);
+  const text = h("textarea", { rows: 2, class: "plain", placeholder: "Paste a link, a note, anything. Or drop a file.", "aria-label": "What to send" });
+  const picker = h("input", { type: "file", multiple: true, hidden: true });
+  const attached = h("div", { class: "row" });
+  const status = h("div", { class: "small" }, sentJustNow ? h("span", { class: "chip ok" }, "Sent. It's on your other devices now.") : null);
+  sentJustNow = false;
+  const arrived = h("ul", { class: "list things arrived" });
+  const send = h("button", { type: "submit" }, "Send to my devices");
+  let files = [];
+
+  const showFiles = () =>
+    fill(
+      attached,
+      files.map((f, i) => h("span", { class: "chip" }, `📎 ${f.name} · ${bytes(f.size)} `, h("button", { type: "button", class: "link tiny", "aria-label": `Remove ${f.name}`, onclick: () => ((files = files.filter((_, j) => j !== i)), showFiles()) }, "✕"))),
+    );
+  const addFiles = (list) => {
+    files.push(...[...list].filter((f) => f.size > 0));
+    showFiles();
+  };
+  picker.addEventListener("change", () => {
+    addFiles(picker.files);
+    picker.value = "";
+  });
+  text.addEventListener("paste", (e) => {
+    if (e.clipboardData?.files.length) {
+      e.preventDefault();
+      addFiles(e.clipboardData.files);
+    }
+  });
+  text.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) form.requestSubmit();
+  });
+
+  const form = h(
+    "form",
+    { class: "card stack send-card" },
+    h("h2", {}, "Send to yourself"),
+    text,
+    attached,
+    h("div", { class: "row" }, send, h("button", { type: "button", class: "secondary", onclick: () => picker.click() }, "Attach files"), picker, h("span", { class: "muted small" }, "Sealed here, then it's on every device you're signed in on.")),
+    status,
+    arrived,
+  );
+  form.addEventListener("dragover", (e) => [...(e.dataTransfer?.types ?? [])].includes("Files") && e.preventDefault());
+  form.addEventListener("drop", (e) => {
+    if (!e.dataTransfer?.files.length) return;
+    e.preventDefault();
+    addFiles(e.dataTransfer.files);
+  });
+
+  let target = box;
+  onSubmit(form, status, async () => {
+    if (!text.value.trim() && !files.length) throw new Error("Type or paste something, or attach a file.");
+    const first = !target;
+    // The first send makes your personal box.
+    target ??= await account.open(await account.makePersonalBox());
+    await sendNow(target, from, text.value, files, status);
+    text.value = "";
+    files = [];
+    showFiles();
+    if (first) {
+      sentJustNow = true;
+      return render(); // so the shelf shows the new box, and listens to it
+    }
+    await showArrived();
+  });
+
+  async function showArrived() {
+    if (!target) return fill(arrived);
+    const { things } = await listThings(target);
+    const fresh = things.filter((t) => t.value.inbox).slice(0, 8);
+    fill(
+      arrived,
+      fresh.length ? h("li", { class: "muted small" }, "Just arrived") : null,
+      fresh.map((t) => arrivedRow(target, t, showArrived)),
+    );
+  }
+
+  await showArrived();
+  shelfWatch?.close();
+  shelfWatch = null;
+  listen();
+  // Coming back to this tab: catch up, in case the live connection dropped while the phone slept.
+  const catchUp = () => {
+    if (!form.isConnected) return document.removeEventListener("visibilitychange", catchUp);
+    if (document.visibilityState === "visible") showArrived().catch(() => {});
+  };
+  document.addEventListener("visibilitychange", catchUp);
+  return form;
+
+  /** Live: something sent from another device shows up here straight away. */
+  function listen() {
+    if (!target) return;
+    shelfWatch?.close();
+    let timer = null;
+    shelfWatch = target.watch((change) => {
+      if (!/^(notes|links|files)\//.test(change.key)) return;
+      clearTimeout(timer);
+      timer = setTimeout(async () => {
+        const before = arrived.querySelectorAll(".thing").length;
+        await showArrived().catch(() => {});
+        const after = arrived.querySelectorAll(".thing").length;
+        if (after > before && document.visibilityState !== "visible") {
+          arrivedUnseen += after - before;
+          document.title = `(${arrivedUnseen}) Cardboard`;
+        }
+      }, 300);
+    }, { onError: () => {} });
+  }
+}
+
+/** Seals and sends text and files, saying how it's going in `status`. */
+async function sendNow(box, from, text, files, status) {
+  if (text.trim()) await sendText(box, text, from);
+  for (const file of files) {
+    const progress = h("span", {}, `Sealing ${file.name}…`);
+    status.replaceChildren(progress);
+    await sendFile(box, file, from, { onProgress: (f, done) => (progress.textContent = `Sealing ${file.name}… ${Math.round(f * 100)}% (${bytes(done)} of ${bytes(file.size)})`) });
+  }
+  status.replaceChildren(h("span", { class: "chip ok" }, "Sent. It's on your other devices now."));
+}
+
+/** One thing that just arrived: open, copy or play it, keep it, or clear it. */
+function arrivedRow(box, t, refresh) {
+  const v = t.value;
+  const url = t.kind === "link" ? safeUrl(v.url) : null;
+  const keep = h("button", { type: "button", class: "secondary tiny" }, "Keep");
+  keep.addEventListener("click", () => withBusy(keep, async () => (await keepThing(box, t), refresh())));
+  const clear = h("button", { type: "button", class: "secondary tiny", "aria-label": `Clear ${v.title}` }, "Clear");
+  clear.addEventListener("click", () => withBusy(clear, async () => (await removeThing(box, t), refresh())));
+  return h(
+    "li",
+    { class: "thing" },
+    h(
+      "a",
+      { class: "thing-open", href: `#/box/${encodeURIComponent(PERSONAL_HOME)}/${encodeURIComponent(t.key)}` },
+      h("span", { class: "thing-icon", "aria-hidden": "true" }, iconOf(t)),
+      h("span", { class: "thing-text" }, h("strong", {}, v.title), h("span", { class: "muted small" }, [subtitle(t), `from ${v.from || "another device"}`].filter(Boolean).join(" · "))),
+      h("span", { class: "muted small thing-when" }, ago(t.updatedAt)),
+    ),
+    h(
+      "span",
+      { class: "row thing-actions" },
+      t.kind === "note" ? copyButton(v.text || v.title, "Copy") : null,
+      url ? h("a", { class: "button secondary tiny", href: url, target: "_blank", rel: "noopener noreferrer" }, "Open") : null,
+      url ? copyButton(url, "Copy") : null,
+      keep,
+      clear,
+    ),
+  );
+}
+
+/** The personal box's name, for links (set when the shelf loads). */
+let PERSONAL_HOME = "personal";
+
+/** What another app shared to Cardboard (Android's share sheet), kept on this phone by media-sw.js. */
+async function takePendingShare() {
+  const db = await new Promise((resolve, reject) => {
+    const open = indexedDB.open("cardboard-share", 1);
+    open.onupgradeneeded = () => open.result.createObjectStore("pending");
+    open.onsuccess = () => resolve(open.result);
+    open.onerror = () => reject(open.error);
+  });
+  try {
+    return await new Promise((resolve, reject) => {
+      const tx = db.transaction("pending", "readwrite");
+      const store = tx.objectStore("pending");
+      const get = store.get("share");
+      get.onsuccess = () => {
+        store.delete("share");
+        resolve(get.result ?? null);
+      };
+      tx.onerror = () => reject(tx.error);
+    });
+  } finally {
+    db.close();
+  }
+}
+
+/** #/send: you shared something to Cardboard from another app. Seal it and send it to your devices. */
+async function renderSend() {
+  const status = h("div", { class: "stack" });
+  fill(app, h("section", { class: "card stack login" }, h("h1", {}, "Send to yourself"), status));
+  if (location.hash.includes("unsealed")) {
+    return fill(status, h("p", {}, "Nothing was sent: Cardboard's helper wasn't running on this phone yet, so what you shared went nowhere (and nothing was kept)."), h("p", { class: "muted small" }, "Open Cardboard once, then share again."), h("a", { href: "#/" }, "Go to your shelf"));
+  }
+  const shared = await takePendingShare().catch(() => null);
+  if (!shared || (!shared.text && !shared.files?.length)) {
+    return fill(status, h("p", {}, location.hash.includes("failed") ? "Cardboard couldn't read what was shared. Try again?" : "There's nothing waiting to be sent."), h("a", { href: "#/" }, "Go to your shelf"));
+  }
+  const me = await account.me();
+  const box = await account.open(await account.makePersonalBox());
+  try {
+    await sendNow(box, thisDeviceName(me), shared.text ?? "", shared.files ?? [], status);
+    history.replaceState(null, "", "#/");
+    fill(status, h("p", {}, h("span", { class: "chip ok" }, "Sent"), " It's on your other devices now."), h("a", { href: "#/" }, "Go to your shelf"));
+  } catch (err) {
+    fill(status, errorBox(err), h("a", { href: "#/" }, "Go to your shelf"));
+  }
 }
 
 /** Your personal box on the shelf, or the button that makes it. */
@@ -1064,17 +1295,24 @@ async function renderPersonal(info, me, openKey) {
         "button",
         { type: "button", class: "thing-open", onclick: () => editThing(t.kind, t) },
         h("span", { class: "thing-icon", "aria-hidden": "true" }, iconOf(t)),
-        h("span", { class: "thing-text" }, h("strong", {}, t.value.title), h("span", { class: "muted small" }, subtitle(t) || " ")),
+        h("span", { class: "thing-text" }, h("strong", {}, t.value.title), h("span", { class: "muted small" }, t.value.inbox ? `just arrived from ${t.value.from || "another device"}` : subtitle(t) || " ")),
         h("span", { class: "muted small thing-when" }, ago(t.updatedAt)),
       ),
       h(
         "span",
         { class: "row thing-actions" },
+        t.value.inbox ? keepButton(t) : null,
         t.kind === "password" && t.value.username ? copyButton(t.value.username, "Copy name") : null,
         t.kind === "password" ? copyButton(t.value.password, "Copy password") : null,
         t.kind === "link" && url ? h("a", { class: "button secondary tiny", href: url, target: "_blank", rel: "noopener noreferrer" }, "Open") : null,
       ),
     );
+  }
+
+  function keepButton(t) {
+    const keep = h("button", { type: "button", class: "secondary tiny" }, "Keep");
+    keep.addEventListener("click", () => withBusy(keep, async () => (await keepThing(box, t), load())));
+    return keep;
   }
 
   function say(...content) {
@@ -2763,7 +3001,10 @@ async function render() {
   if (pendingShare) return renderJoin(pendingShare);
   if (pendingPair) return renderApprovePair(pendingPair);
   nav.hidden = false;
-  const [, page, arg, key] = location.hash.split("/");
+  shelfWatch?.close();
+  shelfWatch = null;
+  const [, rawPage, arg, key] = location.hash.split("/");
+  const page = rawPage?.split("?")[0];
   for (const a of nav.querySelectorAll("a")) a.classList.toggle("active", a.getAttribute("href") === `#/${page && page !== "box" ? page : ""}`);
   try {
     if (page === "box" && arg) await renderBox(decodeURIComponent(arg), key ? decodeURIComponent(key) : undefined);
@@ -2772,6 +3013,7 @@ async function render() {
     else if (page === "apps") await renderApps();
     else if (page === "security") await renderSecurity();
     else if (page === "you") await renderYou();
+    else if (page === "send") await renderSend();
     else await renderShelf();
   } catch (err) {
     if (err.code === "bad_device") {
@@ -2782,6 +3024,9 @@ async function render() {
     fill(app, errorBox(err), h("p", {}, h("a", { href: "#/" }, "Back to the shelf")));
   }
 }
+
+// The helper also receives what other apps share to Cardboard, so it starts with the dashboard.
+startMediaHelper();
 
 window.addEventListener("hashchange", () => {
   if (!hashParam("connect")) pendingConnect = null;

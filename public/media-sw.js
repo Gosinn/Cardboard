@@ -6,6 +6,11 @@
 // It answers only /media/<token>/… addresses, and only while the page that
 // made the token is open (tokens live in that page's memory). Its responses
 // are sandboxed, so a file can never run as a page here.
+//
+// It also catches what you share to Cardboard from other apps (Android's
+// share sheet), keeps it on this phone, and hands it to the dashboard, which
+// seals it and sends it to your other devices. It never reaches the server
+// unsealed.
 
 const PIECE = 2 * 1024 * 1024;
 const SAFE_TYPE = /^(audio|video)\/[\w.+-]+$|^image\/(png|jpeg|gif|webp|avif|bmp)$/;
@@ -15,7 +20,9 @@ self.addEventListener("activate", (event) => event.waitUntil(self.clients.claim(
 
 self.addEventListener("fetch", (event) => {
   const url = new URL(event.request.url);
-  if (url.origin !== self.location.origin || !url.pathname.startsWith("/media/")) return;
+  if (url.origin !== self.location.origin) return;
+  if (event.request.method === "POST" && url.pathname === "/share") return event.respondWith(takeShare(event.request));
+  if (!url.pathname.startsWith("/media/")) return;
   event.respondWith(serve(event, url).catch((err) => new Response(String(err?.message || err), { status: 404, headers: { "content-type": "text/plain" } })));
 });
 
@@ -94,4 +101,29 @@ async function serve(event, url) {
   });
   if (typeof info.size === "number") headers["content-length"] = String(info.size);
   return new Response(body, { status: 200, headers });
+}
+
+/** Something shared to Cardboard from another app: kept on this device (IndexedDB) until the dashboard sends it. */
+async function takeShare(request) {
+  try {
+    const form = await request.formData();
+    const files = form.getAll("files").filter((f) => typeof f !== "string" && f.size > 0);
+    const text = ["title", "text", "url"].map((k) => form.get(k)).filter((v) => typeof v === "string" && v.trim()).join("\n");
+    const db = await new Promise((resolve, reject) => {
+      const open = indexedDB.open("cardboard-share", 1);
+      open.onupgradeneeded = () => open.result.createObjectStore("pending");
+      open.onsuccess = () => resolve(open.result);
+      open.onerror = () => reject(open.error);
+    });
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction("pending", "readwrite");
+      tx.objectStore("pending").put({ text, files, at: Date.now() }, "share");
+      tx.oncomplete = resolve;
+      tx.onerror = () => reject(tx.error);
+    });
+    db.close();
+    return Response.redirect("/#/send", 303);
+  } catch {
+    return Response.redirect("/#/send?failed", 303);
+  }
 }
