@@ -838,6 +838,7 @@ async function renderShelf() {
     search,
     results,
     pendingCard(docks.pending),
+    installCard(),
     sending,
     personalCard(personal),
     insightsBox,
@@ -867,6 +868,25 @@ document.addEventListener("visibilitychange", () => {
     document.title = "Cardboard";
   }
 });
+
+/** "Install Cardboard as an app", shown only where the browser offers it and it isn't installed yet. */
+function installCard() {
+  const button = h("button", { type: "button" }, "Install Cardboard");
+  button.addEventListener("click", async () => {
+    if (!installPrompt) return;
+    installPrompt.prompt();
+    await installPrompt.userChoice.catch(() => null);
+    installPrompt = null;
+    card.remove();
+  });
+  const card = h(
+    "section",
+    { class: "card row spread install-card", hidden: !installPrompt },
+    h("div", {}, h("strong", {}, "Install Cardboard as an app"), h("div", { class: "muted small" }, "Its own icon and window, and on Android it's in the Share menu of your other apps.")),
+    button,
+  );
+  return card;
+}
 
 function thisDeviceName(me) {
   return me.devices.find((d) => d.current)?.name ?? "one of your devices";
@@ -3131,6 +3151,19 @@ async function render() {
 
 // The helper also receives what other apps share to Cardboard, so it starts with the dashboard.
 startMediaHelper();
+
+// Chrome (Android, Windows, Mac) offers to install Cardboard as an app; on Android that's a real app in
+// the app drawer and the Share menu. Offer it on the shelf until it's installed.
+let installPrompt = null;
+addEventListener("beforeinstallprompt", (e) => {
+  e.preventDefault();
+  installPrompt = e;
+  document.querySelector(".install-card")?.removeAttribute("hidden");
+});
+addEventListener("appinstalled", () => {
+  installPrompt = null;
+  document.querySelector(".install-card")?.remove();
+});
 
 window.addEventListener("hashchange", () => {
   if (!hashParam("connect")) pendingConnect = null;

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { createReadStream, createWriteStream, existsSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { once } from "node:events";
 import { hostname } from "node:os";
 import { basename, join, resolve } from "node:path";
@@ -34,6 +35,7 @@ whoever runs the server can't read what's in it.
     cardboard start --tunnel tailscale   …and put it online from this computer, free, at a fixed https:// address
     cardboard start --tunnel cloudflare  …or at a throwaway address, with no account at all
     cardboard doctor                  Why isn't my address working? (safe to paste for help)
+    cardboard autostart [on|off]      Windows: start Cardboard by itself when you sign in, and don't sleep while plugged in
     cardboard signup [invite-link]    Make your account on this computer (prints your recovery kit)
     cardboard connect <app>           Connect the app in this folder: makes a box + tape, writes .env
 
@@ -445,6 +447,42 @@ async function main() {
     }
 
     // Everything needed to say why the address doesn't work. Nothing secret, so it's safe to paste for help.
+    case "autostart": {
+      // Windows: a small launcher in your Startup folder runs start-cardboard.cmd, minimized, when you sign in.
+      const appData = process.env["APPDATA"];
+      const dir = process.env["CARDBOARD_STARTUP_DIR"] ?? (process.platform === "win32" && appData ? join(appData, "Microsoft", "Windows", "Start Menu", "Programs", "Startup") : null);
+      if (!dir) die("autostart is for Windows.", "On Linux, use deploy/cardboard.service. On a Mac: caffeinate -i node src/cli.ts start --tunnel tailscale");
+      const launcher = join(dir, "Cardboard.cmd");
+      if (args[0] === "off") {
+        rmSync(launcher, { force: true });
+        return console.log("✓ Cardboard won't start by itself any more.");
+      }
+      const script = resolve(import.meta.dirname, "..", "start-cardboard.cmd");
+      if (!existsSync(script)) die(`Can't find ${script}.`, "Run this from your Cardboard folder after git pull.");
+      writeFileSync(launcher, `@echo off\r\nrem Starts Cardboard when you sign in to Windows (made by: node src/cli.ts autostart on).\r\nstart "Cardboard" /min "${script}"\r\n`);
+      console.log("✓ Cardboard now starts by itself when you sign in to Windows, in a small window on the taskbar.");
+      console.log(dim(`  (${launcher})`));
+      if (process.platform === "win32") {
+        // Plugged in: never sleep, and keep running with the lid closed. Asleep, Cardboard is offline.
+        const power = [
+          ["/change", "standby-timeout-ac", "0"],
+          ["/setacvalueindex", "SCHEME_CURRENT", "SUB_BUTTONS", "LIDACTION", "0"],
+          ["/setactive", "SCHEME_CURRENT"],
+        ];
+        const ok = power.every((a) => {
+          try {
+            execFileSync("powercfg", a, { stdio: "ignore" });
+            return true;
+          } catch {
+            return false;
+          }
+        });
+        console.log(ok ? "✓ While plugged in, this computer won't sleep, and closing the lid won't stop it." : "  Couldn't change the sleep settings. Set them yourself: Settings → System → Power → when plugged in, sleep: Never.");
+      }
+      console.log(dim("  Make sure Tailscale starts with Windows too (it does unless you turned that off). To undo: node src/cli.ts autostart off"));
+      return;
+    }
+
     case "doctor": {
       const { checkAddress, tailscaleReport } = await import("./node/tunnel.ts");
       const port = values.port ? Number(values.port) : Number(process.env["CARDBOARD_PORT"] ?? process.env["PORT"] ?? 8787);

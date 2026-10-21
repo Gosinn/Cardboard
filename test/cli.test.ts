@@ -85,6 +85,18 @@ describe("cardboard CLI", () => {
     assert.match((await cli(["import", "notes-old", old])).stdout, /Imported 1 items into notes-old/);
   });
 
+  it("starts by itself on Windows: a launcher in the Startup folder, and off again", async () => {
+    const startup = join(home, "Startup");
+    mkdirSync(startup);
+    const on = await cli(["autostart", "on"], undefined, { CARDBOARD_STARTUP_DIR: startup });
+    assert.match(on.stdout, /starts by itself/);
+    const launcher = readFileSync(join(startup, "Cardboard.cmd"), "utf8");
+    assert.match(launcher, /start "Cardboard" \/min ".*start-cardboard\.cmd"\r\n/);
+    assert.ok(existsSync(join(import.meta.dirname, "..", "start-cardboard.cmd")));
+    await cli(["autostart", "off"], undefined, { CARDBOARD_STARTUP_DIR: startup });
+    assert.ok(!existsSync(join(startup, "Cardboard.cmd")));
+  });
+
   it("answers the everyday questions", async () => {
     const boxes = await cli(["boxes"]);
     assert.match(boxes.stdout, /my-notes/);

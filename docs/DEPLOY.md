@@ -12,7 +12,14 @@ Three ways, all with real HTTPS (which Face ID needs) and phones that open it li
 
 Your computer runs Cardboard, and Tailscale Funnel (free) gives it an `https://` address anyone can reach. Cardboard itself only listens on your computer: nothing else on your network is opened up, and HTTPS ends on your computer (Tailscale only passes encrypted traffic along).
 
-You need **Node.js** (nodejs.org, the LTS version) and **Tailscale** (tailscale.com/download), installed, with Tailscale signed in.
+You need **Node.js** (nodejs.org, the LTS version), **Git**, and **Tailscale** (tailscale.com/download), installed, with Tailscale signed in. On Windows, PowerShell installs the first two for you:
+
+```
+winget install --id OpenJS.NodeJS.LTS -e
+winget install --id Git.Git -e
+```
+
+Then **close PowerShell and open it again** (until you do, it says `git` or `node` "is not recognized").
 
 **1. Get Cardboard** (once). In PowerShell (Windows) or Terminal (Mac):
 
@@ -37,6 +44,14 @@ node src/cli.ts start --tunnel tailscale
 A moment later it checks the address itself and says **✓ Your address works** once phones can open it. The very first time, that can take up to 10 minutes while the internet learns the new address; the window tells you while it's waiting.
 
 **5. Leave the window open.** Cardboard is online while it runs. Ctrl+C stops it (and takes the address offline).
+
+**No more typing it, on Windows:** double-click **`start-cardboard.cmd`** in the Cardboard folder. It gets the newest version, starts Cardboard online, and starts it again if it ever stops. Or have it start by itself whenever you sign in to Windows:
+
+```
+node src/cli.ts autostart on
+```
+
+That also stops the computer sleeping while it's plugged in, and keeps it running with the lid closed (a laptop that sleeps takes Cardboard offline). `node src/cli.ts autostart off` undoes the starting.
 
 **Not working?** Open a second PowerShell (or Terminal) window, `cd Cardboard`, and run `node src/cli.ts doctor`. It says what's running, what Tailscale is sharing, and whether the address answers, with nothing secret in it, so you can paste it to whoever is helping you.
 
@@ -82,7 +97,7 @@ cardboard host invite --note "Siggi"
 
 ## C. Your own server (Docker + Caddy)
 
-You need a small Linux server with Docker (1 CPU and 1 GB of memory is plenty for a family: Hetzner, DigitalOcean, a Raspberry Pi at home with ports 80 and 443 forwarded…) and a domain name.
+You need a small Linux server with Docker (1 CPU and 1 GB of memory is plenty for a family: 1984 Hosting in Iceland, Hetzner, DigitalOcean, a Raspberry Pi at home with ports 80 and 443 forwarded…) and a domain name. Pick the disk size for what you'll keep: photos and videos need room (the database holds everything, and backups need about as much again).
 
 1. Add an `A` record (and `AAAA` for IPv6) for `cardboard.yourdomain.com` pointing at the server. Wait until `ping cardboard.yourdomain.com` answers from that address.
 2. On the server:
