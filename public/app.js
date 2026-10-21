@@ -2038,15 +2038,18 @@ function timeMachine(boxName) {
   );
 }
 
-function dangerZone(box) {
-  const exportBtn = h("button", { type: "button", class: "secondary" }, "Export");
-  const exportStatus = h("span", { class: "muted small" }, "Everything, opened, as plain data (one item per line). Keep the file somewhere private.");
-  exportBtn.addEventListener("click", () =>
-    withBusy(exportBtn, async () => {
+/**
+ * A button that downloads everything in a box, opened, as JSON Lines. Streamed
+ * through the media helper a megabyte at a time, so a box full of videos never
+ * has to fit in memory; held in memory only where the helper can't run.
+ */
+function exportButton(box, status, label, size = "") {
+  const button = h("button", { type: "button", class: `secondary ${size}` }, label);
+  button.addEventListener("click", () =>
+    withBusy(button, async () => {
       try {
         const name = `${box.name}-${new Date().toISOString().slice(0, 10)}.jsonl`;
         const encoder = new TextEncoder();
-        // Written a megabyte at a time, so a box full of videos never has to fit in memory.
         const chunks = async function* () {
           let batch = "";
           for await (const line of account.exportLines(box.name)) {
@@ -2059,18 +2062,24 @@ function dangerZone(box) {
           if (batch) yield encoder.encode(batch);
         };
         if (await streamDownload({ info: { name, type: "application/x-ndjson" }, chunks })) {
-          exportStatus.textContent = "Exporting. Keep this page open until the download is done.";
+          status.textContent = "Downloading. Keep this page open until it's done.";
           return;
         }
-        if (box.bytes > IN_MEMORY_MAX) throw new Error(`${box.name} is too big to export in this browser. On the computer Cardboard runs on: node src/cli.ts export ${box.name} --out ${name}`);
+        if (box.bytes > IN_MEMORY_MAX) throw new Error(`${box.name} is too big to download in this browser. On the computer Cardboard runs on: node src/cli.ts export ${box.name} --out ${name}`);
         const lines = [];
         for await (const line of account.exportLines(box.name)) lines.push(line);
         blobDownload(lines, name);
       } catch (err) {
-        exportStatus.replaceChildren(errorBox(err));
+        status.replaceChildren(errorBox(err));
       }
     }),
   );
+  return button;
+}
+
+function dangerZone(box) {
+  const exportStatus = h("span", { class: "muted small" }, "Everything, opened, as plain data (one item per line). Keep the file somewhere private.");
+  const exportBtn = exportButton(box, exportStatus, "Export");
   if (box.shared) {
     return h(
       "section",
@@ -2557,6 +2566,7 @@ const SCOPE_LABEL = { openid: "knows you (private ID)", profile: "your name", em
 
 async function renderApps() {
   const data = await account.apps();
+  const boxesByName = new Map((await account.boxes()).map((b) => [b.name, b]));
   const connected = data.connected.map((a) => {
     const disconnect = h("button", { type: "button", class: "secondary tiny" }, "Disconnect");
     const shred = a.boxName ? h("button", { type: "button", class: "danger tiny" }, "Disconnect & shred its data") : null;
@@ -2579,10 +2589,24 @@ async function renderApps() {
       { class: "stack" },
       h("div", { class: "row spread" }, h("div", {}, h("strong", {}, a.name), h("span", { class: "muted small" }, ` · ${a.site}`)), h("div", { class: "row" }, disconnect, shred)),
       h("div", { class: "row" }, a.scopes.filter((s) => SCOPE_LABEL[s]).map((s) => h("span", { class: "chip" }, SCOPE_LABEL[s])), a.selfRegistered ? h("span", { class: "chip warn" }, "registered itself") : null),
-      h("div", { class: "muted small" }, `Connected ${ago(a.connectedAt)} · last used ${ago(a.lastUsedAt)}`, a.boxName ? [" · data in ", h("a", { href: `#/box/${encodeURIComponent(a.boxName)}` }, a.boxName)] : null),
+      h("div", { class: "muted small" }, `Connected ${ago(a.connectedAt)} · last used ${ago(a.lastUsedAt)}`),
+      a.boxName ? keptBy(a) : null,
       h("div", { class: "muted small mono" }, `knows you as ${a.privateId}`),
     );
   });
+
+  // What the app keeps about you: look at it, or take a copy.
+  function keptBy(a) {
+    const status = h("span", { class: "muted small" });
+    const box = boxesByName.get(a.boxName);
+    return h(
+      "div",
+      { class: "row" },
+      h("a", { class: "button secondary tiny", href: `#/box/${encodeURIComponent(a.boxName)}` }, `See what ${a.name} keeps about you`),
+      box ? exportButton(box, status, "Download it", "tiny") : null,
+      status,
+    );
+  }
 
   const registered = data.registered.map((c) => {
     const forget = h("button", { type: "button", class: "secondary tiny" }, "Forget");

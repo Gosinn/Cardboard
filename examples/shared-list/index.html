@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Shared list</title>
+    <style>
+      body { font: 16px/1.5 system-ui, sans-serif; max-width: 34rem; margin: 2rem auto; padding: 0 1rem; color: #2b2118; background: #f3eadb; }
+      button { font: inherit; padding: 0.4rem 0.9rem; border-radius: 8px; border: 1px solid #c8a27a; background: #fffaf1; cursor: pointer; }
+      button.primary { background: #8a5a2b; color: #fffaf1; border-color: #8a5a2b; }
+      input[type="text"] { font: inherit; padding: 0.4rem 0.6rem; border-radius: 8px; border: 1px solid #c8a27a; flex: 1; }
+      form, .row { display: flex; gap: 0.5rem; align-items: center; }
+      ul { list-style: none; padding: 0; }
+      li { display: flex; gap: 0.6rem; align-items: center; padding: 0.35rem 0; border-bottom: 1px dashed #e2d3bd; }
+      li.done span { text-decoration: line-through; color: #7b6957; }
+      .muted { color: #7b6957; font-size: 0.9rem; }
+    </style>
+  </head>
+  <body>
+    <h1>Shared list</h1>
+    <p class="muted" id="who">…</p>
+    <div id="app"></div>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

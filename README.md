@@ -46,6 +46,8 @@ That's the whole setup. `open()` reads `.env` by itself. (Don't use `npx cardboa
 
 > Requires Node 22.18+. To use the SDK from another project: `npm install github:gosinn/cardboard`.
 >
+> Building an app on it with an AI assistant? Start from [`examples/shared-list`](examples/shared-list) (sign-in, sharing, live updates and undo, no database) and point your assistant at [`docs/FOR-AI.md`](docs/FOR-AI.md).
+>
 > Putting it online for real (HTTPS, your family's phones)? For free from your own computer: `node src/cli.ts start --tunnel tailscale`. Or always on, with Railway or `docker compose up -d` on a server. See [docs/DEPLOY.md](docs/DEPLOY.md). Connecting a website like LORE: [docs/APPS.md](docs/APPS.md).
 
 ---

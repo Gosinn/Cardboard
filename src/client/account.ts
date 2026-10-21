@@ -1503,7 +1503,12 @@ export class Account {
       registered: Array<{ client: string; name: string; redirectUris: string[]; createdAt: number }>;
       mine: Array<{ client: string; name: string; home: string }>;
     }>("apps");
-    const boxes = await this.cache();
+    let boxes = await this.cache();
+    // A box made by a sign-in in another tab (or on another device) isn't in this page's list yet.
+    if (res.connected.some((c) => c.box && !boxes.has(c.box))) {
+      await this.boxes();
+      boxes = await this.cache();
+    }
     return { ...res, connected: res.connected.map((c) => ({ ...c, boxName: c.box ? (boxes.get(c.box)?.name ?? null) : null })) };
   }
 
