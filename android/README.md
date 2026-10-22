@@ -7,6 +7,10 @@ A small app (about 30 KB) that opens your own Cardboard in its own window:
 - **Downloads land in *Downloads › Cardboard*.**
 - If the computer Cardboard runs on is off, it says so, with *Try again*, instead of a browser error page.
 
+## Getting it
+
+Open your Cardboard in your phone's browser: on Android it shows **Get the Cardboard app**. Tap *Download the app*, then tap the download and allow installing from your browser. (It's also at `/cardboard.apk` on your Cardboard.)
+
 ## How it keeps your things safe
 
 - It's a window on the dashboard, nothing more: sealing and opening happen in the dashboard page exactly as in a browser, and the app never holds a key.

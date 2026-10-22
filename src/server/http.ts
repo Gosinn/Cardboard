@@ -83,6 +83,8 @@ const STATIC: Record<string, string> = {
   "/icon-512.png": "image/png",
   "/apple-touch-icon.png": "image/png",
   "/media-sw.js": "text/javascript; charset=utf-8",
+  // The Android app (android/build.sh puts it here), offered on the dashboard to Android phones.
+  "/cardboard.apk": "application/vnd.android.package-archive",
 };
 const CSP = [
   "default-src 'none'",
@@ -185,6 +187,7 @@ export async function startServer(options: StartOptions = {}): Promise<RunningCa
         ...(file.type.startsWith("text/html") ? { "content-security-policy": CSP } : {}),
         // The media helper needs no network of its own: it only answers with what the page hands it.
         ...(path === "/media-sw.js" ? { "content-security-policy": "default-src 'none'" } : {}),
+        ...(path === "/cardboard.apk" ? { "content-disposition": 'attachment; filename="Cardboard.apk"' } : {}),
       });
       res.end(req.method === "HEAD" ? undefined : file.body);
       return;

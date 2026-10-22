@@ -774,6 +774,7 @@ function renderWelcome(info) {
       remembers,
       tabs,
       body,
+      ON_ANDROID ? h("p", { class: "muted small row" }, "On this phone, Cardboard works best as its app. ", androidAppLink("Get the app")) : null,
       info?.shake ? h("p", { class: "muted small" }, `This server's self-test: ${info.shake.summary}.`) : null,
     ),
   );
@@ -960,7 +961,8 @@ async function renderShelf() {
     search,
     results,
     pendingCard(docks.pending),
-    installCard(),
+    androidAppCard(),
+    ON_ANDROID ? null : installCard(),
     sending,
     personalCard(personal),
     insightsBox,
@@ -990,6 +992,28 @@ document.addEventListener("visibilitychange", () => {
     document.title = "Cardboard";
   }
 });
+
+/** On an Android phone's browser: the Cardboard app, straight from this Cardboard. */
+const ON_ANDROID = /Android/.test(navigator.userAgent) && !IN_ANDROID_APP;
+
+function androidAppLink(label) {
+  return h("a", { class: "button", href: "/cardboard.apk", download: "Cardboard.apk" }, label);
+}
+
+function androidAppCard() {
+  if (!ON_ANDROID) return null;
+  return h(
+    "section",
+    { class: "card row spread install-card" },
+    h(
+      "div",
+      {},
+      h("strong", {}, "Get the Cardboard app"),
+      h("div", { class: "muted small" }, "Its own icon, in the Share menu of every app, downloads in Downloads › Cardboard. When it's downloaded, tap it and allow installing from this browser."),
+    ),
+    androidAppLink("Download the app"),
+  );
+}
 
 /** "Install Cardboard as an app", shown only where the browser offers it and it isn't installed yet. */
 function installCard() {

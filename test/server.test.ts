@@ -434,6 +434,11 @@ describe("HTTP edges", () => {
     assert.match(res.headers.get("content-security-policy") ?? "", /script-src 'self'/);
     assert.equal(res.headers.get("x-frame-options"), "DENY");
     assert.match(await res.text(), /<title>Cardboard<\/title>/);
+    const apk = await fetch(`${t.cb.url}/cardboard.apk`);
+    assert.equal(apk.status, 200);
+    assert.equal(apk.headers.get("content-type"), "application/vnd.android.package-archive");
+    assert.match(apk.headers.get("content-disposition") ?? "", /attachment/);
+    assert.equal(Buffer.from(await apk.arrayBuffer()).subarray(0, 2).toString(), "PK");
     const lib = await fetch(`${t.cb.url}/lib/client/crypto.ts`);
     assert.equal(lib.status, 200);
     assert.match(lib.headers.get("content-type") ?? "", /javascript/);

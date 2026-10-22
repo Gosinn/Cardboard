@@ -69,4 +69,6 @@ if [ ! -f "$key" ]; then
 fi
 # apksig 2.3 reaches into the JDK for algorithm names.
 java --add-exports java.base/sun.security.x509=ALL-UNNAMED --add-exports java.base/sun.security.pkcs=ALL-UNNAMED -cp "$tools/apksig.jar" tools/Sign.java "$key" "$password" "$build/unsigned.apk" "$build/cardboard.apk"
-echo "Built $build/cardboard.apk ($(du -h "$build/cardboard.apk" | cut -f1))"
+# Your Cardboard offers it to Android phones from here.
+cp "$build/cardboard.apk" ../public/cardboard.apk
+echo "Built $build/cardboard.apk ($(du -h "$build/cardboard.apk" | cut -f1)), and copied it to public/cardboard.apk"
