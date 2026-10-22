@@ -15,6 +15,7 @@ A personal, end-to-end encrypted backend: each app gets a box, opened with a tap
 - `src/mcp.ts`: the local MCP server (`cardboard mcp <name>`), holding tapes only for shared boxes. `src/node/store.ts`: the CLI's device file. `src/node/tunnel.ts`: `cardboard start --tunnel` (Tailscale Funnel or a Cloudflare quick tunnel).
 - `src/cli.ts`: the `cardboard` command. `public/`: the dashboard (vanilla JS modules, no build, installable as a PWA); `device.js` keeps a non-extractable device key in IndexedDB; `media-sw.js` streams videos, songs and big downloads by asking the page for pieces (it never holds a key), and catches what Android's share sheet sends to Cardboard (kept on the phone until the page seals and sends it).
 - `android/`: the Android app (one Java file, no libraries): a WebView on your Cardboard's address that hands the dashboard a message port (only ever to that origin) for the Share menu and for saving downloads; it never holds a key. `android/build.sh` builds it without Android Studio or Gradle.
+- `desktop/main.go`: `Cardboard.exe` (Go, standard library only, built by `desktop/build.sh` into the repo root): starts Cardboard hidden on Windows, keeps it running, opens it in an app window, makes the desktop/Start menu/Startup shortcuts.
 - `Dockerfile`, `compose.yaml`, `railway.json`, `deploy/` (container entrypoint that drops root, Caddyfile, systemd unit), `docs/DEPLOY.md`: running it for real. `docs/APPS.md`: connecting a website with Sign in with Cardboard.
 
 ## Rules
