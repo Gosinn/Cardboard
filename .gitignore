@@ -4,3 +4,5 @@ cardboard-data/
 .env
 .env.*
 *.key
+android/.tools/
+android/build/

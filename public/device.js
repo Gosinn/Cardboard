@@ -78,5 +78,6 @@ export function browserName() {
   const ua = navigator.userAgent;
   const browser = /Firefox\//.test(ua) ? "Firefox" : /Edg\//.test(ua) ? "Edge" : /Chrome\//.test(ua) ? "Chrome" : /Safari\//.test(ua) ? "Safari" : "A browser";
   const os = /iPhone|iPad/.test(ua) ? "iPhone" : /Android/.test(ua) ? "Android" : /Mac OS X/.test(ua) ? "Mac" : /Windows/.test(ua) ? "Windows" : /Linux/.test(ua) ? "Linux" : "";
+  if (/CardboardAndroid\//.test(ua)) return "Cardboard app on Android";
   return os ? `${browser} on ${os}` : browser;
 }

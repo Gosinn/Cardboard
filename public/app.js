@@ -398,15 +398,16 @@ navigator.serviceWorker?.addEventListener("message", async (e) => {
   }
 });
 
-/** Saves a download a piece at a time through the media helper (nothing big in memory). Returns false if it can't here. */
-async function streamDownload(entry) {
+/** Saves a download a piece at a time (nothing big in memory). Returns what to tell you, or false if it can't here. */
+async function streamDownload(entry, report) {
+  if (IN_ANDROID_APP) return androidSave(entry.info, entry.chunks(), report);
   if (WEBKIT || !(await startMediaHelper())) return false;
   // A hidden frame, not <a download>: Chrome sends <a download> straight to the server, past the helper.
   // If anything goes wrong, the error lands in the frame, never in place of this page.
   const frame = h("iframe", { hidden: true, src: `${offerMedia({ ...entry, kind: "download" })}?download` });
   document.body.append(frame);
   setTimeout(() => frame.remove(), 60 * 60_000);
-  return true;
+  return "Downloading. Keep this page open until it's done.";
 }
 
 /** Saves bytes held in memory (small files, or browsers without the helper). */
@@ -421,6 +422,127 @@ function blobDownload(parts, name) {
 
 /** Most a phone can hold in memory to hand a file over (share sheet, or a download without the helper). */
 const IN_MEMORY_MAX = 300 * 1024 * 1024;
+
+// ── The Cardboard app for Android (android/) ───────────────────────────────────
+// It opens this page in its own window and hands it a message port, only ever to this
+// Cardboard's address: for what you share to Cardboard from other apps, and to save downloads.
+
+const IN_ANDROID_APP = /CardboardAndroid\/\d/.test(navigator.userAgent);
+/** Bytes per message to or from the app (it takes at most 1 MiB). */
+const ANDROID_PIECE = 512 * 1024;
+let androidPort = null;
+const androidWaiting = [];
+const androidCalls = new Map();
+let androidNextId = 1;
+if (IN_ANDROID_APP) {
+  addEventListener("message", (e) => {
+    // Only the app posts with no source window: no other page can pose as it.
+    if (e.source !== null || e.data !== "cardboard-android" || !e.ports[0]) return;
+    androidPort = e.ports[0];
+    androidPort.onmessage = (m) => {
+      let reply;
+      try {
+        reply = JSON.parse(m.data);
+      } catch {
+        return;
+      }
+      const call = androidCalls.get(reply.id);
+      if (!call) return;
+      androidCalls.delete(reply.id);
+      if (reply.error) call.reject(new Error(reply.error));
+      else call.resolve(reply);
+    };
+    for (const wake of androidWaiting.splice(0)) wake();
+  });
+}
+
+/** Asks the Android app to do something, and resolves with its answer. */
+async function androidCall(op, args = {}) {
+  if (!androidPort) {
+    await new Promise((resolve, reject) => {
+      androidWaiting.push(resolve);
+      setTimeout(() => reject(new Error("The Cardboard app isn't answering this page. Close the app and open it again.")), 10_000);
+    });
+  }
+  const id = androidNextId++;
+  return new Promise((resolve, reject) => {
+    androidCalls.set(id, { resolve, reject });
+    androidPort.postMessage(JSON.stringify({ id, op, ...args }));
+  });
+}
+
+function toBase64(data) {
+  if (data.toBase64) return data.toBase64();
+  let text = "";
+  for (let i = 0; i < data.length; i += 0x8000) text += String.fromCharCode.apply(null, data.subarray(i, i + 0x8000));
+  return btoa(text);
+}
+
+function fromBase64(text) {
+  if (Uint8Array.fromBase64) return Uint8Array.fromBase64(text);
+  const raw = atob(text);
+  const data = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) data[i] = raw.charCodeAt(i);
+  return data;
+}
+
+/** Saves a download into the phone's Downloads › Cardboard folder, a piece at a time. */
+async function androidSave(info, chunks, report) {
+  const { handle } = await androidCall("save-start", { name: info.name, type: info.type || "" });
+  let done = 0;
+  try {
+    for await (const chunk of chunks) {
+      for (let i = 0; i < chunk.length; i += ANDROID_PIECE) {
+        const piece = chunk.subarray(i, i + ANDROID_PIECE);
+        await androidCall("save", { handle, data: toBase64(piece) });
+        done += piece.length;
+        report?.(`Saving… ${bytes(done)}${info.size ? ` of ${bytes(info.size)}` : ""}`);
+      }
+    }
+    const { where } = await androidCall("save-end", { handle, ok: true });
+    return `Saved in ${where} on this phone.`;
+  } catch (err) {
+    androidCall("save-end", { handle, ok: false }).catch(() => {});
+    throw err;
+  }
+}
+
+/** Reads part of a file shared to the app, from `start` up to `end`. */
+async function androidRead(file, start, end) {
+  const parts = [];
+  for (let at = start; at < end; ) {
+    const piece = fromBase64((await androidCall("read", { file: file.n, offset: at, length: Math.min(ANDROID_PIECE, end - at) })).data);
+    if (!piece.length) throw new Error(`${file.name} got shorter while it was being sent. Share it again.`);
+    parts.push(piece);
+    at += piece.length;
+  }
+  return parts;
+}
+
+/** What was shared to the app: its text, and its files, each read from the phone only as it's sealed. */
+async function takeAndroidShare() {
+  const shared = await androidCall("share");
+  if (shared.none) return null;
+  const files = [];
+  for (const f of shared.files) {
+    if (f.size >= 0) {
+      // Just what sendFile reads: name, type, size and slice(). Nothing is held in memory.
+      files.push({ name: f.name, type: f.type, size: f.size, slice: (start, end) => ({ arrayBuffer: async () => new Blob(await androidRead(f, start, Math.min(end, f.size))).arrayBuffer() }) });
+      continue;
+    }
+    // The app that shared it didn't say how big it is: read it to the end.
+    const parts = [];
+    for (let at = 0; ; ) {
+      const piece = fromBase64((await androidCall("read", { file: f.n, offset: at, length: ANDROID_PIECE })).data);
+      if (!piece.length) break;
+      parts.push(piece);
+      at += piece.length;
+      if (at > IN_MEMORY_MAX) throw new Error(`${f.name} is too big to send without knowing its size. Open Cardboard and attach it instead.`);
+    }
+    files.push(new File(parts, f.name, { type: f.type }));
+  }
+  return { text: shared.text, files, done: () => androidCall("share-done").catch(() => {}) };
+}
 
 function lockIfIdle() {
   const idle = account?.lock?.idleMs;
@@ -1050,8 +1172,9 @@ function arrivedRow(box, t, refresh) {
 /** The personal box's name, for links (set when the shelf loads). */
 let PERSONAL_HOME = "personal";
 
-/** What another app shared to Cardboard (Android's share sheet), kept on this phone by media-sw.js. */
+/** What another app shared to Cardboard (Android's share sheet), kept on this phone by media-sw.js or by the app. */
 async function takePendingShare() {
+  if (IN_ANDROID_APP) return takeAndroidShare();
   const db = await new Promise((resolve, reject) => {
     const open = indexedDB.open("cardboard-share", 1);
     open.onupgradeneeded = () => open.result.createObjectStore("pending");
@@ -1081,7 +1204,12 @@ async function renderSend() {
   if (location.hash.includes("unsealed")) {
     return fill(status, h("p", {}, "Nothing was sent: Cardboard's helper wasn't running on this phone yet, so what you shared went nowhere (and nothing was kept)."), h("p", { class: "muted small" }, "Open Cardboard once, then share again."), h("a", { href: "#/" }, "Go to your shelf"));
   }
-  const shared = await takePendingShare().catch(() => null);
+  let shared;
+  try {
+    shared = await takePendingShare();
+  } catch (err) {
+    if (IN_ANDROID_APP) return fill(status, errorBox(err), h("a", { href: "#/" }, "Go to your shelf"));
+  }
   if (!shared || (!shared.text && !shared.files?.length)) {
     return fill(status, h("p", {}, location.hash.includes("failed") ? "Cardboard couldn't read what was shared. Try again?" : "There's nothing waiting to be sent."), h("a", { href: "#/" }, "Go to your shelf"));
   }
@@ -1089,7 +1217,9 @@ async function renderSend() {
   const box = await account.open(await account.makePersonalBox());
   try {
     await sendNow(box, thisDeviceName(me), shared.text ?? "", shared.files ?? [], status);
-    history.replaceState(null, "", "#/");
+    await shared.done?.();
+    // Not #/ itself, or "Go to your shelf" (#/) would go nowhere.
+    history.replaceState(null, "", "#/send");
     fill(status, h("p", {}, h("span", { class: "chip ok" }, "Sent"), " It's on your other devices now."), h("a", { href: "#/" }, "Go to your shelf"));
   } catch (err) {
     fill(status, errorBox(err), h("a", { href: "#/" }, "Go to your shelf"));
@@ -1503,8 +1633,9 @@ async function renderPersonal(info, me, openKey) {
         withBusy(save, async () => {
           try {
             // Always as a download, never opened as a page here: a file can't run anything in the dashboard.
-            if (await streamDownload(fileEntry)) {
-              progress.textContent = "Downloading. Keep this page open until it's done.";
+            const said = await streamDownload(fileEntry, (words) => (progress.textContent = words));
+            if (said) {
+              progress.textContent = said;
               return;
             }
             if (v.size > IN_MEMORY_MAX) throw tooBig();
@@ -2081,8 +2212,9 @@ function exportButton(box, status, label, size = "") {
           }
           if (batch) yield encoder.encode(batch);
         };
-        if (await streamDownload({ info: { name, type: "application/x-ndjson" }, chunks })) {
-          status.textContent = "Downloading. Keep this page open until it's done.";
+        const said = await streamDownload({ info: { name, type: "application/x-ndjson" }, chunks }, (words) => (status.textContent = words));
+        if (said) {
+          status.textContent = said;
           return;
         }
         if (box.bytes > IN_MEMORY_MAX) throw new Error(`${box.name} is too big to download in this browser. On the computer Cardboard runs on: node src/cli.ts export ${box.name} --out ${name}`);

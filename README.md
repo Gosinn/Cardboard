@@ -101,6 +101,7 @@ This is a real lock, not a screen: the passkey makes a secret (WebAuthn's PRF ex
 The oldest annoyance on the internet: getting something from your phone to your laptop. On your shelf, **Send to yourself**: type or paste anything (a link, a note, a code), attach or drop files, and press *Send to my devices*. A second later it's on every device you're signed in on, under *Just arrived*, live, with *Copy*, *Open* or *Download* right there. *Keep* puts it in your personal box for good; *Clear* tidies it away (and can be undone).
 
 - **From any app on Android:** once Cardboard is on your home screen, it's in the **Share** menu. Share a photo, a page or some text to Cardboard and it lands on your laptop.
+- **The Android app** ([`android/`](android/README.md)): a small app that opens your Cardboard in its own window. You type the address once; then it's an icon, it's in the Share menu (videos of any size, read from the phone only as they're sealed), and downloads land in *Downloads › Cardboard*.
 - **Sealed on the device it was sent from**, like everything else. Your other devices are told *that* something arrived, then fetch and open it themselves; the server only passes sealed bytes along.
 - Files of any size, sent a piece at a time. Paste a screenshot straight into the box.
 
