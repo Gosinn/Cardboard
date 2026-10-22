@@ -50,11 +50,35 @@ func main() {
 		fail("Cardboard couldn't find itself on this computer.")
 	}
 	dir := filepath.Dir(exe)
-	background := len(os.Args) > 1 && os.Args[1] == "--background"
+	args := os.Args[1:]
+	background := has(args, "--background")
 
-	if _, err := os.Stat(filepath.Join(dir, "src", "cli.ts")); err != nil {
-		fail("Cardboard.exe has to stay in the Cardboard folder (next to the src folder). Put it back there, and make a shortcut to it instead.")
+	if !isCardboard(dir) {
+		// A copy somewhere else (on the desktop, say): find the Cardboard folder, and let the
+		// Cardboard.exe in it do the work, since that's the one that stays up to date.
+		folder := findFolder()
+		if folder == "" {
+			fail("Cardboard couldn't find your Cardboard folder, so it can't start.\n\nOpen Cardboard.exe again and choose the folder (it's the one with a folder called src in it).")
+		}
+		inFolder := filepath.Join(folder, "Cardboard.exe")
+		if _, err := os.Stat(inFolder); err != nil {
+			if git, err := exec.LookPath("git"); err == nil {
+				run(folder, time.Minute, git, "checkout", "--", "Cardboard.exe")
+			}
+		}
+		if _, err := os.Stat(inFolder); err == nil && !sameFile(exe, inFolder) {
+			if strings.EqualFold(filepath.Base(dir), "Desktop") && !has(args, "--on-desktop") {
+				args = append(args, "--on-desktop") // This copy is the desktop icon: don't add a second one.
+			}
+			cmd := exec.Command(inFolder, args...)
+			cmd.Dir = folder
+			if cmd.Start() == nil {
+				return
+			}
+		}
+		dir = folder
 	}
+	remember(dir)
 	node, err := exec.LookPath("node")
 	if err != nil {
 		fail("Cardboard needs Node.js, and it isn't on this computer (or Windows can't find it).\n\nInstall Node.js LTS from nodejs.org, then open Cardboard again.")
@@ -69,12 +93,88 @@ func main() {
 		go keepRunning(dir, node)
 	}
 	if !background {
-		firstRun(exe, dir)
+		firstRun(filepath.Join(dir, "Cardboard.exe"), dir, has(args, "--on-desktop"))
 		openWindow()
 	}
 	if keeper {
 		select {} // Keep Cardboard running until Windows signs out (or Task Manager ends "Cardboard").
 	}
+}
+
+func has(args []string, flag string) bool {
+	for _, a := range args {
+		if a == flag {
+			return true
+		}
+	}
+	return false
+}
+
+func isCardboard(dir string) bool {
+	_, err := os.Stat(filepath.Join(dir, "src", "cli.ts"))
+	return err == nil
+}
+
+func sameFile(a, b string) bool {
+	x, errA := os.Stat(a)
+	y, errB := os.Stat(b)
+	return errA == nil && errB == nil && os.SameFile(x, y)
+}
+
+// rememberedFolder is where Cardboard.exe writes down where the Cardboard folder is (just the path).
+func rememberedFolder() string {
+	return filepath.Join(os.Getenv("LOCALAPPDATA"), "Cardboard", "folder.txt")
+}
+
+func remember(dir string) {
+	if os.Getenv("LOCALAPPDATA") == "" {
+		return
+	}
+	_ = os.MkdirAll(filepath.Dir(rememberedFolder()), 0o700)
+	_ = os.WriteFile(rememberedFolder(), []byte(dir), 0o600)
+}
+
+// findFolder finds the Cardboard folder: where it was last time, the usual places, or by asking.
+func findFolder() string {
+	if os.Getenv("LOCALAPPDATA") != "" {
+		if saved, err := os.ReadFile(rememberedFolder()); err == nil && isCardboard(strings.TrimSpace(string(saved))) {
+			return strings.TrimSpace(string(saved))
+		}
+	}
+	home := os.Getenv("USERPROFILE")
+	for _, dir := range []string{
+		filepath.Join(home, "Cardboard"), `D:\Cardboard`, `C:\Cardboard`,
+		filepath.Join(home, "Documents", "Cardboard"), filepath.Join(home, "Desktop", "Cardboard"), filepath.Join(home, "Downloads", "Cardboard"),
+	} {
+		if isCardboard(dir) {
+			return dir
+		}
+	}
+	for {
+		dir := pickFolder()
+		if dir == "" || isCardboard(dir) {
+			return dir
+		}
+		if message("Cardboard", "That isn't the Cardboard folder. It's the one with a folder called src in it, next to start-cardboard and Cardboard.exe.\n\nChoose again?", mbYesNo|mbIconWarning) != idYes {
+			return ""
+		}
+	}
+}
+
+// pickFolder asks for a folder with Windows' own folder picker (through PowerShell). "" if cancelled.
+func pickFolder() string {
+	script := `Add-Type -AssemblyName System.Windows.Forms
+$d = New-Object System.Windows.Forms.FolderBrowserDialog
+$d.Description = 'Where is your Cardboard folder?'
+if ($d.ShowDialog() -eq 'OK') { $d.SelectedPath }`
+	cmd := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-STA", "-Command", "-")
+	cmd.Stdin = strings.NewReader(script)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: createNoWindow}
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
 }
 
 // keepRunning starts Cardboard and starts it again if it stops, like start-cardboard.cmd.
@@ -259,7 +359,7 @@ func regString(root syscall.Handle, path, name string) string {
 }
 
 // firstRun puts Cardboard on the desktop and in the Start menu, once, and asks about starting with Windows.
-func firstRun(exe, dir string) {
+func firstRun(exe, dir string, onDesktop bool) {
 	local := os.Getenv("LOCALAPPDATA")
 	if local == "" {
 		return
@@ -271,9 +371,11 @@ func firstRun(exe, dir string) {
 	_ = os.MkdirAll(filepath.Dir(marker), 0o700)
 	_ = os.WriteFile(marker, []byte("Cardboard.exe made its shortcuts. Delete this file to be asked again.\r\n"), 0o600)
 
-	shortcut(exe, dir, "Desktop", "")
+	if !onDesktop {
+		shortcut(exe, dir, "Desktop", "")
+	}
 	shortcut(exe, dir, "Programs", "")
-	answer := message("Cardboard", "Cardboard is now on your desktop and in the Start menu.\n\nStart Cardboard by itself when Windows starts, and keep this computer awake while it's plugged in? Then your phone can always reach it.\n\n(Change it later: Settings → Apps → Startup.)", mbYesNo|mbIconInformation)
+	answer := message("Cardboard", "Cardboard is on your desktop and in the Start menu.\n\nStart Cardboard by itself when Windows starts, and keep this computer awake while it's plugged in? Then your phone can always reach it.\n\n(Change it later: Settings → Apps → Startup.)", mbYesNo|mbIconInformation)
 	if answer != idYes {
 		return
 	}
