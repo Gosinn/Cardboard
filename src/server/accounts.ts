@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { fail } from "../shared/errors.ts";
 import { newId, newSecret, sameBytes, sha256 } from "./crypto.ts";
 import { transaction, type DB } from "./db.ts";
@@ -22,6 +23,8 @@ const DAY = 24 * 60 * 60 * 1000;
 const INVITE_TTL = 7 * DAY;
 const PAIRING_TTL = 10 * 60 * 1000;
 const MAX_PENDING_PAIRINGS = 1000;
+/** "Add a device" stays open this long. */
+export const OFFER_TTL = 5 * 60 * 1000;
 
 export interface Account {
   id: string;
@@ -104,6 +107,32 @@ interface PairingRow {
   account_id: string | null;
   device_id: string | null;
   envelope: Uint8Array | null;
+}
+
+interface OfferRow {
+  id: Uint8Array;
+  account_id: string;
+  created_at: number;
+  expires_at: number;
+  commitment: Uint8Array | null;
+  kind: string | null;
+  token_hash: Uint8Array | null;
+  nonce_a: Uint8Array | null;
+  public_key: Uint8Array | null;
+  nonce_n: Uint8Array | null;
+  device_id: string | null;
+  envelope: Uint8Array | null;
+}
+
+/** What the device that opened an offer sees of it, step by step. */
+export interface OfferView {
+  expiresAt: number;
+  commitment: Buffer | null;
+  kind: DeviceKind | null;
+  nonceA: Buffer | null;
+  publicKey: Buffer | null;
+  nonceN: Buffer | null;
+  deviceId: string | null;
 }
 
 const TOUCH_EVERY_MS = 60 * 1000;
@@ -417,7 +446,107 @@ export class Accounts {
     return { status: "approved", accountId: row.account_id, deviceId: row.device_id!, envelope: Buffer.from(row.envelope!) };
   }
 
+  // ── Adding a device by matching numbers ──────────────────────────────────
+
+  /** "Add a device" on a device you have: one open offer per account at a time. */
+  openOffer(accountId: string): { id: Buffer; expiresAt: number } {
+    const now = this.now();
+    const id = randomBytes(16);
+    const expiresAt = now + OFFER_TTL;
+    transaction(this.db, () => {
+      this.db.prepare("DELETE FROM pair_offers WHERE account_id = ? OR expires_at <= ?").run(accountId, now);
+      this.db.prepare("INSERT INTO pair_offers (id, account_id, created_at, expires_at) VALUES (?, ?, ?, ?)").run(id, accountId, now, expiresAt);
+    });
+    return { id, expiresAt };
+  }
+
+  /** Offers nobody has answered yet, newest first. They say nothing about whose they are. */
+  offersWaiting(): Buffer[] {
+    const rows = this.db.prepare("SELECT id FROM pair_offers WHERE commitment IS NULL AND expires_at > ? ORDER BY created_at DESC LIMIT 3").all(this.now()) as Array<{ id: Uint8Array }>;
+    return rows.map((r) => Buffer.from(r.id));
+  }
+
+  /** A new device answers an offer. Only the first one to answer gets it. */
+  joinOffer(id: Buffer, input: { commitment: Buffer; tokenHash: Buffer; kind: DeviceKind }): { expiresAt: number } {
+    const row = this.offerRow(id);
+    if (row.commitment !== null) throw offerTaken();
+    const done = this.db
+      .prepare("UPDATE pair_offers SET commitment = ?, token_hash = ?, kind = ? WHERE id = ? AND commitment IS NULL")
+      .run(input.commitment, input.tokenHash, input.kind, id);
+    if (done.changes !== 1) throw offerTaken();
+    return { expiresAt: row.expires_at };
+  }
+
+  /** The offering device's view of its own offer. */
+  offer(accountId: string, id: Buffer): OfferView {
+    const row = this.offerRow(id);
+    if (row.account_id !== accountId) throw noOffer();
+    return {
+      expiresAt: row.expires_at,
+      commitment: blob(row.commitment),
+      kind: (row.kind as DeviceKind | null) ?? null,
+      nonceA: blob(row.nonce_a),
+      publicKey: blob(row.public_key),
+      nonceN: blob(row.nonce_n),
+      deviceId: row.device_id,
+    };
+  }
+
+  /** The offering device's random nonce, sent only once the new device is committed to its key. */
+  challengeOffer(accountId: string, id: Buffer, nonce: Buffer) {
+    const row = this.offerRow(id);
+    if (row.account_id !== accountId) throw noOffer();
+    if (row.commitment === null || row.nonce_a !== null) throw fail("offer_out_of_order", 409, "That step of adding a device already happened, or isn't due yet.", "Press Add a device again.");
+    this.db.prepare("UPDATE pair_offers SET nonce_a = ? WHERE id = ?").run(nonce, id);
+  }
+
+  /** The new device's view: the offering device's nonce, then (once you say yes) the sealed account key. Only the device holding the token. */
+  joinerView(id: Buffer, token: string): { nonceA: Buffer | null; approved: { accountId: string; deviceId: string; envelope: Buffer } | null } {
+    const row = this.joinerRow(id, token);
+    if (row.device_id === null) return { nonceA: blob(row.nonce_a), approved: null };
+    this.db.prepare("DELETE FROM pair_offers WHERE id = ?").run(id);
+    return { nonceA: blob(row.nonce_a), approved: { accountId: row.account_id, deviceId: row.device_id, envelope: Buffer.from(row.envelope!) } };
+  }
+
+  /** The new device reveals its key and nonce, after seeing the offering device's nonce. */
+  revealOffer(id: Buffer, token: string, publicKey: Buffer, nonce: Buffer) {
+    const row = this.joinerRow(id, token);
+    if (row.nonce_a === null || row.public_key !== null) throw fail("offer_out_of_order", 409, "That step of adding a device already happened, or isn't due yet.", "Start again on both devices.");
+    this.db.prepare("UPDATE pair_offers SET public_key = ?, nonce_n = ? WHERE id = ?").run(publicKey, nonce, id);
+  }
+
+  /** You said the numbers match. The new device becomes yours. */
+  approveOffer(accountId: string, id: Buffer, envelope: Buffer, label: Buffer | null): Device {
+    return transaction(this.db, () => {
+      const row = this.offerRow(id);
+      if (row.account_id !== accountId) throw noOffer();
+      if (row.public_key === null || row.device_id !== null) throw fail("offer_out_of_order", 409, "That device isn't ready to be added yet.", "Wait for the number to show on both devices.");
+      const device = this.addDevice(accountId, { tokenHash: Buffer.from(row.token_hash!), kind: row.kind as DeviceKind, envelope: null, label });
+      this.db.prepare("UPDATE pair_offers SET device_id = ?, envelope = ? WHERE id = ?").run(device.id, envelope, id);
+      return device;
+    });
+  }
+
+  closeOffer(accountId: string, id: Buffer) {
+    this.db.prepare("DELETE FROM pair_offers WHERE id = ? AND account_id = ?").run(id, accountId);
+  }
+
+  private offerRow(id: Buffer): OfferRow {
+    const row = this.db.prepare("SELECT * FROM pair_offers WHERE id = ?").get(id) as OfferRow | undefined;
+    if (!row || row.expires_at <= this.now()) throw noOffer();
+    return row;
+  }
+
+  private joinerRow(id: Buffer, token: string): OfferRow {
+    const row = this.db.prepare("SELECT * FROM pair_offers WHERE id = ?").get(id) as OfferRow | undefined;
+    if (!row || row.token_hash === null || !sameBytes(row.token_hash, sha256(token))) throw noOffer();
+    // Once approved, the new device may collect its key a little late; until then, the offer expires.
+    if (row.device_id === null && row.expires_at <= this.now()) throw noOffer();
+    return row;
+  }
+
   sweep() {
+    this.db.prepare("DELETE FROM pair_offers WHERE expires_at <= ?").run(this.now() - OFFER_TTL);
     this.db.prepare("DELETE FROM pairings WHERE expires_at <= ?").run(this.now() - PAIRING_TTL);
     this.db.prepare("DELETE FROM invites WHERE used_at IS NULL AND expires_at <= ?").run(this.now() - 30 * DAY);
   }
@@ -455,6 +584,18 @@ function toDevice(row: DeviceRow): Device {
 
 function noDevice() {
   return fail("no_such_device", 404, "There's no such device on your account.");
+}
+
+function blob(value: Uint8Array | null): Buffer | null {
+  return value ? Buffer.from(value) : null;
+}
+
+function noOffer() {
+  return fail("no_such_offer", 404, "Nobody is adding a device right now (or it was more than 5 minutes ago).", "On a device where you're signed in, press Add a device, then try again here.");
+}
+
+function offerTaken() {
+  return fail("offer_taken", 409, "Another device answered first, so this one wasn't added.", "Press Add a device again on your other device, then try again here.");
 }
 
 function noPairing() {

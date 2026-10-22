@@ -2,7 +2,7 @@
 // browser, so everything is opened right here: the server only ever sends
 // sealed bytes. Anything that came from an app (key names, values, labels) is
 // inserted with textContent, never as HTML.
-import { claimEmergency, cleanInvite, deviceLock, recoverWithFriends, recoverWithKit, requestEmergency, signUp, startPairing, unlock, viewEmergency } from "/lib/client/account.ts";
+import { claimEmergency, cleanInvite, deviceLock, joinDevice, recoverWithFriends, recoverWithKit, requestEmergency, signUp, startPairing, unlock, viewEmergency } from "/lib/client/account.ts";
 import { qrEncode, qrPath } from "/lib/shared/qr.ts";
 import { describeDuration } from "/lib/shared/duration.ts";
 import { toName } from "/lib/shared/names.ts";
@@ -741,30 +741,25 @@ function renderWelcome(info) {
       : h("p", { class: "muted" }, "Your private, end-to-end encrypted deposit box. Your keys live on your devices: whoever runs this server can't read anything you keep here.");
 
   const panes = {
-    invite: inviteForm(invite),
     pair: pairPane(),
+    invite: inviteForm(invite),
     kit: kitForm(),
     friends: friendsForm(),
   };
+  const ways = [
+    ["pair", "Add this device"],
+    ["invite", invite ? "Make my account" : "I'm new (I have an invite)"],
+    ["kit", "My recovery kit"],
+    ["friends", "Friends' pieces"],
+  ];
   const body = h("div", { class: "stack" });
-  const tab = (id, label) => {
-    const b = h("button", { type: "button", class: "secondary tiny" }, label);
-    b.addEventListener("click", () => {
-      for (const other of tabs.children) other.classList.remove("active");
-      b.classList.add("active");
-      fill(body, panes[id]);
-    });
-    return b;
+  // One way in on screen at a time; the others are a tap away underneath.
+  const others = h("p", { class: "muted small row other-ways" });
+  const show = (id) => {
+    fill(body, panes[id]);
+    fill(others, "Other ways in:", ways.filter(([w]) => w !== id).map(([w, label]) => h("button", { type: "button", class: "link small", onclick: () => show(w) }, label)));
   };
-  const tabs = h(
-    "div",
-    { class: "row tabs" },
-    tab("invite", invite ? "Make my account" : "I have an invite"),
-    tab("pair", "Use a device I have"),
-    tab("kit", "Recovery kit"),
-    tab("friends", "Friends' pieces"),
-  );
-  (invite ? tabs.children[0] : tabs.children[1]).click();
+  show(invite ? "invite" : "pair");
   fill(app, 
     h(
       "section",
@@ -772,8 +767,8 @@ function renderWelcome(info) {
       h("div", { class: "row" }, logo, h("h1", {}, invite ? "Welcome to Cardboard" : "Open your Cardboard")),
       intro,
       remembers,
-      tabs,
       body,
+      others,
       ON_ANDROID ? h("p", { class: "muted small row" }, "On this phone, Cardboard works best as its app. ", androidAppLink("Get the app")) : null,
       info?.shake ? h("p", { class: "muted small" }, `This server's self-test: ${info.shake.summary}.`) : null,
     ),
@@ -806,7 +801,107 @@ function inviteForm(invite) {
   return form;
 }
 
+/**
+ * The new device's side of "Add a device": press the button here, press Add a
+ * device on a device you're signed in on, and check both show the same number.
+ */
 function pairPane() {
+  const status = h("div", { class: "stack" });
+  const start = h("button", { type: "button" }, "Add this device");
+  const pane = h(
+    "div",
+    { class: "stack" },
+    h("p", {}, "Signed in on another device, like your laptop? Press the button, then say yes there. Nothing to type."),
+    start,
+    status,
+    h("details", { class: "small" }, h("summary", {}, "Or use a pairing code"), codePairPane()),
+  );
+  start.addEventListener("click", () =>
+    withBusy(start, async () => {
+      fill(
+        status,
+        h("p", {}, "Now, on your other device: open Cardboard and press ", h("strong", {}, "Add a device"), " (at the top of your shelf)."),
+        h("p", { class: "muted small" }, "Waiting for it… (up to 5 minutes)"),
+      );
+      try {
+        const joining = await joinDevice(getInOptions(""));
+        start.hidden = true;
+        fill(
+          status,
+          h("p", {}, "Your other device shows a number. If it's this one, press ", h("strong", {}, "Yes"), " there:"),
+          h("div", { class: "pair-number" }, joining.number),
+          h("p", { class: "muted small" }, "Waiting for your yes…"),
+        );
+        account = await joining.wait();
+        render();
+      } catch (err) {
+        start.hidden = false;
+        status.replaceChildren(errorBox(err));
+      }
+    }),
+  );
+  return pane;
+}
+
+/** "Add a device", on a device you're signed in on: a number shows here and on the new device. Same number, press Yes. */
+function addDevice() {
+  const controller = new AbortController();
+  let offer = null;
+  const status = h(
+    "div",
+    { class: "stack" },
+    h("p", {}, "On the new device (your phone, another computer), open Cardboard and press ", h("strong", {}, "Add this device"), "."),
+    h("p", { class: "muted small" }, "Waiting for it… (up to 5 minutes)"),
+  );
+  const close = h("button", { type: "button", class: "secondary" }, "Cancel");
+  close.addEventListener("click", () => closeModal());
+  openModal(
+    () => {
+      controller.abort();
+      offer?.cancel();
+    },
+    h("h2", {}, "Add a device"),
+    status,
+    h("div", { class: "row" }, close),
+  );
+  account
+    .offerDevice({ signal: controller.signal })
+    .then((answered) => {
+      offer = answered;
+      const yes = h("button", { type: "button" }, "Yes, add it");
+      const no = h("button", { type: "button", class: "secondary" }, "No");
+      no.addEventListener("click", () => closeModal());
+      yes.addEventListener("click", () =>
+        withBusy(yes, async () => {
+          try {
+            await answered.approve();
+            offer = null; // Added: closing now mustn't cancel it.
+            fill(status, h("p", {}, h("span", { class: "chip ok" }, "Added"), " It's opening your Cardboard now."));
+            close.textContent = "Done";
+            close.hidden = false;
+            close.addEventListener("click", () => render());
+          } catch (err) {
+            status.replaceChildren(errorBox(err));
+          }
+        }),
+      );
+      fill(
+        status,
+        h("p", {}, `A new device (${answered.kind === "browser" ? "a browser or the app" : answered.kind === "cli" ? "a command line" : "a device"}) answered. Does it show this number?`),
+        h("div", { class: "pair-number" }, answered.number),
+        h("p", { class: "small" }, h("strong", {}, "Only press Yes if it's the device in front of you, showing exactly this number."), " A different number (or none) means someone else answered: press No."),
+        h("div", { class: "row" }, yes, no),
+      );
+      close.hidden = true;
+    })
+    .catch((err) => {
+      if (err?.code === "cancelled") return;
+      status.replaceChildren(errorBox(err));
+    });
+}
+
+/** The older way: this device shows a code to type (or scan) on one you're signed in on. */
+function codePairPane() {
   const status = h("div");
   const name = deviceNameField();
   const start = h("button", { type: "button" }, "Show me a pairing code");
@@ -829,7 +924,7 @@ function pairPane() {
             qrCode(`${ORIGIN}/#pair=${pending.code}`, "QR code to approve this browser"),
             h("p", {}, "Or type this code on a device that's already signed in:"),
             h("code", { class: "secret big" }, pending.code),
-            h("p", { class: "small" }, "It's under ", h("strong", {}, "You → Devices → Add a device"), ". Or run:"),
+            h("p", { class: "small" }, "It's under ", h("strong", {}, "You → Devices → Or type a pairing code"), ". Or run:"),
             h("code", { class: "secret" }, `cardboard devices add ${pending.code}`),
             h("p", { class: "muted small" }, "Waiting for you to approve it (the code works for 10 minutes)…"),
           ),
@@ -955,7 +1050,7 @@ async function renderShelf() {
       "div",
       { class: "page-head" },
       h("div", {}, h("h1", {}, me.profile.name ? `${me.profile.name}'s shelf` : "Your shelf"), h("div", { class: "muted" }, `${plural(boxes.length, "box").replace("boxs", "boxes")} · ${bytes(me.quota.used)} of ${bytes(me.quota.limit)}`)),
-      shakeChip,
+      h("div", { class: "row" }, shakeChip, h("button", { type: "button", class: "secondary tiny", onclick: addDevice }, "Add a device")),
     ),
     emergencyAlerts(me),
     search,
@@ -1000,7 +1095,32 @@ function androidAppLink(label) {
   return h("a", { class: "button", href: "/cardboard.apk", download: "Cardboard.apk" }, label);
 }
 
+/** The newest Cardboard app for Android (VERSION in android/…/MainActivity.java). */
+const ANDROID_APP_LATEST = 2;
+const ANDROID_APP_VERSION = Number(navigator.userAgent.match(/CardboardAndroid\/(\d+)/)?.[1] ?? 0);
+
+/** Inside an older Cardboard app: the new one, saved to the phone's Downloads through the app. */
+function androidUpdateCard() {
+  const button = h("button", { type: "button" }, "Get the new version");
+  const note = h("div", { class: "muted small" }, "Fixes and new things for the app itself. Your Cardboard stays as it is.");
+  button.addEventListener("click", () =>
+    withBusy(button, async () => {
+      try {
+        const res = await fetch("/cardboard.apk");
+        if (!res.ok) throw new Error("This Cardboard doesn't have the app to give out. Update Cardboard on its computer first.");
+        await androidSave({ name: "Cardboard.apk", type: "application/vnd.android.package-archive" }, [new Uint8Array(await res.arrayBuffer())]);
+        fill(note, "Saved. Now open your Files app → Downloads → Cardboard, tap ", h("strong", {}, "Cardboard.apk"), " and press Update.");
+        button.hidden = true;
+      } catch (err) {
+        note.replaceChildren(errorBox(err));
+      }
+    }),
+  );
+  return h("section", { class: "card row spread install-card" }, h("div", {}, h("strong", {}, "A new version of the Cardboard app is ready"), note), button);
+}
+
 function androidAppCard() {
+  if (IN_ANDROID_APP && ANDROID_APP_VERSION < ANDROID_APP_LATEST) return androidUpdateCard();
   if (!ON_ANDROID) return null;
   return h(
     "section",
@@ -3196,7 +3316,14 @@ async function renderYou() {
       h(
         "div",
         {},
-        h("section", { class: "card stack" }, h("h2", {}, "Devices"), h("ul", { class: "list" }, devices), h("details", {}, h("summary", {}, "Add a device"), add)),
+        h(
+          "section",
+          { class: "card stack" },
+          h("h2", {}, "Devices"),
+          h("ul", { class: "list" }, devices),
+          h("div", { class: "row" }, h("button", { type: "button", onclick: addDevice }, "Add a device")),
+          h("details", {}, h("summary", {}, "Or type a pairing code from the new device"), add),
+        ),
         await lockCard(),
         h("section", { class: "card stack" }, h("h2", {}, "Your name and email"), profile),
       ),

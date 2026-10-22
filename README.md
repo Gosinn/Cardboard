@@ -76,7 +76,7 @@ So the smart parts moved to where your keys are. Search, the sensitive-data rada
 
 There are no passwords to forget or leak. **Each device is signed in with its own key.**
 
-- **A new device:** on it, choose *Use a device I have* (or run `cardboard pair <url>`). It shows a QR code and a code like `K7Q2M-9XMA2-R7G08`. Scan the QR code with your phone's camera, or type the code on a device you already have (*You → Devices → Add a device*, or `cardboard devices add <code>`). The code never reaches the server, and it's what lets your device check it's sealing your account key to the right device, so not even a malicious server can slip its own device in.
+- **A new device:** on it, press *Add this device*; on a device you already have, press *Add a device* (top of your shelf). Both show the same 6-digit number: press *Yes* if they match. Nothing to type. The new device commits to its key before your device picks its own random part of the number, so whoever passes the messages (even a malicious server) can't slip its own device in with a matching number. (The older way still works: *Or use a pairing code*, or `cardboard pair <url>` and `cardboard devices add <code>`.)
 - **Lost a device?** Remove it from any other (`cardboard devices remove <id>`). Its token stops working and its sealed copy of your account key is deleted.
 
 **If you lose every device**, you choose how you get back in (*You → If you lose every device*, or `cardboard recovery`):

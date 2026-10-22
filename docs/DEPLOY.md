@@ -122,7 +122,7 @@ Open the invite link **on your phone**, make your account, and save the recovery
 1. **Add it to your home screen.** iPhone: Safari's Share button → *Add to Home Screen*. Android: Chrome's menu → *Add to Home screen*. It gets an icon, opens like an app, and the browser won't clear its storage (where this phone's key lives).
 2. **Turn on Face ID:** *You → Lock with Face ID*.
 3. **Make your personal box:** on the shelf, *Make my personal box*. Notes, passwords, links and files, just for you, on every device you sign in on.
-4. **Add your laptop:** open the same address there and choose *Use a device I have*. It shows a QR code: scan it with your phone's camera and approve.
+4. **Add your laptop:** open the same address there and press *Add this device*. On your phone, press *Add a device* (top of your shelf). If both show the same number, press *Yes*.
 5. **Invite your friend:** *You → Invite a friend*. Send the link, or let them scan the QR code. Their account is theirs alone: you can't see into it, even as the host.
 6. **Share a box with them:** open a box, then *People → Share with someone*.
 7. **If something happens to you:** *You → If something happens to you* makes a link (and a printable QR code) for someone you trust.

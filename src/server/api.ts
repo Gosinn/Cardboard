@@ -171,6 +171,8 @@ export class Api {
   readonly limiter = new FailureLimiter();
   /** New devices asking to pair, per address: 20 per 10 minutes. */
   readonly pairings = new FailureLimiter(20, 10 * 60 * 1000);
+  /** New devices looking for an open "Add a device", per address: one every 3 seconds or so, for 10 minutes. */
+  readonly offerLooks = new FailureLimiter(250, 10 * 60 * 1000);
   /** New accounts, per address: 10 an hour (matters with open sign-up). */
   readonly signups = new FailureLimiter(10, 60 * 60 * 1000);
   lastShake: ShakeReport | null = null;
@@ -608,6 +610,34 @@ export class Api {
         });
       },
 
+      // Adding a device by matching numbers (see accounts.openOffer). These are the new device's steps.
+      "pair.find": (_body, req) => {
+        if (this.offerLooks.blocked(req.ip, this.now())) throw slowDown();
+        this.offerLooks.fail(req.ip, this.now());
+        return { offers: accounts.offersWaiting().map(b64) };
+      },
+
+      "pair.join": (body, req) => {
+        if (this.pairings.blocked(req.ip, this.now())) throw slowDown();
+        this.pairings.fail(req.ip, this.now());
+        const kind = optString(body, "kind") ?? "other";
+        if (!(DEVICE_KINDS as readonly string[]).includes(kind)) throw fail("bad_request", 400, `\`kind\` is one of ${DEVICE_KINDS.join(", ")}.`);
+        const input = { commitment: requireBlob(body, "commitment", 32, 32), tokenHash: requireBlob(body, "tokenHash", 32, 32), kind: kind as DeviceKind };
+        return this.countMisses(req, () => accounts.joinOffer(requireBlob(body, "offer", 16, 16), input));
+      },
+
+      "pair.joined": (body, req) => {
+        const view = this.countMisses(req, () => accounts.joinerView(requireBlob(body, "offer", 16, 16), requireString(body, "token", 100)));
+        const approved = view.approved ? { accountId: view.approved.accountId, deviceId: view.approved.deviceId, envelope: b64(view.approved.envelope) } : null;
+        return { nonceA: view.nonceA ? b64(view.nonceA) : null, approved };
+      },
+
+      "pair.reveal": (body, req) => {
+        const [publicKey, nonce] = [requireBlob(body, "publicKey", 65, 65), requireBlob(body, "nonce", 32, 32)];
+        this.countMisses(req, () => accounts.revealOffer(requireBlob(body, "offer", 16, 16), requireString(body, "token", 100), publicKey, nonce));
+        return { ok: true };
+      },
+
       "pair.poll": (body, req) => {
         try {
           const result = accounts.pollPairing(requireBlob(body, "id", 32, 32), requireString(body, "token", 100));
@@ -890,6 +920,37 @@ export class Api {
         hub.closeWhere((w) => w.tapeId === deviceStream(a.account.id, removed.id));
         record(a, req, "device.remove", { ref: removed.label ? { sealed: removed.label, ctx: ctx.deviceLabel } : null });
         return { removed: removed.id, self: removed.id === a.device.id };
+      },
+
+      // Adding a device by matching numbers: the steps of the device you already have.
+      "pair.offer": (a) => {
+        const offer = accounts.openOffer(a.account.id);
+        return { id: b64(offer.id), expiresAt: offer.expiresAt };
+      },
+
+      "pair.offer.check": (a, body, req) => {
+        const v = this.countMisses(req, () => accounts.offer(a.account.id, requireBlob(body, "id", 16, 16)));
+        const opt = (x: Buffer | null) => (x ? b64(x) : null);
+        return { expiresAt: v.expiresAt, commitment: opt(v.commitment), kind: v.kind, nonceA: opt(v.nonceA), publicKey: opt(v.publicKey), nonceN: opt(v.nonceN), deviceId: v.deviceId };
+      },
+
+      "pair.offer.nonce": (a, body, req) => {
+        const nonce = requireBlob(body, "nonce", 32, 32);
+        this.countMisses(req, () => accounts.challengeOffer(a.account.id, requireBlob(body, "id", 16, 16), nonce));
+        return { ok: true };
+      },
+
+      "pair.offer.approve": (a, body, req) => {
+        const label = optBlob(body, "label", MAX_LABEL) ?? null;
+        const envelope = requireBlob(body, "envelope", MAX_KEY_BLOB);
+        const device = this.countMisses(req, () => accounts.approveOffer(a.account.id, requireBlob(body, "id", 16, 16), envelope, label));
+        record(a, req, "device.add", { ref: label ? { sealed: label, ctx: ctx.deviceLabel } : null, note: device.kind });
+        return { device: { id: device.id, kind: device.kind } };
+      },
+
+      "pair.offer.cancel": (a, body) => {
+        accounts.closeOffer(a.account.id, requireBlob(body, "id", 16, 16));
+        return { ok: true };
       },
 
       "pair.view": (a, body, req) => {
@@ -1399,7 +1460,7 @@ export class Api {
     try {
       return fn();
     } catch (err) {
-      if (err instanceof CardboardError && ["no_such_pairing", "no_such_share", "no_such_emergency_link"].includes(err.code)) this.limiter.fail(req.ip, this.now());
+      if (err instanceof CardboardError && ["no_such_pairing", "no_such_offer", "no_such_share", "no_such_emergency_link"].includes(err.code)) this.limiter.fail(req.ip, this.now());
       throw err;
     }
   }

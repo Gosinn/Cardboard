@@ -870,3 +870,19 @@ svg.qr,
 .perms li strong {
   display: block;
 }
+
+/* ── Adding a device: the number both devices show ─────── */
+
+.pair-number {
+  font-size: 2.6rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+  padding: 8px 0;
+}
+
+.other-ways {
+  gap: 4px 12px;
+  flex-wrap: wrap;
+}

@@ -29,6 +29,7 @@ import {
   splitSecret,
   toB64u,
   toCode,
+  utf8,
   type KeyLike,
 } from "./crypto.ts";
 import type { DeviceLock, DeviceRecord, DeviceStore } from "./device.ts";
@@ -481,6 +482,97 @@ export async function startPairing(options: GetInOptions): Promise<PendingPairin
   };
 }
 
+// ── Adding a device by matching numbers ──────────────────────────────────────
+//
+// "Add a device" on a device you have opens an offer. The new device answers it
+// with a commitment to its public key and a random nonce; the device you have
+// then adds its own random nonce; only then does the new device reveal its key.
+// Both show a 6-digit number made from all of it, and you say yes only if they
+// match. Whoever passes the messages (the server) has to commit to a key before
+// seeing your device's nonce, so it can't choose one that gives the same number
+// (a one in a million guess, and a wrong number is there to see).
+
+/** What the new device promises before it knows the other device's nonce. */
+async function pairCommitment(publicKey: Uint8Array, nonce: Uint8Array): Promise<Uint8Array> {
+  return sha256(concat(utf8.encode("cardboard pair commitment"), publicKey, nonce));
+}
+
+/** The number both devices show, like "482 917". */
+async function pairNumber(commitment: Uint8Array, publicKey: Uint8Array, nonceN: Uint8Array, nonceA: Uint8Array): Promise<string> {
+  const hash = await sha256(concat(utf8.encode("cardboard pair number"), commitment, publicKey, nonceN, nonceA));
+  const n = new DataView(hash.buffer, hash.byteOffset, 4).getUint32(0) % 1_000_000;
+  const digits = String(n).padStart(6, "0");
+  return `${digits.slice(0, 3)} ${digits.slice(3)}`;
+}
+
+function pause(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(new CardboardError("cancelled", 0, "Adding the device was cancelled."));
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(resolve, ms);
+    signal?.addEventListener("abort", () => (clearTimeout(timer), reject(new CardboardError("cancelled", 0, "Adding the device was cancelled."))), { once: true });
+  });
+}
+
+export interface JoiningDevice {
+  /** Show this; the device you already have shows it too. */
+  number: string;
+  /** Resolves once you say yes on the other device. */
+  wait(options?: { signal?: AbortSignal; everyMs?: number }): Promise<Account>;
+}
+
+/**
+ * The new device's side of "Add a device": waits (up to `lookForMs`) for one of
+ * your signed-in devices to open an offer, answers it, and resolves with the
+ * number to compare.
+ */
+export async function joinDevice(options: GetInOptions & { signal?: AbortSignal; everyMs?: number; lookForMs?: number }): Promise<JoiningDevice> {
+  const rpc = new Rpc(options.url, null, options.fetch);
+  const every = options.everyMs ?? 3000;
+  const until = Date.now() + (options.lookForMs ?? 5 * 60_000);
+  let offer: string | undefined;
+  for (;;) {
+    offer = (await rpc.call<{ offers: string[] }>("pair.find", {})).offers[0];
+    if (offer) break;
+    if (Date.now() > until) {
+      throw new CardboardError("no_such_offer", 404, "Nobody pressed Add a device in the last 5 minutes.", "On a device where you're signed in, press Add a device, then try again here.");
+    }
+    await pause(every, options.signal);
+  }
+  const pair = await keyPair();
+  const nonceN = random(32);
+  const token = newDeviceToken();
+  const commitment = await pairCommitment(pair.publicKey, nonceN);
+  await rpc.call("pair.join", { offer, commitment: toB64u(commitment), tokenHash: toB64u(await sha256(token)), kind: options.kind });
+  let nonceA: string | null = null;
+  while (!nonceA) {
+    await pause(Math.min(every, 1000), options.signal);
+    nonceA = (await rpc.call<{ nonceA: string | null }>("pair.joined", { offer, token })).nonceA;
+  }
+  await rpc.call("pair.reveal", { offer, token, publicKey: toB64u(pair.publicKey), nonce: toB64u(nonceN) });
+  return {
+    number: await pairNumber(commitment, pair.publicKey, nonceN, fromB64u(nonceA)),
+    async wait({ signal, everyMs = 1500 } = {}) {
+      for (;;) {
+        const { approved } = await rpc.call<{ approved: { accountId: string; deviceId: string; envelope: string } | null }>("pair.joined", { offer, token });
+        if (approved) {
+          const root = await openWith(pair, fromB64u(approved.envelope), ctx.accountKey("pairing"));
+          return finishDevice(options, rpc, root, approved, token);
+        }
+        await pause(everyMs, signal);
+      }
+    },
+  };
+}
+
+export interface DeviceOffer {
+  /** What kind of device answered (browser, cli, other). */
+  kind: DeviceKind;
+  /** Say yes only if the new device shows this same number. */
+  number: string;
+  approve(label?: string): Promise<{ id: string; kind: DeviceKind }>;
+  cancel(): Promise<void>;
+}
+
 /** Back in with your recovery kit, on a new device. */
 export async function recoverWithKit(options: GetInOptions & { code: string }): Promise<Account> {
   const code = fromCode(options.code, KIT_BYTES);
@@ -708,6 +800,53 @@ export class Account {
       label: label ? await this.sealMeta(label, ctx.deviceLabel) : undefined,
     });
     return res.device;
+  }
+
+  /**
+   * "Add a device": opens an offer for a new device to answer (for 5 minutes), and
+   * resolves once one has, with the number both now show. See joinDevice().
+   */
+  async offerDevice(options: { signal?: AbortSignal; everyMs?: number } = {}): Promise<DeviceOffer> {
+    const every = options.everyMs ?? 1500;
+    const { id } = await this.rpc.call<{ id: string }>("pair.offer", {});
+    const cancel = () => this.rpc.call("pair.offer.cancel", { id }).then(() => undefined, () => undefined);
+    type Check = { commitment: string | null; kind: DeviceKind | null; publicKey: string | null; nonceN: string | null };
+    try {
+      let state = await this.rpc.call<Check>("pair.offer.check", { id });
+      while (!state.commitment) {
+        await pause(every, options.signal);
+        state = await this.rpc.call<Check>("pair.offer.check", { id });
+      }
+      const commitment = fromB64u(state.commitment);
+      const nonceA = random(32);
+      await this.rpc.call("pair.offer.nonce", { id, nonce: toB64u(nonceA) });
+      while (!state.publicKey || !state.nonceN) {
+        await pause(Math.min(every, 1000), options.signal);
+        state = await this.rpc.call<Check>("pair.offer.check", { id });
+      }
+      const publicKey = fromB64u(state.publicKey);
+      const nonceN = fromB64u(state.nonceN);
+      if (!equalBytes(await pairCommitment(publicKey, nonceN), commitment)) {
+        throw new CardboardError("pairing_tampered", 0, "The new device's key isn't the one it promised, so Cardboard didn't trust it.", "Press Add a device again.");
+      }
+      return {
+        kind: state.kind ?? "other",
+        number: await pairNumber(commitment, publicKey, nonceN, nonceA),
+        approve: async (label?: string) => {
+          const envelope = await sealTo(publicKey, this.keys.root, ctx.accountKey("pairing"));
+          const res = await this.rpc.call<{ device: { id: string; kind: DeviceKind } }>("pair.offer.approve", {
+            id,
+            envelope: toB64u(envelope),
+            label: label ? await this.sealMeta(label, ctx.deviceLabel) : undefined,
+          });
+          return res.device;
+        },
+        cancel,
+      };
+    } catch (err) {
+      await cancel();
+      throw err;
+    }
   }
 
   // ── Locking this device (Face ID…) ───────────────────────────────────────

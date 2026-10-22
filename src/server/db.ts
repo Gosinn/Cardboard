@@ -345,6 +345,27 @@ const MIGRATIONS: string[] = [
   -- past by rewriting it with a short expiry.
   ALTER TABLE history ADD COLUMN temporary INTEGER NOT NULL DEFAULT 0;
   `,
+  `
+  -- Adding a device by matching numbers. A device you have opens an offer; the
+  -- new device joins it with a commitment to its public key; the offering
+  -- device adds a random nonce; then the new device reveals its key. Both show
+  -- a number made from all of it, and you check they match. The server only
+  -- passes these along, and can't pick a key that gives the same number.
+  CREATE TABLE pair_offers (
+    id          BLOB PRIMARY KEY,
+    account_id  TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    created_at  INTEGER NOT NULL,
+    expires_at  INTEGER NOT NULL,
+    commitment  BLOB,
+    kind        TEXT,
+    token_hash  BLOB,
+    nonce_a     BLOB,
+    public_key  BLOB,
+    nonce_n     BLOB,
+    device_id   TEXT,
+    envelope    BLOB
+  ) WITHOUT ROWID;
+  `,
 ];
 
 export function openDb(path: string): DB {

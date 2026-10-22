@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
-import { recoverWithFriends, recoverWithKit, signUp, startPairing, unlock } from "../src/client/account.ts";
+import { joinDevice, recoverWithFriends, recoverWithKit, signUp, startPairing, unlock } from "../src/client/account.ts";
 import { keyPair, open, random, toB64u } from "../src/client/crypto.ts";
 import { ctx } from "../src/shared/contexts.ts";
 import { MemoryStore } from "../src/client/device.ts";
@@ -74,6 +74,66 @@ describe("accounts, devices and recovery", () => {
     t.clock.advance(11 * 60 * 1000);
     await rejectsWith(t.me.approveDevice(pending.code), "no_such_pairing");
     t.cb.api.limiter.reset("127.0.0.1");
+  });
+
+  it("adds a device when the numbers on both match, with nothing to type", async () => {
+    const offering = t.me.offerDevice({ everyMs: 50 });
+    const joining = await joinDevice({ ...device(), label: "Tablet", everyMs: 50 });
+    const offer = await offering;
+    assert.match(joining.number, /^\d{3} \d{3}$/);
+    assert.equal(offer.number, joining.number, "both devices show the same number");
+    assert.equal(offer.kind, "cli");
+    const [tablet] = await Promise.all([joining.wait({ everyMs: 50 }), offer.approve("Tablet")]);
+    assert.equal(tablet.id, t.me.id);
+    await tablet.createBox("from-tablet");
+    assert.ok((await t.me.boxes()).some((b) => b.name === "from-tablet"));
+    assert.ok((await t.me.me()).devices.some((d) => d.name === "Tablet"));
+    const left = t.cb.api.ctx.db.prepare("SELECT COUNT(*) AS n FROM pair_offers").get() as { n: number };
+    assert.equal(left.n, 0, "the offer is gone once used");
+  });
+
+  it("catches a key swapped by the server, and lets only the first device answer", async () => {
+    // The device you have waits longer between looks, so the swap lands before it reads the key.
+    const offering = t.me.offerDevice({ everyMs: 400 });
+    const joining = await joinDevice({ ...device(), everyMs: 50 });
+    assert.ok(joining.number);
+    const evil = await keyPair();
+    t.cb.api.ctx.db.prepare("UPDATE pair_offers SET public_key = ?").run(Buffer.from(evil.publicKey));
+    await rejectsWith(offering, "pairing_tampered");
+    assert.equal((t.cb.api.ctx.db.prepare("SELECT COUNT(*) AS n FROM pair_offers").get() as { n: number }).n, 0, "a refused offer is closed");
+
+    const second = t.me.offerDevice({ everyMs: 50 });
+    const first = await joinDevice({ ...device(), everyMs: 50 });
+    const id = (t.cb.api.ctx.db.prepare("SELECT id FROM pair_offers").get() as { id: Uint8Array }).id;
+    const late = await fetch(`${t.cb.url}/v1/pair.join`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ offer: toB64u(id), commitment: toB64u(random(32)), tokenHash: toB64u(random(32)), kind: "other" }),
+    });
+    assert.equal(((await late.json()) as { error: { code: string } }).error.code, "offer_taken");
+    const offer = await second;
+    assert.equal(offer.number, first.number);
+    await offer.cancel();
+    await rejectsWith(first.wait({ everyMs: 50 }), "no_such_offer");
+    t.cb.api.limiter.reset("127.0.0.1");
+  });
+
+  it("closes an offer nobody answered after 5 minutes", async () => {
+    const controller = new AbortController();
+    const offering = t.me.offerDevice({ everyMs: 50, signal: controller.signal });
+    await new Promise((r) => setTimeout(r, 100));
+    const id = (t.cb.api.ctx.db.prepare("SELECT id FROM pair_offers").get() as { id: Uint8Array }).id;
+    t.clock.advance(6 * 60 * 1000);
+    await rejectsWith(offering, "no_such_offer");
+    const res = await fetch(`${t.cb.url}/v1/pair.join`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ offer: toB64u(id), commitment: toB64u(random(32)), tokenHash: toB64u(random(32)), kind: "other" }),
+    });
+    assert.equal(((await res.json()) as { error: { code: string } }).error.code, "no_such_offer");
+    await rejectsWith(joinDevice({ ...device(), everyMs: 10, lookForMs: 30 }), "no_such_offer");
+    t.cb.api.limiter.reset("127.0.0.1");
+    t.cb.api.pairings.reset("127.0.0.1");
   });
 
   it("gets you back in with your recovery kit, and a new kit retires the old one", async () => {

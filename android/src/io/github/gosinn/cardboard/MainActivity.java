@@ -68,7 +68,7 @@ import org.json.JSONObject;
  * talks to the page only through a message port it hands to your Cardboard's address alone.
  */
 public class MainActivity extends Activity {
-  static final String VERSION = "1";
+  static final String VERSION = "2";
   static final int PICK_FILES = 1;
   /** The most the page reads or writes in one message, in bytes (it travels as base64). */
   static final int PIECE_MAX = 1 << 20;
@@ -82,6 +82,12 @@ public class MainActivity extends Activity {
   WebView web;
   /** The address screen or the "isn't answering" screen, shown over the page. */
   View cover;
+  /** Where to try again while Cardboard isn't answering (null when it is). */
+  String failing;
+  /** While Cardboard isn't answering, it tries again by itself every 10 seconds. */
+  final Runnable retry = () -> {
+    if (web != null && failing != null) web.loadUrl(failing);
+  };
   View fullscreen;
   WebChromeClient.CustomViewCallback fullscreenDone;
   /** Your Cardboard, like https://laptop.tail1234.ts.net:8443 (no path). */
@@ -162,7 +168,8 @@ public class MainActivity extends Activity {
     view.setDownloadListener((url, agent, disposition, type, length) -> {
       // The dashboard saves its own downloads through this app; anything else is for the browser.
       Uri u = Uri.parse(url);
-      if (!ours(u)) openOutside(u);
+      // A new version of this app: the browser downloads it, and Android installs it.
+      if (!ours(u) || "/cardboard.apk".equals(u.getPath())) openOutside(u);
     });
     return view;
   }
@@ -201,7 +208,17 @@ public class MainActivity extends Activity {
 
     @Override
     public void onPageFinished(WebView view, String url) {
-      if (port == null && url != null && ours(Uri.parse(url))) connect();
+      if (url == null || !ours(Uri.parse(url))) return;
+      // Cardboard's own page is called "Cardboard". Anything else here is an error page.
+      String title = view.getTitle();
+      if (title == null || !title.contains("Cardboard")) {
+        trouble(url, null);
+        return;
+      }
+      if (failing != null) removeCover();
+      failing = null;
+      view.setVisibility(View.VISIBLE);
+      if (port == null) connect();
     }
 
     @Override
@@ -289,7 +306,7 @@ public class MainActivity extends Activity {
   @Override
   public void onBackPressed() {
     if (fullscreen != null) leaveFullscreen();
-    else if (cover != null && web != null && origin != null) removeCover();
+    else if (cover != null) super.onBackPressed();
     else if (web != null && web.canGoBack()) web.goBack();
     else super.onBackPressed();
   }
@@ -304,6 +321,11 @@ public class MainActivity extends Activity {
   protected void onResume() {
     super.onResume();
     if (web != null) web.onResume();
+    // Back in the app while Cardboard wasn't answering: look again now.
+    if (failing != null) {
+      main.removeCallbacks(retry);
+      retry.run();
+    }
   }
 
   @Override
@@ -627,22 +649,28 @@ public class MainActivity extends Activity {
     showCover(page);
   }
 
-  void trouble(String failing, String detail) {
+  void trouble(String url, String detail) {
+    String target = url != null && ours(Uri.parse(url)) ? url : origin + "/";
+    // Never the browser's own error page underneath (it's unreadable here, and says less).
+    if (web != null) web.setVisibility(View.INVISIBLE);
     LinearLayout page = column();
     page.addView(text("Cardboard isn't answering", 24, true));
-    page.addView(text("Is the computer Cardboard runs on switched on and online? It's at " + origin + ".", 16, false));
+    page.addView(text("Is the computer Cardboard runs on switched on, awake and online? It's at " + origin + ".", 16, false));
+    page.addView(text("Trying again by itself every 10 seconds.", 15, false));
     if (detail != null && !detail.isEmpty()) page.addView(text("(" + detail + ")", 13, false));
     Button again = new Button(this);
-    again.setText("Try again");
+    again.setText("Try again now");
     again.setOnClickListener(v -> {
-      removeCover();
-      if (web != null) web.loadUrl(failing != null && ours(Uri.parse(failing)) ? failing : origin + "/");
+      main.removeCallbacks(retry);
+      retry.run();
     });
     Button change = new Button(this);
     change.setText("Change address");
     change.setOnClickListener(v -> ask(null));
     page.addView(row(change, again));
     showCover(page);
+    failing = target;
+    main.postDelayed(retry, 10_000);
   }
 
   LinearLayout column() {
@@ -684,6 +712,8 @@ public class MainActivity extends Activity {
   }
 
   void removeCover() {
+    main.removeCallbacks(retry);
+    failing = null;
     if (cover != null) root.removeView(cover);
     cover = null;
   }

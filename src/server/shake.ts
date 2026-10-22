@@ -2,7 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { readFileSync, statSync } from "node:fs";
 import { CardboardError } from "../shared/errors.ts";
 import { ctx } from "../shared/contexts.ts";
-import { claimEmergency, requestEmergency, signUp, recoverWithKit, startPairing, unlock, viewEmergency, type Account } from "../client/account.ts";
+import { claimEmergency, joinDevice, requestEmergency, signUp, recoverWithKit, startPairing, unlock, viewEmergency, type Account } from "../client/account.ts";
 import { fromB64u, keyPair, open, openWith, random, sealJson, toB64u, toCode, utf8 } from "../client/crypto.ts";
 import { MemoryStore } from "../client/device.ts";
 import { dockIndex, dockKeys, newClientId, readBundle } from "../client/keys.ts";
@@ -318,6 +318,26 @@ export async function runShake(api: Api): Promise<ShakeReport> {
       return caught && wrongCode
         ? pass("A pairing whose public key was swapped on the server was refused by your device; a made-up code found nothing.")
         : failed("A tampered pairing request was approved.");
+    });
+
+    await check("pairing-numbers", "Adding a device by matching numbers can't be hijacked", async () => {
+      // The device you have looks less often, so the swap below lands before it reads the new device's key.
+      const offering = me.offerDevice({ everyMs: 300 }).then(
+        () => "approved",
+        (err) => (err instanceof CardboardError ? err.code : "error"),
+      );
+      const joining = await joinDevice({ url, store: new MemoryStore(), kind: "other", fetch: inProcess, everyMs: 20 });
+      // Pretend the server swapped in its own public key after the new device committed to its real one.
+      const evil = await keyPair();
+      db.prepare("UPDATE pair_offers SET public_key = ? WHERE public_key IS NOT NULL").run(Buffer.from(evil.publicKey));
+      const outcome = await offering;
+      const left = db.prepare("SELECT COUNT(*) AS n FROM pair_offers").get() as { n: number };
+      db.prepare("DELETE FROM pair_offers").run();
+      api.limiter.reset(PROBE_IP);
+      api.pairings.reset(PROBE_IP);
+      return outcome === "pairing_tampered" && left.n === 0 && /^\d{3} \d{3}$/.test(joining.number)
+        ? pass("A key swapped on the server after the new device promised its own was refused, and the offer was closed.")
+        : failed(`A swapped key wasn't caught (${outcome}).`);
     });
 
     await check("device-removed", "Removed devices are locked out", async () => {
