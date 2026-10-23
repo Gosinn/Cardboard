@@ -31,7 +31,7 @@ import { toB64u } from "../src/client/crypto.ts";
 import { recoverWithKit } from "../src/client/account.ts";
 import { MemoryStore } from "../src/client/device.ts";
 import { openDb } from "../src/server/db.ts";
-import { CardboardError, type Box } from "../src/sdk/index.ts";
+import { CardboardError, open as openBox, type Box } from "../src/sdk/index.ts";
 import { startTestServer, type TestServer } from "./helpers.ts";
 
 const rejectsWith = (promise: Promise<unknown>, code: string) =>
@@ -442,5 +442,62 @@ describe("sending things to yourself", () => {
     } finally {
       await t.stop();
     }
+  });
+});
+
+describe("friend boxes", () => {
+  let t: TestServer;
+  before(async () => {
+    t = await startTestServer({ shake: false });
+  });
+  after(() => t.stop());
+  const secretOf = (link: string) => link.split("#friend=")[1]!;
+
+  it("opens with nothing but its link: play, download, and add when you let them", async () => {
+    await t.me.setProfile({ name: "Gosinn" });
+    const { box, link } = await t.me.makeFriendBox({ title: "Trip videos", write: true, expires: "7d" });
+    assert.match(link.link, /^http:\/\/127\.0\.0\.1:\d+\/#friend=cbt_[A-Za-z0-9_-]{86}$/);
+    assert.ok(link.write && link.expiresAt! > Date.now());
+    const mine = await t.me.open(box);
+    const video = new Blob([randomBytes(FILE_PART_BYTES + 5000)], { type: "video/mp4" });
+    await addFile(mine, video, { name: "trip.mp4" });
+
+    const friend = openBox({ url: t.cb.url, tape: secretOf(link.link), onNotice: false });
+    assert.deepEqual(await friend.get("friend/about"), { title: "Trip videos", from: "Gosinn" });
+    const { things } = await listThings(friend);
+    assert.equal(things.length, 1);
+    const bytes = await readFile(friend, things[0] as Thing<FileValue>);
+    assert.equal(createHash("sha256").update(bytes).digest("hex"), createHash("sha256").update(Buffer.from(await video.arrayBuffer())).digest("hex"));
+    await addFile(friend, new Blob(["back at you"]), { name: "reply.txt", sentFrom: "a friend" });
+    assert.ok((await listThings(mine)).things.some((x) => x.value.title === "reply.txt"), "what the friend added is in your box");
+    assert.ok((await t.me.friendBoxes())[box.id]?.link === link.link, "the link is kept (sealed) in your profile");
+  });
+
+  it("holds the key to that box only: a view-only link can't add, and nothing reaches your other boxes or keys", async () => {
+    const { box: other } = await t.newBox("private-stuff");
+    await other.put("secret", { pin: 1234 });
+    const { link } = await t.me.makeFriendBox({ title: "Look only" });
+    assert.equal(link.write, false);
+    const friend = openBox({ url: t.cb.url, tape: secretOf(link.link), onNotice: false });
+    await rejectsWith(friend.put("files/x", { title: "x" }), "read_only");
+    assert.equal(await friend.get("secret"), null, "another box's items aren't there");
+    // The link's bundle carries a names key made for it, not your account's.
+    const who = await friend.ready();
+    assert.notDeepEqual(Buffer.from(who.names.root), Buffer.from((t.me as unknown as { keys: { names: { root: Uint8Array } } }).keys.names.root));
+  });
+
+  it("stops working when you stop it, or when it expires", async () => {
+    const { box, link } = await t.me.makeFriendBox({ expires: "1d" });
+    const friend = () => openBox({ url: t.cb.url, tape: secretOf(link.link), onNotice: false });
+    assert.ok(await friend().get("friend/about"));
+    const again = await t.me.newFriendLink(box.name, { expires: "1d" });
+    await assert.rejects(friend().get("friend/about"), /was revoked/);
+    t.clock.advance(2 * 24 * 60 * 60 * 1000);
+    await assert.rejects(openBox({ url: t.cb.url, tape: secretOf(again.link), onNotice: false }).get("friend/about"), /expired/);
+    const last = await t.me.newFriendLink(box.name);
+    await t.me.stopFriendLink(box.name);
+    await rejectsWith(openBox({ url: t.cb.url, tape: secretOf(last.link), onNotice: false }).get("friend/about"), "bad_tape");
+    assert.equal((await t.me.friendBoxes())[box.id], null, "still a friend box, with no link");
+    t.cb.api.limiter.reset("127.0.0.1");
   });
 });

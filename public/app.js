@@ -10,6 +10,7 @@ import { createPasskey, hasBuiltInPasskeys, passkeyBlocker, passkeySecret } from
 import {
   addFile,
   fileChunks,
+  FRIEND_ABOUT,
   KINDS,
   keysOf,
   listThings,
@@ -33,6 +34,7 @@ import {
   subtitle,
 } from "/lib/client/personal.ts";
 import { Rpc } from "/lib/client/rpc.ts";
+import { open as openBox } from "/lib/sdk/index.ts";
 import { browserName, browserStore, makeKey } from "/device.js";
 
 const app = document.getElementById("app");
@@ -52,6 +54,8 @@ let pendingShare = null;
 let pendingEmergency = null;
 /** A pairing code scanned from a new device's screen, to approve here. */
 let pendingPair = null;
+/** A friend box's link (#friend=cbt_…), opened by anyone: no account needed. Kept for this tab so a reload works. */
+let pendingFriend = null;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -1022,7 +1026,8 @@ async function renderShelf() {
   const shakeChip = shake ? h("a", { href: "#/security", class: `chip ${shake.ok ? "ok" : "danger"}` }, `${shake.ok ? "✓" : "✗"} Server self-test: ${shake.summary}`) : null;
 
   const insightsBox = h("section", { class: "card" }, h("h2", {}, "Worth a look"), h("p", { class: "muted small" }, "Looking through your boxes…"));
-  const cards = boxes.filter((b) => b.id !== personal?.id).map((b) => {
+  const friends = me.profile.friends ?? {};
+  const cards = boxes.filter((b) => b.id !== personal?.id && !(b.id in friends && !b.shared)).map((b) => {
     const summary = h("div", { class: "muted" }, "…");
     const chips = h("div", { class: "row" });
     account
@@ -1060,6 +1065,7 @@ async function renderShelf() {
     ON_ANDROID ? null : installCard(),
     sending,
     personalCard(personal),
+    friendBoxesCard(boxes, friends),
     insightsBox,
     h("div", { class: "grid" }, cards, newBoxCard()),
   );
@@ -1414,6 +1420,333 @@ function personalCard(box) {
   );
 }
 
+// ── Friend boxes ────────────────────────────────────────────────────────────
+
+const LINK_DURATIONS = [
+  ["1d", "1 day"],
+  ["7d", "7 days"],
+  ["30d", "30 days"],
+  ["", "until I stop it"],
+];
+
+/** On the shelf: your friend boxes, and the button that makes one. */
+function friendBoxesCard(boxes, friends) {
+  const mine = boxes.filter((b) => b.id in friends && !b.shared);
+  const make = h("button", { type: "button" }, "Make a friend box");
+  make.addEventListener("click", () => friendBoxForm());
+  return h(
+    "section",
+    { class: "card stack" },
+    h("h2", {}, "Friend boxes"),
+    h("p", { class: "small" }, "A box anyone with its link can open: no account, no app, no size limit but your own room. For videos too big for Discord, or to get files back from a friend."),
+    mine.length
+      ? h(
+          "ul",
+          { class: "list" },
+          mine.map((b) => h("li", { class: "row spread" }, h("a", { href: `#/box/${encodeURIComponent(b.name)}` }, h("strong", {}, `🎁 ${b.name}`)), h("span", { class: "muted small" }, `${bytes(b.bytes)} · ${linkState(friends[b.id])}`))),
+        )
+      : null,
+    h("div", { class: "row" }, make),
+  );
+}
+
+function linkExpired(link) {
+  return Boolean(link?.expiresAt && link.expiresAt <= Date.now());
+}
+
+function linkState(link) {
+  if (!link) return "no link";
+  if (linkExpired(link)) return "its link expired";
+  return `${link.write ? "they can add too" : "they can open and download"} · ${link.expiresAt ? `until ${new Date(link.expiresAt).toLocaleDateString()}` : "until you stop it"}`;
+}
+
+/** What people with a friend link can do, and for how long. */
+function linkChoices(write = false) {
+  const canAdd = h("input", { type: "checkbox", checked: write });
+  const how = h("select", {}, LINK_DURATIONS.map(([value, label]) => h("option", { value, selected: value === "7d" }, label)));
+  return {
+    fields: [h("label", { class: "row small" }, canAdd, "They can add files too (and you get what they add)"), h("label", { class: "field" }, "The link works for", how)],
+    value: () => ({ write: canAdd.checked, expires: how.value || null }),
+  };
+}
+
+function friendBoxForm() {
+  const title = h("input", { placeholder: "e.g. Trip videos", maxlength: 200 });
+  const choices = linkChoices();
+  const status = h("div");
+  const form = h(
+    "form",
+    { class: "stack" },
+    h("h2", {}, "Make a friend box"),
+    h("label", { class: "field" }, "What's in it (they see this)", title),
+    choices.fields,
+    h("div", { class: "row" }, h("button", { type: "submit" }, "Make it"), h("button", { type: "button", class: "secondary", onclick: () => closeModal() }, "Cancel")),
+    status,
+  );
+  onSubmit(form, status, async () => {
+    const { box, link } = await account.makeFriendBox({ title: title.value, ...choices.value() });
+    showFriendLink(link, box.name);
+  });
+  openModal(null, form);
+  title.focus();
+}
+
+/** The link, just made: to copy, send or scan. */
+function showFriendLink(link, boxName) {
+  const go = h("a", { class: "button", href: `#/box/${encodeURIComponent(boxName)}` }, "Add files to it");
+  go.addEventListener("click", () => closeModal(false));
+  openModal(
+    render,
+    h("h2", {}, "The friend box's link"),
+    h("p", {}, "Send this to your friend. Anyone who has it can open the box", link.write ? " and add to it" : "", ", with no account. The key is in the link itself, so send it only to people you mean."),
+    h("code", { class: "secret" }, link.link),
+    sendButtons(link.link, "Files for you"),
+    qrCode(link.link, "QR code of the friend box's link"),
+    h("p", { class: "muted small" }, `Works ${link.expiresAt ? `until ${new Date(link.expiresAt).toLocaleString()}` : "until you stop it"}. You can stop it any time on the box's page.`),
+    h("div", { class: "row" }, go, h("button", { type: "button", class: "secondary", onclick: () => closeModal() }, "Done")),
+  );
+}
+
+/** On a friend box's page: its link, and the buttons to stop it or make a new one. */
+function friendLinkCard(info, link) {
+  const card = h("section", { class: "card stack" });
+  const status = h("div");
+  const newLink = (current) => {
+    const choices = linkChoices(current?.write ?? false);
+    const formStatus = h("div");
+    const form = h(
+      "form",
+      { class: "stack" },
+      h("h2", {}, current ? "A new link" : "Make a link"),
+      current && !linkExpired(current) ? h("p", { class: "small" }, "The link you have now stops working.") : null,
+      choices.fields,
+      h("div", { class: "row" }, h("button", { type: "submit" }, "Make the link"), h("button", { type: "button", class: "secondary", onclick: () => closeModal() }, "Cancel")),
+      formStatus,
+    );
+    onSubmit(form, formStatus, async () => {
+      const made = await account.newFriendLink(info.name, choices.value());
+      draw(made);
+      showFriendLink(made, info.name);
+    });
+    openModal(null, form);
+  };
+  const draw = (current) => {
+    const live = current && !linkExpired(current);
+    const stop = h("button", { type: "button", class: "secondary" }, "Stop the link");
+    stop.addEventListener("click", () =>
+      withBusy(stop, async () => {
+        if (!confirm("Stop this link? Nobody can open the box with it any more. What's in the box stays.")) return;
+        try {
+          await account.stopFriendLink(info.name);
+          draw(null);
+        } catch (err) {
+          status.replaceChildren(errorBox(err));
+        }
+      }),
+    );
+    const fresh = h("button", { type: "button", class: live ? "secondary" : "" }, live ? "New link…" : "Make a link…");
+    fresh.addEventListener("click", () => newLink(current));
+    fill(
+      card,
+      h("h2", {}, "Its link"),
+      live
+        ? [h("p", { class: "small" }, `Anyone with this link can open this box${current.write ? " and add to it" : ""}. ${current.expiresAt ? `It works until ${new Date(current.expiresAt).toLocaleString()}.` : "It works until you stop it."}`), h("code", { class: "secret" }, current.link), sendButtons(current.link, "Files for you")]
+        : h("p", { class: "small" }, current ? "Its link expired. Make a new one to let people in again." : "No link right now: nobody can open this box but you."),
+      h("div", { class: "row" }, live ? stop : null, fresh),
+      status,
+    );
+  };
+  draw(link);
+  return card;
+}
+
+/** The live connection while someone is looking at a friend box through its link. */
+let friendWatch = null;
+
+/** A friend box, opened with its link: no account, just this box. */
+async function renderFriendView(secret) {
+  nav.hidden = true;
+  friendWatch?.close();
+  friendWatch = null;
+  const box = openBox({ url: ORIGIN, tape: secret, onNotice: false });
+  let who;
+  let about;
+  try {
+    [who, about] = await Promise.all([box.whoami(), box.get(FRIEND_ABOUT)]);
+  } catch (err) {
+    const gone = err.code === "bad_tape";
+    return fill(
+      app,
+      h(
+        "section",
+        { class: "card stack login" },
+        h("h1", {}, gone ? "This link doesn't open anything any more" : "This link didn't open"),
+        gone ? h("p", {}, "Whoever sent it stopped it, or it expired. Ask them for a new one.") : errorBox(err),
+      ),
+    );
+  }
+  const canAdd = Boolean(who.tape?.write);
+  const expiresAt = who.tape?.expiresAt;
+  const list = h("ul", { class: "list things" });
+  const notice = h("div", { class: "stack" });
+  const picker = h("input", { type: "file", multiple: true, hidden: true });
+
+  async function load() {
+    const { things } = await listThings(box);
+    fill(
+      list,
+      things.length
+        ? things.map((t) =>
+            h(
+              "li",
+              { class: "thing" },
+              h(
+                "button",
+                { type: "button", class: "thing-open", onclick: () => friendThing(box, t) },
+                h("span", { class: "thing-icon", "aria-hidden": "true" }, iconOf(t)),
+                h("span", { class: "thing-text" }, h("strong", {}, t.value.title), h("span", { class: "muted small" }, subtitle(t) || " ")),
+                h("span", { class: "muted small thing-when" }, ago(t.updatedAt)),
+              ),
+            ),
+          )
+        : h("li", { class: "muted" }, canAdd ? "Empty so far. Add files below." : "Nothing in here yet. Look again later: it shows up here as soon as it's added."),
+    );
+  }
+
+  async function upload(chosen) {
+    const stop = new AbortController();
+    const stopButton = h("button", { type: "button", class: "secondary tiny", onclick: () => stop.abort() }, "Stop");
+    const warn = (e) => e.preventDefault();
+    addEventListener("beforeunload", warn);
+    const awake = await navigator.wakeLock?.request("screen").catch(() => null);
+    try {
+      for (const file of chosen) {
+        const progress = h("span", {}, `Sealing ${file.name}…`);
+        fill(notice, h("div", { class: "insight tip row spread" }, progress, stopButton));
+        try {
+          await addFile(box, file, {
+            sentFrom: "a friend",
+            signal: stop.signal,
+            onProgress: (f, done) => (progress.textContent = `Sealing ${file.name}… ${Math.round(f * 100)}% (${bytes(done)} of ${bytes(file.size)})`),
+          });
+          fill(notice, h("div", { class: "insight tip" }, `Added ${file.name}. It was sealed here before it left this device.`));
+        } catch (err) {
+          fill(notice, err.name === "AbortError" ? h("div", { class: "insight tip" }, `Stopped. Nothing of ${file.name} was kept.`) : errorBox(err));
+          break;
+        }
+      }
+    } finally {
+      removeEventListener("beforeunload", warn);
+      awake?.release().catch(() => {});
+      await load();
+    }
+  }
+  picker.addEventListener("change", () => {
+    const chosen = [...picker.files];
+    picker.value = "";
+    upload(chosen);
+  });
+
+  const page = h(
+    "div",
+    { class: "friend-view" },
+    h(
+      "div",
+      { class: "page-head" },
+      h(
+        "div",
+        { class: "stack" },
+        h("h1", {}, `🎁 ${about?.title || "A friend box"}`),
+        h("div", { class: "muted" }, about?.from ? `From ${about.from}. ` : "Someone sent you this. ", "Sealed end to end: only people with this link can see inside, not even the server it's kept on."),
+        expiresAt ? h("div", { class: "muted small" }, `The link works until ${new Date(expiresAt).toLocaleString()}.`) : null,
+      ),
+    ),
+    h(
+      "section",
+      { class: "card stack" },
+      list,
+      notice,
+      canAdd ? h("div", { class: "row" }, h("button", { type: "button", onclick: () => picker.click() }, "+ Add files"), picker, h("span", { class: "muted small drop-hint" }, "or drop them here")) : null,
+    ),
+    h("p", { class: "muted small" }, "This is Cardboard: a private, end-to-end encrypted place for your things. Want your own? Ask whoever sent you this for an invite."),
+  );
+  if (canAdd) {
+    page.addEventListener("dragover", (e) => [...(e.dataTransfer?.types ?? [])].includes("Files") && e.preventDefault());
+    page.addEventListener("drop", (e) => {
+      if (!e.dataTransfer?.files.length) return;
+      e.preventDefault();
+      upload([...e.dataTransfer.files]);
+    });
+  }
+  fill(app, page);
+  await load();
+  // Live: something added (by the sender, or another friend) shows up straight away.
+  let timer = null;
+  friendWatch = box.watch(
+    (change) => {
+      if (!/^(notes|links|files)\//.test(change.key)) return;
+      clearTimeout(timer);
+      timer = setTimeout(() => load().catch(() => {}), 300);
+    },
+    { onError: () => {} },
+  );
+}
+
+/** One thing in a friend box, opened: play, look at or download a file; read a note; open a link. */
+function friendThing(box, t) {
+  const v = t.value;
+  const status = h("div");
+  const body = [];
+  if (t.kind === "file") {
+    const preview = h("div", { class: "file-preview" });
+    const progress = h("span", { class: "muted small" });
+    let loaded = null;
+    const fetchBytes = async () => (loaded ??= await readFile(box, t, (f) => (progress.textContent = f < 1 ? `Opening… ${Math.round(f * 100)}%` : "")));
+    const entry = { info: { name: v.name || "file", type: v.type, size: v.size }, range: (start, end) => readRange(box, t, start, end), chunks: () => fileChunks(box, t) };
+    const save = h("button", { type: "button" }, "Download");
+    save.addEventListener("click", () =>
+      withBusy(save, async () => {
+        try {
+          const said = await streamDownload(entry, (words) => (progress.textContent = words));
+          if (said) {
+            progress.textContent = said;
+            return;
+          }
+          if (v.size > IN_MEMORY_MAX) throw new Error(`${bytes(v.size)} is too big for this browser to hold at once. Open the link on a computer (Chrome, Edge or Firefox) to download it, or play it here.`);
+          blobDownload([await fetchBytes()], v.name || "file");
+        } catch (err) {
+          status.replaceChildren(errorBox(err));
+        }
+      }),
+    );
+    body.push(h("div", { class: "muted small" }, `${v.name} · ${bytes(v.size)}`), preview, h("div", { class: "row" }, save, progress), v.notes ? h("p", { class: "small" }, v.notes) : null);
+    if (/^image\/(png|jpe?g|gif|webp|avif|bmp)$/.test(v.type) && v.size <= 25 * 1024 * 1024) {
+      fetchBytes()
+        .then((data) => {
+          const url = URL.createObjectURL(new Blob([data], { type: v.type }));
+          const img = h("img", { src: url, alt: v.title });
+          img.addEventListener("load", () => setTimeout(() => URL.revokeObjectURL(url), 1000));
+          fill(preview, img);
+        })
+        .catch((err) => fill(preview, errorBox(err)));
+    } else if (/^(video|audio)\//.test(v.type)) {
+      play(preview, entry, fetchBytes);
+    }
+  } else if (t.kind === "note") {
+    body.push(h("div", { class: "note-text" }, v.text || ""), h("div", { class: "row" }, copyButton(v.text || "", "Copy")));
+  } else if (t.kind === "link") {
+    const url = safeUrl(v.url);
+    body.push(url ? h("div", { class: "row" }, h("a", { class: "button secondary tiny", href: url, target: "_blank", rel: "noopener noreferrer" }, "Open"), copyButton(url, "Copy address")) : null, v.notes ? h("p", { class: "small" }, v.notes) : null);
+  }
+  openModal(
+    () => forgetMedia("play"),
+    h("h2", {}, h("span", { "aria-hidden": "true" }, `${iconOf(t)} `), v.title),
+    body,
+    status,
+    h("div", { class: "row" }, h("button", { type: "button", class: "secondary", onclick: () => closeModal() }, "Close")),
+  );
+}
+
 function peopleChip(b) {
   if (b.shared) return h("div", { class: "row" }, h("span", { class: "chip" }, `Shared by ${b.shared.from}${b.shared.write ? "" : " · read only"}`));
   if (b.people.members.length) return h("div", { class: "row" }, h("span", { class: "chip" }, `Shared with ${b.people.members.map((m) => m.name).join(", ")}`));
@@ -1469,6 +1802,8 @@ async function renderBox(name, openKey) {
   const box = await account.box(name);
   const me = await account.me();
   if (box.id === me.profile.personal && !box.shared) return renderPersonal(box, me, openKey);
+  const friends = me.profile.friends ?? {};
+  if (box.id in friends && !box.shared) return renderPersonal(box, me, openKey, { link: friends[box.id] });
   const [inventory, log] = await Promise.all([account.inventory(box), account.log({ box: name, limit: 30 })]);
   const head = h(
     "div",
@@ -1567,14 +1902,16 @@ const ICON = { note: "📝", password: "🔑", link: "🔗", file: "📎" };
 const iconOf = (t) => (t.kind !== "file" ? ICON[t.kind] : /^video\//.test(t.value.type) ? "🎬" : /^audio\//.test(t.value.type) ? "🎵" : /^image\//.test(t.value.type) ? "🖼️" : ICON.file);
 const NEW_LABEL = { note: "Note", password: "Password", link: "Link", file: "File" };
 
-async function renderPersonal(info, me, openKey) {
+/** Your personal box; and, with `friend`, a friend box (the same, with its link, and no passwords). */
+async function renderPersonal(info, me, openKey, friend = null) {
   // Personal boxes made before 0.6 had the 512 MB every box got: only the account's limit applies now.
-  if (info.settings.quotaBytes === OLD_BOX_QUOTA) info = await account.setBoxSettings(info.name, PERSONAL_SETTINGS);
+  if (!friend && info.settings.quotaBytes === OLD_BOX_QUOTA) info = await account.setBoxSettings(info.name, PERSONAL_SETTINGS);
   const box = await account.open(info);
+  const about = friend ? await box.get(FRIEND_ABOUT).catch(() => null) : null;
   let things = [];
   let other = 0;
   let show = "all";
-  const find = h("input", { type: "search", placeholder: "Find in your personal box…", "aria-label": "Find in your personal box" });
+  const find = h("input", { type: "search", placeholder: friend ? "Find in this box…" : "Find in your personal box…", "aria-label": friend ? "Find in this box" : "Find in your personal box" });
   const tabs = h("div", { class: "row tabs" });
   const list = h("ul", { class: "list things" });
   const notice = h("div", { class: "stack" });
@@ -1613,7 +1950,7 @@ async function renderPersonal(info, me, openKey) {
       list,
       shown.length
         ? shown.map(thingRow)
-        : h("li", { class: "muted" }, things.length ? "Nothing matches." : "Empty so far. Add a note, a password, a link or a file: it's sealed on this device before it leaves."),
+        : h("li", { class: "muted" }, things.length ? "Nothing matches." : friend ? "Empty so far. Add the files you want to give: they're sealed on this device before they leave." : "Empty so far. Add a note, a password, a link or a file: it's sealed on this device before it leaves."),
     );
   }
 
@@ -1626,7 +1963,7 @@ async function renderPersonal(info, me, openKey) {
         "button",
         { type: "button", class: "thing-open", onclick: () => editThing(t.kind, t) },
         h("span", { class: "thing-icon", "aria-hidden": "true" }, iconOf(t)),
-        h("span", { class: "thing-text" }, h("strong", {}, t.value.title), h("span", { class: "muted small" }, t.value.inbox ? `just arrived from ${t.value.from || "another device"}` : subtitle(t) || " ")),
+        h("span", { class: "thing-text" }, h("strong", {}, t.value.title), h("span", { class: "muted small" }, t.value.inbox ? `${friend ? "added" : "just arrived"} from ${t.value.from || "another device"}` : subtitle(t) || " ")),
         h("span", { class: "muted small thing-when" }, ago(t.updatedAt)),
       ),
       h(
@@ -1905,8 +2242,9 @@ async function renderPersonal(info, me, openKey) {
   const add = h(
     "div",
     { class: "row" },
-    ["note", "password", "link"].map((k) => h("button", { type: "button", onclick: () => editThing(k) }, `+ ${NEW_LABEL[k]}`)),
-    h("button", { type: "button", onclick: () => files.click() }, "+ File"),
+    // No passwords in a friend box: everyone with the link would see them.
+    (friend ? ["note", "link"] : ["note", "password", "link"]).map((k) => h("button", { type: "button", onclick: () => editThing(k) }, `+ ${NEW_LABEL[k]}`)),
+    h("button", { type: "button", onclick: () => files.click() }, friend ? "+ Files" : "+ File"),
     files,
   );
   files.addEventListener("change", () => {
@@ -1927,13 +2265,13 @@ async function renderPersonal(info, me, openKey) {
         "div",
         { class: "stack" },
         h("a", { href: "#/", class: "small" }, "← Shelf"),
-        h("h1", {}, "Your personal box"),
-        h("div", { class: "muted" }, "Just for you. Everything is sealed on this device before it leaves, and opens on every device you've signed in on."),
+        h("h1", {}, friend ? `🎁 ${about?.title || info.name}` : "Your personal box"),
+        h("div", { class: "muted" }, friend ? "A friend box: anyone with its link can open it, with no account. Sealed like everything else: the server can't see inside." : "Just for you. Everything is sealed on this device before it leaves, and opens on every device you've signed in on."),
         usage,
         peopleChip(info),
       ),
     ),
-    me.device.lock ? null : h("p", { class: "insight tip small" }, "Tip: ", h("a", { href: "#/you" }, "lock this browser with Face ID"), " so nobody who picks up this device can open your personal box."),
+    friend ? friendLinkCard(info, friend.link) : me.device.lock ? null : h("p", { class: "insight tip small" }, "Tip: ", h("a", { href: "#/you" }, "lock this browser with Face ID"), " so nobody who picks up this device can open your personal box."),
     h("section", { class: "card stack" }, add, find, tabs, notice, list, h("p", { class: "muted small drop-hint" }, "You can also drop files here.")),
     h(
       "details",
@@ -1956,6 +2294,16 @@ async function renderPersonal(info, me, openKey) {
     if (document.visibilityState === "visible" && modal.hidden) load().catch(() => {});
   };
   document.addEventListener("visibilitychange", refresh);
+  // Live: what another device (or, in a friend box, a friend) adds shows up straight away.
+  let changed = null;
+  shelfWatch = box.watch(
+    (change) => {
+      if (!/^(notes|passwords|links|files)\//.test(change.key)) return;
+      clearTimeout(changed);
+      changed = setTimeout(() => modal.hidden && load().catch(() => {}), 300);
+    },
+    { onError: () => {} },
+  );
 
   fill(app, page);
   await load();
@@ -3366,6 +3714,26 @@ function takeShareFromUrl() {
 }
 
 /** Emergency access (#emergency=<code>) and pairing (#pair=<code>) links, the same way. */
+function takeFriendFromUrl() {
+  const secret = hashParam("friend");
+  if (secret) {
+    pendingFriend = secret;
+    try {
+      sessionStorage.setItem("cardboard-friend", secret);
+    } catch {
+      // A private window may not keep it: then a reload needs the link again.
+    }
+    // Out of the address bar (and history), like invite and pairing codes.
+    history.replaceState(null, "", "#/friend");
+  } else if (location.hash.startsWith("#/friend")) {
+    try {
+      pendingFriend ??= sessionStorage.getItem("cardboard-friend");
+    } catch {
+      pendingFriend = null;
+    }
+  } else pendingFriend = null;
+}
+
 function takeEmergencyAndPairFromUrl() {
   const emergency = hashParam("emergency");
   if (emergency) {
@@ -3384,8 +3752,11 @@ async function render() {
   takeConnectFromUrl();
   takeShareFromUrl();
   takeEmergencyAndPairFromUrl();
+  takeFriendFromUrl();
   // Someone else's emergency link: it's about their Cardboard, whoever is signed in here.
   if (pendingEmergency) return renderEmergency(pendingEmergency);
+  // A friend box's link: just that box, for anyone holding it, signed in here or not.
+  if (pendingFriend) return renderFriendView(pendingFriend);
   if (!account) {
     if (await deviceLock(browserStore)) return renderLocked();
     try {

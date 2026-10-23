@@ -106,6 +106,15 @@ The oldest annoyance on the internet: getting something from your phone to your 
 - **Sealed on the device it was sent from**, like everything else. Your other devices are told *that* something arrived, then fetch and open it themselves; the server only passes sealed bytes along.
 - Files of any size, sent a piece at a time. Paste a screenshot straight into the box.
 
+## Friend boxes
+
+For the video Discord won't take, or the folder you'd otherwise put in a shared Dropbox: on your shelf, **Make a friend box**. You get a link; anyone who has it opens the box in their browser, with **no account and no app**: they play videos right there, download, and (if you tick it) add files back to you.
+
+- **The key is in the link**, after the `#`, which browsers never send to the server. Whoever runs the server still can't see inside.
+- **The link opens that box only.** It carries a key for that one box, never one of your account's.
+- **Links expire** (1 day, 7 days, 30 days, or when you stop them), and *Stop the link* shuts it straight away. What's in the box stays yours.
+- What friends add shows up for you live, marked *from a friend*, and can be undone like everything else.
+
 ## Your personal box
 
 Not everything belongs to an app. On your shelf, *Make my personal box* gives you one box that's just for you: **notes, passwords, links and files** (photos, videos, music, PDFs, anything up to 20 GB each), added and edited right in the dashboard, on your phone or your laptop. Every device you've signed in on opens it.

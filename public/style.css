@@ -886,3 +886,10 @@ svg.qr,
   gap: 4px 12px;
   flex-wrap: wrap;
 }
+
+/* ── Friend boxes ─────────────────────────────────────── */
+
+.note-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}

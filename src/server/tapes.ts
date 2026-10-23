@@ -12,7 +12,8 @@ import type { DB } from "./db.ts";
  * By default a tape stops working after 90 days *without use*: apps you use
  * keep working, dead apps clean themselves up.
  */
-export type TapeKind = "app" | "assistant" | "grant";
+/** "link": a friend box's link, which anyone holding it can use. */
+export type TapeKind = "app" | "assistant" | "grant" | "link";
 
 export interface Tape {
   id: string;

@@ -340,6 +340,24 @@ export async function runShake(api: Api): Promise<ShakeReport> {
         : failed(`A swapped key wasn't caught (${outcome}).`);
     });
 
+    await check("friend-link", "A friend box's link opens that box and nothing else", async () => {
+      const { box, link } = await me.makeFriendBox({ title: "shake" });
+      const secret = link.link.split("#friend=")[1]!;
+      const friend = new Box({ url, tape: secret, fetch: inProcess, onNotice: false });
+      const opens = (await friend.get<{ title: string }>("friend/about"))?.title === "shake";
+      const elsewhere = (await friend.get("secret").catch(() => null)) === null;
+      const { names } = await friend.ready();
+      const ownNames = !Buffer.from(names.root).equals(Buffer.from((me as unknown as { keys: { names: { root: Uint8Array } } }).keys.names.root));
+      const readOnly = await rejects(() => friend.put("files/x", { title: "x" }), "read_only");
+      await me.stopFriendLink(box.name);
+      const stopped = await rejects(() => new Box({ url, tape: secret, fetch: inProcess, onNotice: false }).get("friend/about"), "bad_tape");
+      await me.shredBox(box.name).catch(() => undefined);
+      api.limiter.reset(PROBE_IP);
+      return opens && elsewhere && ownNames && readOnly && stopped
+        ? pass("The link opened its box (read-only, as made), carried no key of your account's, and stopped working when stopped.")
+        : failed(`A friend link went wrong (opens ${opens}, own names key ${ownNames}, read-only ${readOnly}, stopped ${stopped}).`);
+    });
+
     await check("device-removed", "Removed devices are locked out", async () => {
       const second = await recoverWithKit({ url, code: kit, store: new MemoryStore(), kind: "other", fetch: inProcess });
       const token = second.rpc.token!;

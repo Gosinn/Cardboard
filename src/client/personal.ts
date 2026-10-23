@@ -90,6 +90,8 @@ const PARTS_PER_REQUEST = 8;
 const MAX_TEXT = 200_000;
 /** Your personal box has no small limit of its own: only your account's limit applies. */
 export const PERSONAL_SETTINGS = { quotaBytes: 1024 ** 4 };
+/** In a friend box: its title and who it's from, for the people opening its link. */
+export const FRIEND_ABOUT = "friend/about";
 /** The limit every box got before 0.6, raised for a personal box made back then. */
 export const OLD_BOX_QUOTA = 512 * 1024 * 1024;
 

@@ -234,9 +234,16 @@ export class Api {
   /** Device, public and host calls only come from Cardboard's own dashboard (or no browser at all). */
   private sameOriginOnly(req: ApiRequest) {
     if (!req.origin) return;
+    if (!this.ownOrigin(req)) {
+      throw fail("not_dashboard", 403, "This part of Cardboard only answers its own dashboard and CLI.", "Apps use their tape, from an origin allowed in the box settings.");
+    }
+  }
+
+  /** Whether a browser request comes from Cardboard's own pages. */
+  private ownOrigin(req: ApiRequest): boolean {
     let originHost: string | null = null;
     try {
-      originHost = new URL(req.origin).host;
+      originHost = new URL(req.origin ?? "").host;
     } catch {
       originHost = null;
     }
@@ -247,9 +254,7 @@ export class Api {
     } catch {
       publicHost = null;
     }
-    if (!originHost || (originHost !== req.host && originHost !== publicHost)) {
-      throw fail("not_dashboard", 403, "This part of Cardboard only answers its own dashboard and CLI.", "Apps use their tape, from an origin allowed in the box settings.");
-    }
+    return Boolean(originHost && (originHost === req.host || originHost === publicHost));
   }
 
   authenticateApp(req: ApiRequest): AppAuth {
@@ -285,7 +290,9 @@ export class Api {
       // A website that signed you in (Sign in with Cardboard) may use its box from its own pages.
       const grant = tape.grantId ? this.ctx.oauth.grant(tape.grantId) : undefined;
       const fromApp = grant ? this.ctx.oauth.clientOrigins(grant.clientId).includes(req.origin) : false;
-      if (!fromApp && !box.settings.origins.includes(req.origin)) {
+      // A friend box's link is opened on Cardboard's own pages.
+      const fromCardboard = tape.kind === "link" && this.ownOrigin(req);
+      if (!fromApp && !fromCardboard && !box.settings.origins.includes(req.origin)) {
         this.log(req, { accountId: box.accountId, boxId: box.id, actor, action: "auth", outcome: "denied", note: `${req.origin} isn't an allowed origin` });
         throw fail(
           "origin_not_allowed",
@@ -1042,7 +1049,7 @@ export class Api {
         const reach = sharing.reach(a.account.id, requireString(body, "box", 64));
         const box = reach.box;
         const kind = optString(body, "kind") ?? "app";
-        if (kind !== "app" && kind !== "assistant") throw fail("bad_request", 400, '`kind` is "app" or "assistant".');
+        if (kind !== "app" && kind !== "assistant" && kind !== "link") throw fail("bad_request", 400, '`kind` is "app", "assistant" or "link".');
         const idle = optDuration(body, "idle");
         const expires = optDuration(body, "expires");
         const label = requireBlob(body, "label", MAX_LABEL);

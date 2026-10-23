@@ -34,7 +34,7 @@ import {
 } from "./crypto.ts";
 import type { DeviceLock, DeviceRecord, DeviceStore } from "./device.ts";
 import { accountKeys, boxIndex, boxKeys, bundle, dockIndex, dockKeys, newClientId, newKey, type AccountKeys, type BoxKeys } from "./keys.ts";
-import { isFileData, kindOfKey, PERSONAL_SETTINGS, searchText } from "./personal.ts";
+import { FRIEND_ABOUT, isFileData, kindOfKey, PERSONAL_SETTINGS, searchText } from "./personal.ts";
 import { Rpc } from "./rpc.ts";
 
 /**
@@ -58,13 +58,32 @@ export interface GetInOptions {
   fetch?: typeof fetch;
 }
 
+/** A friend box's link, kept sealed in your profile so any of your devices can show it again. */
+export interface FriendLink {
+  /** The link itself. The key to the box is after the #, which browsers never send to the server. */
+  link: string;
+  /** The tape behind it (to stop it). */
+  tape: string;
+  /** Whether people with the link can add things too, not only open and download them. */
+  write: boolean;
+  expiresAt: number | null;
+}
+
+export interface FriendLinkOptions {
+  /** What the people opening it see as its name. */
+  title?: string;
+  write?: boolean;
+  /** "1d", "7d", "30d"…, or null to work until you stop it. */
+  expires?: string | null;
+}
+
 export interface Me {
   id: string;
   createdAt: number;
   recovery: RecoveryPlan;
   recoveryReady: boolean;
-  /** Sealed: only your devices read it. `personal` is the id of your personal box. */
-  profile: { name?: string; email?: string; personal?: string };
+  /** Sealed: only your devices read it. `personal` is the id of your personal box; `friends`, your friend boxes and their links. */
+  profile: { name?: string; email?: string; personal?: string; friends?: Record<string, FriendLink | null> };
   quota: { used: number; limit: number };
   device: { id: string; kind: DeviceKind; lock: "passkey" | null };
   devices: Array<{ id: string; kind: DeviceKind; lock: "passkey" | null; name: string; createdAt: number; lastSeenAt: number | null; current: boolean }>;
@@ -105,7 +124,7 @@ export interface TapeInfo {
   id: string;
   box: string;
   label: string;
-  kind: "app" | "assistant" | "grant";
+  kind: "app" | "assistant" | "grant" | "link";
   read: boolean;
   write: boolean;
   idleMs: number | null;
@@ -777,6 +796,65 @@ export class Account {
     const box = await this.createBox(await this.freeName("personal"), PERSONAL_SETTINGS);
     await this.writeProfile({ ...me.profile, personal: box.id });
     return box;
+  }
+
+  // ── Friend boxes ───────────────────────────────────────────────────────────
+
+  /** Your friend boxes: box id → its link (null once you stopped it). */
+  async friendBoxes(me?: Me): Promise<Record<string, FriendLink | null>> {
+    return (me ?? (await this.me())).profile.friends ?? {};
+  }
+
+  /**
+   * A friend box: a box anyone with its link can open, play and download from
+   * (and add to, with `write`), with no account. The link holds the key to this
+   * box only, after the #, so the server never sees it.
+   */
+  async makeFriendBox(options: FriendLinkOptions & { name?: string } = {}): Promise<{ box: BoxInfo; link: FriendLink }> {
+    const box = await this.createBox(await this.freeName(options.name ?? "friend-box"), PERSONAL_SETTINGS);
+    return { box, link: await this.newFriendLink(box.name, options) };
+  }
+
+  /** A new link for a friend box. The old one stops working. */
+  async newFriendLink(boxName: string, options: FriendLinkOptions = {}): Promise<FriendLink> {
+    const me = await this.me();
+    const box = await this.box(boxName);
+    if (box.shared) throw fail("not_your_box", 403, "Only the owner of a box can make a friend link for it.", "Make a friend box of your own.");
+    const old = me.profile.friends?.[box.id];
+    if (old) await this.revokeTape(old.tape).catch(() => undefined);
+    const about = (await (await this.open(box)).get<{ title?: string }>(FRIEND_ABOUT).catch(() => null)) ?? {};
+    const title = (options.title ?? about.title ?? "").trim().slice(0, 200) || "Friend box";
+    await (await this.open(box)).put(FRIEND_ABOUT, { title, from: (me.profile.name ?? "").slice(0, 100) });
+    const token = random(32);
+    const tapeKey = random(32);
+    // The box's key, and a names key made just for this link: never your account's own.
+    const sealedBundle = await sealJson(tapeKey, bundle(box.id, box.keys.root, random(32)), ctx.tapeBundle(box.id));
+    const res = await this.rpc.call<{ tape: WireTape }>("tape.create", {
+      box: box.id,
+      tokenHash: toB64u(await sha256(`cbt_${toB64u(token)}`)),
+      bundle: toB64u(sealedBundle),
+      label: await this.sealMeta("friend link", ctx.tapeLabel(box.id)),
+      kind: "link",
+      read: true,
+      write: options.write ?? false,
+      idle: null,
+      expires: options.expires ?? null,
+    });
+    // Cardboard's public address, even when this device reaches it another way (like localhost on the computer it runs on).
+    const base = (me.server.issuer || this.rpc.url).replace(/\/+$/, "");
+    const link: FriendLink = { link: `${base}/#friend=cbt_${toB64u(concat(token, tapeKey))}`, tape: res.tape.id, write: res.tape.write, expiresAt: res.tape.expiresAt };
+    await this.writeProfile({ ...me.profile, friends: { ...me.profile.friends, [box.id]: link } });
+    this.boxCache = null;
+    return link;
+  }
+
+  /** Stops a friend box's link: nobody can open the box with it any more. The box stays, with everything in it. */
+  async stopFriendLink(boxName: string): Promise<void> {
+    const me = await this.me();
+    const box = await this.box(boxName);
+    const old = me.profile.friends?.[box.id];
+    if (old) await this.revokeTape(old.tape);
+    await this.writeProfile({ ...me.profile, friends: { ...me.profile.friends, [box.id]: null } });
   }
 
   /**
