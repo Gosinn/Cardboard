@@ -83,6 +83,7 @@ const STATIC: Record<string, string> = {
   "/icon-512.png": "image/png",
   "/apple-touch-icon.png": "image/png",
   "/media-sw.js": "text/javascript; charset=utf-8",
+  "/convert.js": "text/javascript; charset=utf-8",
   // The Android app (android/build.sh puts it here), offered on the dashboard to Android phones.
   "/cardboard.apk": "application/vnd.android.package-archive",
 };

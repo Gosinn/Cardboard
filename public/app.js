@@ -1376,6 +1376,203 @@ async function renderSend() {
   }
 }
 
+// ── Convert ─────────────────────────────────────────────────────────────────
+
+/** Files handed to the converter from elsewhere (a file in your personal box). */
+let convertQueue = [];
+
+/** Saves something made on this device as a download (through the app, in the Android app). */
+async function saveBlob(blob, name) {
+  if (IN_ANDROID_APP) {
+    const chunks = async function* () {
+      for (let at = 0; at < blob.size; at += 4 * 1024 * 1024) yield new Uint8Array(await blob.slice(at, at + 4 * 1024 * 1024).arrayBuffer());
+    };
+    return androidSave({ name, type: blob.type, size: blob.size }, chunks());
+  }
+  blobDownload([blob], name);
+  return "Downloaded.";
+}
+
+/** #/convert: turn files into other kinds of files, on this device. */
+async function renderConvert() {
+  const conv = await import("/convert.js");
+  let files = convertQueue;
+  convertQueue = [];
+  let target = null;
+  const picker = h("input", { type: "file", multiple: true, hidden: true });
+  const chosen = h("div", { class: "stack" });
+  const targets = h("div", { class: "row convert-targets" });
+  const optionsBox = h("div", { class: "stack" });
+  const go = h("button", { type: "button", disabled: true }, "Convert");
+  const status = h("div", { class: "stack" });
+  const results = h("ul", { class: "list" });
+  const options = {};
+
+  const field = (label, input) => h("label", { class: "field" }, label, input);
+  const select = (key, choices, initial) => {
+    const el = h("select", {}, choices.map(([value, label]) => h("option", { value: String(value), selected: value === initial }, label)));
+    options[key] = initial;
+    el.addEventListener("change", () => (options[key] = el.value === "" ? undefined : Number(el.value)));
+    return el;
+  };
+  const number = (key, initial, attrs) => {
+    const el = h("input", { type: "number", value: initial, inputmode: "decimal", ...attrs });
+    options[key] = initial;
+    el.addEventListener("input", () => (options[key] = Number(el.value)));
+    return el;
+  };
+
+  function drawOptions() {
+    for (const key of Object.keys(options)) delete options[key];
+    const picture = ["jpeg", "png", "webp", "pdf-images"].includes(target);
+    fill(
+      optionsBox,
+      picture ? field("Size", select("maxSide", [["", "As it is"], [4096, "At most 4096 px"], [2048, "At most 2048 px"], [1080, "At most 1080 px"], [640, "At most 640 px"]], target === "pdf-images" ? 2400 : "")) : null,
+      ["jpeg", "webp", "pdf-images"].includes(target) ? field("Quality", select("quality", [[0.92, "High"], [0.8, "Medium"], [0.6, "Small file"]], 0.92)) : null,
+      target === "gif-images" ? [field("Each picture shows for (seconds)", number("frameSeconds", 0.7, { min: 0.1, max: 10, step: 0.1 })), field("Width", select("width", [[320, "320 px"], [480, "480 px"], [640, "640 px"]], 480))] : null,
+      target === "gif-video"
+        ? [field("Start at (seconds)", number("start", 0, { min: 0, step: 0.5 })), field("How long (seconds, up to 20)", number("seconds", 5, { min: 0.5, max: 20, step: 0.5 })), field("Width", select("width", [[320, "320 px"], [480, "480 px"], [640, "640 px"]], 480))]
+        : null,
+      target === "frame" ? field("At (seconds)", number("at", 1, { min: 0, step: 0.5 })) : null,
+      target === "opus" ? field("Quality", select("bitrate", [[64000, "Speech (64 kbps)"], [96000, "Music (96 kbps)"], [160000, "Best (160 kbps)"]], 96000)) : null,
+    );
+  }
+
+  function draw() {
+    const blocked = files.map((f) => [f, conv.cantConvert(f)]).filter(([, why]) => why);
+    const usable = files.filter((f) => !conv.cantConvert(f));
+    fill(
+      chosen,
+      files.length
+        ? h(
+            "ul",
+            { class: "list" },
+            files.map((f, i) =>
+              h(
+                "li",
+                { class: "row spread" },
+                h("span", {}, h("strong", {}, f.name), h("span", { class: "muted small" }, ` · ${bytes(f.size)}`)),
+                h("button", { type: "button", class: "link tiny", "aria-label": `Remove ${f.name}`, onclick: () => ((files = files.filter((_, j) => j !== i)), (target = null), draw()) }, "✕"),
+              ),
+            ),
+          )
+        : h("p", { class: "muted" }, "Choose or drop files to start: pictures, videos, sound, spreadsheets, documents, zips."),
+      blocked.map(([f, why]) => h("p", { class: "insight tip small" }, `${f.name}: ${why}`)),
+    );
+    const list = conv.targetsFor(usable);
+    if (!list.some((t) => t.id === target)) target = null;
+    fill(
+      targets,
+      list.length ? h("div", { class: "muted small" }, "Turn into:") : null,
+      list.map((t) => h("button", { type: "button", class: `secondary tiny ${t.id === target ? "active" : ""}`, onclick: () => ((target = t.id), draw(), drawOptions()) }, t.label)),
+    );
+    go.disabled = !target;
+    if (!target) fill(optionsBox);
+  }
+
+  picker.addEventListener("change", () => {
+    files = [...files, ...picker.files];
+    picker.value = "";
+    draw();
+  });
+
+  go.addEventListener("click", () =>
+    withBusy(go, async () => {
+      const usable = files.filter((f) => !conv.cantConvert(f));
+      const progress = h("span", { class: "muted small" }, "Starting…");
+      fill(status, progress);
+      try {
+        const made = await conv.convert(target, usable, { ...options, onProgress: (f, words) => (progress.textContent = words ? `${words} ${Math.round(f * 100)}%` : "") });
+        fill(status, h("span", { class: "chip ok" }, `Done: ${plural(made.length, "file")}, made on this device.`));
+        fill(results, made.map(resultRow));
+      } catch (err) {
+        fill(status, errorBox(err));
+      }
+    }),
+  );
+
+  function resultRow(r) {
+    const note = h("span", { class: "muted small" });
+    const download = h("button", { type: "button" }, "Download");
+    download.addEventListener("click", () =>
+      withBusy(download, async () => {
+        try {
+          note.textContent = await saveBlob(r.blob, r.name);
+        } catch (err) {
+          note.replaceChildren(errorBox(err));
+        }
+      }),
+    );
+    const keep = h("button", { type: "button", class: "secondary" }, "Keep in my personal box");
+    keep.addEventListener("click", () =>
+      withBusy(keep, async () => {
+        try {
+          const box = await account.open(await account.makePersonalBox());
+          await addFile(box, r.blob, { name: r.name, type: r.type });
+          note.textContent = "Kept, sealed, in your personal box.";
+        } catch (err) {
+          note.replaceChildren(errorBox(err));
+        }
+      }),
+    );
+    const send = h("button", { type: "button", class: "secondary" }, "Send to my devices");
+    send.addEventListener("click", () =>
+      withBusy(send, async () => {
+        try {
+          const me = await account.me();
+          const box = await account.open(await account.makePersonalBox());
+          await sendFile(box, r.blob, thisDeviceName(me), { name: r.name });
+          note.textContent = "Sent. It's on your other devices now.";
+        } catch (err) {
+          note.replaceChildren(errorBox(err));
+        }
+      }),
+    );
+    return h("li", { class: "stack" }, h("div", {}, h("strong", {}, r.name), h("span", { class: "muted small" }, ` · ${bytes(r.blob.size)}`)), h("div", { class: "row" }, download, keep, send, note));
+  }
+
+  const card = h(
+    "section",
+    { class: "card stack" },
+    h("div", { class: "row" }, h("button", { type: "button", onclick: () => picker.click() }, "Choose files"), picker, h("span", { class: "muted small drop-hint" }, "or drop them here")),
+    chosen,
+    targets,
+    optionsBox,
+    h("div", { class: "row" }, go),
+    status,
+    results,
+  );
+  card.addEventListener("dragover", (e) => [...(e.dataTransfer?.types ?? [])].includes("Files") && e.preventDefault());
+  card.addEventListener("drop", (e) => {
+    if (!e.dataTransfer?.files.length) return;
+    e.preventDefault();
+    files = [...files, ...e.dataTransfer.files];
+    draw();
+  });
+  fill(
+    app,
+    h("div", { class: "page-head" }, h("div", {}, h("h1", {}, "Convert"), h("div", { class: "muted" }, "Turn files into other kinds of files: pictures, videos, sound, spreadsheets, documents, zips. It all happens on this device: nothing is uploaded to convert it."))),
+    card,
+    h(
+      "details",
+      { class: "card" },
+      h("summary", {}, "What it can do"),
+      h(
+        "ul",
+        { class: "small" },
+        h("li", {}, "Pictures (PNG, JPEG, WebP, GIF, BMP, AVIF, SVG, ICO) → JPEG, PNG, WebP, smaller sizes, a PDF, an animated GIF, an icon"),
+        h("li", {}, "Videos → an animated GIF of a clip, a still picture, just the sound (Opus or WAV)"),
+        h("li", {}, "Sound (MP3, WAV, OGG, M4A, FLAC…) → Opus (small) or WAV (plays anywhere)"),
+        h("li", {}, "Spreadsheets (Excel .xlsx, CSV, TSV, JSON) → each other, a web page or a Markdown table"),
+        h("li", {}, "Word (.docx), Markdown and text → PDF, a web page, plain text; JSON → YAML"),
+        h("li", {}, "Anything → a .zip, or Base64 text (and back); a .zip → the files inside; text → a QR code"),
+        h("li", { class: "muted" }, "Not yet: iPhone photos (HEIC), PDF to pictures or text, making videos smaller."),
+      ),
+    ),
+  );
+  draw();
+}
+
 /** Your personal box on the shelf, or the button that makes it. */
 function personalCard(box) {
   if (!box) {
@@ -2140,10 +2337,23 @@ async function renderPersonal(info, me, openKey, friend = null) {
           }
         }),
       );
+      const convertIt = h("button", { type: "button", class: "secondary" }, "Convert…");
+      convertIt.addEventListener("click", () =>
+        withBusy(convertIt, async () => {
+          try {
+            if (v.size > 400 * 1024 * 1024) throw new Error(`${bytes(v.size)} is too big to convert on this device (most is about 400 MB).`);
+            convertQueue = [new File([await fetchBytes()], v.name || "file", { type: v.type || "" })];
+            closeModal(false);
+            location.hash = "#/convert";
+          } catch (err) {
+            status.replaceChildren(errorBox(err));
+          }
+        }),
+      );
       body.push(
         h("div", { class: "muted small" }, `${v.name} · ${bytes(v.size)}${v.type ? ` · ${v.type}` : ""}`),
         preview,
-        h("div", { class: "row" }, save, send, progress),
+        h("div", { class: "row" }, save, send, convertIt, progress),
         h("label", { class: "field" }, "Notes", fields.notes),
       );
       if (/^image\/(png|jpe?g|gif|webp|avif|bmp)$/.test(v.type) && v.size <= 25 * 1024 * 1024) {
@@ -3792,6 +4002,7 @@ async function render() {
     else if (page === "security") await renderSecurity();
     else if (page === "you") await renderYou();
     else if (page === "send") await renderSend();
+    else if (page === "convert") await renderConvert();
     else await renderShelf();
   } catch (err) {
     if (err.code === "bad_device") {

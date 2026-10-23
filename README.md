@@ -115,6 +115,21 @@ For the video Discord won't take, or the folder you'd otherwise put in a shared 
 - **Links expire** (1 day, 7 days, 30 days, or when you stop them), and *Stop the link* shuts it straight away. What's in the box stays yours.
 - What friends add shows up for you live, marked *from a friend*, and can be undone like everything else.
 
+## Convert
+
+**Convert** (in the menu) turns files into other kinds of files, **on your device**: nothing is uploaded to convert it, so it's as private as everything else here. Choose or drop files, pick what they should become, then download the result, keep it in your personal box, or send it to your devices. Files already in your personal box have a *Convert…* button.
+
+| From | To |
+|---|---|
+| Pictures (PNG, JPEG, WebP, GIF, BMP, AVIF, SVG, ICO) | JPEG, PNG, WebP, smaller sizes, one PDF of many, an animated GIF, an icon |
+| Videos | an animated GIF of a clip, a still picture, just the sound (Opus or WAV) |
+| Sound (MP3, WAV, OGG, M4A, FLAC…) | Opus (small) or WAV (plays anywhere) |
+| Spreadsheets (Excel .xlsx, CSV, TSV, JSON) | each other, a web page, a Markdown table; JSON to YAML |
+| Word (.docx), Markdown, text | PDF, a web page, plain text; text to a QR code |
+| Anything | a .zip (and a .zip back into its files), Base64 text (and back) |
+
+Not yet: iPhone photos (HEIC), PDFs into pictures or text, making videos smaller. It says so rather than pretending.
+
 ## Your personal box
 
 Not everything belongs to an app. On your shelf, *Make my personal box* gives you one box that's just for you: **notes, passwords, links and files** (photos, videos, music, PDFs, anything up to 20 GB each), added and edited right in the dashboard, on your phone or your laptop. Every device you've signed in on opens it.
