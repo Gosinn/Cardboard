@@ -4,7 +4,7 @@ import { createServer as createHttpServer, type IncomingMessage, type Server, ty
 import { createServer as createHttpsServer } from "node:https";
 import { stripTypeScriptTypes } from "node:module";
 import type { AddressInfo } from "node:net";
-import { join, posix } from "node:path";
+import { delimiter, join, posix, resolve } from "node:path";
 import { parseDuration } from "../shared/duration.ts";
 import { CardboardError, fail } from "../shared/errors.ts";
 import { VERSION } from "../shared/version.ts";
@@ -45,8 +45,10 @@ export interface StartOptions {
   diskFree?: () => number | null;
   /** Run the shake test on startup (default true). */
   shake?: boolean;
-  /** Back up the database this often (ms) into <data>/backups, keeping the newest 10. Off unless set. */
+  /** Back up the database this often (ms) into <data>/backups, keeping the newest 10. Off unless set (a day once backupTo is set). */
   backupEveryMs?: number | null;
+  /** Folders each backup is also copied to: another drive, another computer. Also CARDBOARD_BACKUP_TO (separated by ; on Windows, : elsewhere). */
+  backupTo?: string[];
   sweepEveryMs?: number;
   now?: () => number;
 }
@@ -150,7 +152,11 @@ export async function startServer(options: StartOptions = {}): Promise<RunningCa
   const sharing = new Sharing(db, vault, now);
   const emergency = new Emergency(db, now);
   const backupEvery = options.backupEveryMs !== undefined ? options.backupEveryMs : process.env["CARDBOARD_BACKUP_EVERY"];
-  const backupEveryMs = typeof backupEvery === "string" ? (backupEvery === "never" ? null : parseDuration(backupEvery)) : (backupEvery ?? null);
+  const backupTo = (options.backupTo ?? (process.env["CARDBOARD_BACKUP_TO"] ?? "").split(delimiter)).map((p) => p.trim()).filter(Boolean).map((p) => resolve(p));
+  // A second place to keep copies means backups are wanted: daily, unless said otherwise.
+  const backupEveryMs = typeof backupEvery === "string" ? (backupEvery === "never" ? null : parseDuration(backupEvery)) : (backupEvery ?? (backupTo.length ? 24 * 60 * 60 * 1000 : null));
+  info.backupEveryMs = backupEveryMs;
+  info.backupTo = backupTo;
   const api = new Api({ db, accounts, vault, tapes, audit, hub, docks, oauth, sharing, emergency, info });
   const oauthHandler = createOAuthHandler({ oauth, api, ip: (req) => clientIp(req, info.trustProxy) });
   const statics = loadStatics();

@@ -1056,7 +1056,7 @@ async function renderShelf() {
       "div",
       { class: "page-head" },
       h("div", {}, h("h1", {}, me.profile.name ? `${me.profile.name}'s shelf` : "Your shelf"), h("div", { class: "muted" }, `${plural(boxes.length, "box").replace("boxs", "boxes")} · ${bytes(me.quota.used)} of ${bytes(me.quota.limit)}`)),
-      h("div", { class: "row" }, shakeChip, h("button", { type: "button", class: "secondary tiny", onclick: addDevice }, "Add a device")),
+      h("div", { class: "row" }, shakeChip, backupChip(me.server.backup), h("button", { type: "button", class: "secondary tiny", onclick: addDevice }, "Add a device")),
     ),
     emergencyAlerts(me),
     search,
@@ -3917,11 +3917,44 @@ async function renderActivity() {
   await load(true);
 }
 
+/** How backups are doing, in words, and whether it's fine. */
+function backupWords(backup) {
+  if (!backup) return { ok: false, words: "Not backed up: everything is on one disk of one computer" };
+  if (!backup.at) return { ok: false, words: "Backups are on, but none has been made yet" };
+  if (Date.now() - backup.at > backup.every * 2 + 60 * 60_000) return { ok: false, words: `The last backup was ${ago(backup.at)}` };
+  if (backup.failing) return { ok: false, words: `Backed up ${ago(backup.at)}, but ${plural(backup.failing, "place")} missed it` };
+  return { ok: true, words: `Backed up ${ago(backup.at)}${backup.places > 1 ? `, in ${backup.places} places` : " (on this computer only)"}` };
+}
+
+function backupChip(backup) {
+  const { ok, words } = backupWords(backup);
+  return h("a", { href: "#/security", class: `chip ${ok && backup.places > 1 ? "ok" : "warn"}` }, `${ok ? "✓" : "!"} ${words}`);
+}
+
 async function renderSecurity() {
   const info = await hello();
   const report = info.shake;
+  const backup = (await account.me()).server.backup;
+  const said = backupWords(backup);
+  const backupCard = h(
+    "section",
+    { class: "card stack" },
+    h("h2", {}, "Backups"),
+    h("p", {}, h("span", { class: `chip ${said.ok && backup.places > 1 ? "ok" : "warn"}` }, said.words)),
+    h("p", { class: "small" }, "Everything here lives on the computer Cardboard runs on. If that computer breaks or is lost, a backup somewhere else is what brings it back: your recovery kit only brings back your keys, not what you kept."),
+    backup && backup.places > 1
+      ? h("p", { class: "muted small" }, `A copy is made every ${describeDuration(backup.every)} and also kept somewhere else. It's sealed like everything here, so that place doesn't need to be trusted.`)
+      : h(
+          "div",
+          { class: "stack small" },
+          h("strong", {}, "To keep a copy somewhere else"),
+          h("p", {}, "On the computer Cardboard runs on, plug in another drive (a USB stick or SSD), then double-click ", h("strong", {}, "Cardboard"), " on the desktop: it asks where to keep the copies. Everything is sealed, so any drive will do."),
+          h("p", { class: "muted" }, "Running it another way: start it with ", h("code", {}, "--backup-to <folder>"), "."),
+        ),
+  );
   fill(app, 
     h("div", { class: "page-head" }, h("div", {}, h("h1", {}, "Security"), h("div", { class: "muted" }, "What keeps your data yours, and how this server tested itself."))),
+    backupCard,
     h(
       "div",
       { class: "two" },

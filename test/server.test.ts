@@ -421,6 +421,54 @@ describe("accounts and the host", () => {
   });
 });
 
+describe("backups in other places", () => {
+  it("copies each backup to another drive with the key to restore it, and tells people it's working", async () => {
+    const elsewhere = mkdtempSync(join(tmpdir(), "cardboard-elsewhere-"));
+    // A folder that can't be made (a file is in the way), like a drive that isn't plugged in.
+    writeFileSync(join(elsewhere, "a-file"), "x");
+    const missing = join(elsewhere, "a-file", "backups");
+    const t = await startTestServer({ shake: false, backupTo: [join(elsewhere, "copies")] });
+    try {
+      assert.equal(t.cb.api.backupIfDue(DAY), true, "a second place turns on daily backups, and the first is made straight away");
+      const files = (await import("node:fs")).readdirSync(join(elsewhere, "copies"));
+      assert.ok(files.some((f) => /^cardboard-.*\.db$/.test(f)), files.join(","));
+      assert.ok(files.includes("server.key") && files.includes("README.txt"));
+      assert.ok(readFileSync(join(elsewhere, "copies", "server.key")).equals(readFileSync(t.cb.paths.keyFile)));
+      assert.ok(!files.some((f) => f.endsWith(".part")));
+      const copy = new DatabaseSync(join(elsewhere, "copies", files.find((f) => f.endsWith(".db"))!));
+      assert.ok((copy.prepare("SELECT COUNT(*) AS n FROM accounts").get() as { n: number }).n >= 1, "the copy is a working database");
+      copy.close();
+      const { server } = await t.me.me();
+      assert.deepEqual({ ...server.backup, at: typeof server.backup?.at }, { every: DAY, at: "number", places: 2, failing: 0 });
+    } finally {
+      await t.stop();
+    }
+    // A place that isn't there (a drive left unplugged) is said, and tried again within the hour, not the next day.
+    const t2 = await startTestServer({ shake: false, backupTo: [missing] });
+    try {
+      assert.equal(t2.cb.api.backupIfDue(DAY), true);
+      assert.equal((await t2.me.me()).server.backup?.failing, 1);
+      assert.equal(t2.cb.api.backupIfDue(DAY), false, "not again straight away");
+      t2.clock.advance(HOUR + 1000);
+      assert.equal(t2.cb.api.backupIfDue(DAY), true, "but again within the hour");
+      const log = (await t2.host("host.log")).body.entries.filter((e: any) => e.action === "backup");
+      assert.equal(log[0].outcome, "error");
+    } finally {
+      await t2.stop();
+      rmSync(elsewhere, { recursive: true, force: true });
+    }
+  });
+
+  it("says nothing about backups when there are none", async () => {
+    const t = await startTestServer({ shake: false });
+    try {
+      assert.equal((await t.me.me()).server.backup, null);
+    } finally {
+      await t.stop();
+    }
+  });
+});
+
 describe("HTTP edges", () => {
   let t: TestServer;
   before(async () => {

@@ -128,11 +128,12 @@ whoever runs the server can't read what's in it.
                       --tls-cert <file> --tls-key <file>  --trust-proxy  --open-signup
                       --public-url https://cardboard.example.com   (where people and apps reach you)
                       --backup-every 1d   (snapshots in <data>/backups, newest 10 kept; 3 once it's over 1 GB)
+                      --backup-to D:\\Backups  (also copy each one there: another drive or computer; daily unless --backup-every)
                       --account-quota 50GB  (room each person gets; default 10 GB. One person: cardboard host quota)
                       --invites host      (only the host makes invites; default: everyone can invite friends)
                       --tunnel tailscale|cloudflare   (online from this computer; sets the address and HTTPS)
   The same as environment variables: CARDBOARD_TUNNEL, CARDBOARD_PORT, CARDBOARD_HOST, CARDBOARD_DATA, CARDBOARD_PUBLIC_URL,
-                      CARDBOARD_TRUST_PROXY=1, CARDBOARD_OPEN_SIGNUP=1, CARDBOARD_BACKUP_EVERY=1d, CARDBOARD_INVITES=host,
+                      CARDBOARD_TRUST_PROXY=1, CARDBOARD_OPEN_SIGNUP=1, CARDBOARD_BACKUP_EVERY=1d, CARDBOARD_BACKUP_TO=D:\\Backups, CARDBOARD_INVITES=host,
                       CARDBOARD_ACCOUNT_QUOTA=50GB
 `;
 
@@ -274,6 +275,7 @@ async function main() {
       "open-signup": { type: "boolean" },
       "public-url": { type: "string" },
       "backup-every": { type: "string" },
+      "backup-to": { type: "string", multiple: true },
       "account-quota": { type: "string" },
       invites: { type: "string" },
       tunnel: { type: "string" },
@@ -345,6 +347,7 @@ async function main() {
         openSignup: values["open-signup"],
         invites: values.invites === "host" || values.invites === "everyone" ? values.invites : undefined,
         backupEveryMs: values["backup-every"] ? (values["backup-every"] === "never" ? null : parseDuration(values["backup-every"])) : undefined,
+        backupTo: values["backup-to"]?.length ? values["backup-to"] : undefined,
         accountQuotaBytes: values["account-quota"] ? parseSize(values["account-quota"]) : undefined,
       }).catch(async (err: NodeJS.ErrnoException) => {
         await tunnel?.close();

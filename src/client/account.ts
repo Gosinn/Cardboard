@@ -94,7 +94,15 @@ export interface Me {
   alarms: Array<{ at: number; text: string }>;
   /** Emergency access links someone is using right now: stop them, or let them in. */
   emergency: EmergencyLinkInfo[];
-  server: { version: string; issuer: string; signup: "invite" | "open"; invites: "everyone" | "host"; shake: { ok: boolean; summary: string; at: number } | null };
+  server: {
+    version: string;
+    issuer: string;
+    signup: "invite" | "open";
+    invites: "everyone" | "host";
+    shake: { ok: boolean; summary: string; at: number } | null;
+    /** How the server's backups are doing (null: it isn't backed up). Nothing about anyone in it. */
+    backup: { every: number; at: number | null; places: number; failing: number } | null;
+  };
 }
 
 /** An emergency access link you gave someone. */

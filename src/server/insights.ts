@@ -21,6 +21,10 @@ export interface ServerInfo {
   signup: "invite" | "open";
   /** Who may make invite links: everyone with an account here, or only the host. */
   invites: "everyone" | "host";
+  /** How often the database is backed up (ms), or null for never. */
+  backupEveryMs?: number | null;
+  /** Other places (folders: another drive, another computer's share) each backup is copied to. */
+  backupTo?: string[];
 }
 
 export interface HostInsightInput {

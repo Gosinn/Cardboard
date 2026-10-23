@@ -92,8 +92,16 @@ func main() {
 		jobForChildren()
 		go keepRunning(dir, node)
 	}
+	if has(args, "--backups") {
+		chooseBackups(dir, true)
+		return
+	}
 	if !background {
 		firstRun(filepath.Join(dir, "Cardboard.exe"), dir, has(args, "--on-desktop"))
+		backupsShortcut(filepath.Join(dir, "Cardboard.exe"), dir)
+		if !loadSettings().AskedBackup {
+			chooseBackups(dir, false)
+		}
 		openWindow()
 	}
 	if keeper {
@@ -151,7 +159,7 @@ func findFolder() string {
 		}
 	}
 	for {
-		dir := pickFolder()
+		dir := pickFolder("Where is your Cardboard folder?")
 		if dir == "" || isCardboard(dir) {
 			return dir
 		}
@@ -162,13 +170,14 @@ func findFolder() string {
 }
 
 // pickFolder asks for a folder with Windows' own folder picker (through PowerShell). "" if cancelled.
-func pickFolder() string {
+func pickFolder(question string) string {
 	script := `Add-Type -AssemblyName System.Windows.Forms
 $d = New-Object System.Windows.Forms.FolderBrowserDialog
-$d.Description = 'Where is your Cardboard folder?'
+$d.Description = $env:CB_QUESTION
 if ($d.ShowDialog() -eq 'OK') { $d.SelectedPath }`
 	cmd := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-STA", "-Command", "-")
 	cmd.Stdin = strings.NewReader(script)
+	cmd.Env = append(os.Environ(), "CB_QUESTION="+question)
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: createNoWindow}
 	out, err := cmd.Output()
 	if err != nil {
@@ -193,6 +202,11 @@ func keepRunning(dir, node string) {
 			update(dir, git)
 		}
 		cmd := hidden(dir, node, "src/cli.ts", "start", "--tunnel", "tailscale")
+		settings := loadSettings()
+		cmd.Env = os.Environ()
+		if settings.BackupTo != "" {
+			cmd.Env = append(cmd.Env, "CARDBOARD_BACKUP_TO="+settings.BackupTo)
+		}
 		if cmd.Start() != nil {
 			time.Sleep(15 * time.Second)
 			continue
@@ -204,11 +218,20 @@ func keepRunning(dir, node string) {
 		}()
 		updating := false
 		hourly := time.NewTicker(time.Hour)
+		minutely := time.NewTicker(time.Minute)
 	running:
 		for {
 			select {
 			case <-stopped:
 				break running
+			case <-minutely.C:
+				// Where backups go changed (Start menu → Cardboard backups): start again with it.
+				if loadSettings().BackupTo != settings.BackupTo {
+					updating = true
+					_ = cmd.Process.Kill()
+					<-stopped
+					break running
+				}
 			case <-hourly.C:
 				if canUpdate && newer(dir, git) {
 					updating = true
@@ -219,6 +242,7 @@ func keepRunning(dir, node string) {
 			}
 		}
 		hourly.Stop()
+		minutely.Stop()
 		if !updating {
 			time.Sleep(15 * time.Second)
 		}
@@ -418,6 +442,79 @@ func regString(root syscall.Handle, path, name string) string {
 	return syscall.UTF16ToString(buf)
 }
 
+// ── Backups somewhere else ───────────────────────────────────────────────────
+
+// Settings is what Cardboard.exe remembers (in %LOCALAPPDATA%\Cardboard\settings.json): no secrets.
+type Settings struct {
+	BackupTo    string `json:"backupTo,omitempty"`
+	AskedBackup bool   `json:"askedBackup,omitempty"`
+}
+
+func settingsFile() string {
+	return filepath.Join(os.Getenv("LOCALAPPDATA"), "Cardboard", "settings.json")
+}
+
+func loadSettings() Settings {
+	var s Settings
+	if data, err := os.ReadFile(settingsFile()); err == nil {
+		_ = json.Unmarshal(data, &s)
+	}
+	return s
+}
+
+func saveSettings(s Settings) {
+	if os.Getenv("LOCALAPPDATA") == "" {
+		return
+	}
+	_ = os.MkdirAll(filepath.Dir(settingsFile()), 0o700)
+	if data, err := json.MarshalIndent(s, "", "  "); err == nil {
+		_ = os.WriteFile(settingsFile(), data, 0o600)
+	}
+}
+
+// chooseBackups asks where Cardboard should keep a copy of everything (another drive). `again`:
+// opened from the Start menu, to change it.
+func chooseBackups(dir string, again bool) {
+	s := loadSettings()
+	s.AskedBackup = true
+	saveSettings(s)
+	question := "Keep a backup of Cardboard somewhere else?\n\nEverything you keep in Cardboard is on this computer only. If it breaks or is lost, a copy on another drive (a USB stick, or an SSD like a T7) brings it all back. Everything in it is sealed, so any drive is safe to use.\n\nChoose where next. (You can change it later: Start menu → Cardboard backups.)"
+	if again && s.BackupTo != "" {
+		question = "Cardboard keeps a backup copy in:\n\n" + s.BackupTo + "\n\nChoose another place? (No keeps it as it is.)"
+	}
+	if message("Cardboard backups", question, mbYesNo|mbIconInformation) != idYes {
+		return
+	}
+	for {
+		picked := pickFolder("Where should Cardboard keep its backup copies? (Another drive is best.)")
+		if picked == "" {
+			return
+		}
+		if strings.EqualFold(filepath.VolumeName(picked), filepath.VolumeName(dir)) {
+			answer := message("Cardboard backups", "That's on the same drive as Cardboard itself, so if that drive fails, the backup goes with it.\n\nChoose another drive? (No uses this one anyway.)", mbYesNo|mbIconWarning)
+			if answer == idYes {
+				continue
+			}
+		}
+		target := picked
+		if !strings.EqualFold(filepath.Base(target), "Cardboard backups") {
+			target = filepath.Join(picked, "Cardboard backups")
+		}
+		s.BackupTo = target
+		saveSettings(s)
+		message("Cardboard backups", "Done. Cardboard keeps a copy in:\n\n"+target+"\n\nIt makes one within a few minutes, then every day. If that drive isn't plugged in, it tries again every hour, and your Cardboard says so (Security).", mbOK|mbIconInformation)
+		return
+	}
+}
+
+// backupsShortcut puts "Cardboard backups" in the Start menu, to change where backups go.
+func backupsShortcut(exe, dir string) {
+	if _, err := os.Stat(filepath.Join(os.Getenv("APPDATA"), "Microsoft", "Windows", "Start Menu", "Programs", "Cardboard backups.lnk")); err == nil {
+		return
+	}
+	shortcutNamed(exe, dir, "Programs", "--backups", "Cardboard backups")
+}
+
 // firstRun puts Cardboard on the desktop and in the Start menu, once, and asks about starting with Windows.
 func firstRun(exe, dir string, onDesktop bool) {
 	local := os.Getenv("LOCALAPPDATA")
@@ -457,17 +554,21 @@ func firstRun(exe, dir string, onDesktop bool) {
 // Windows' own shortcut maker is reached through PowerShell; the paths go in as environment
 // variables, so nothing in them is ever read as code.
 func shortcut(exe, dir, folder, args string) {
+	shortcutNamed(exe, dir, folder, args, "Cardboard")
+}
+
+func shortcutNamed(exe, dir, folder, args, name string) {
 	script := `$w = New-Object -ComObject WScript.Shell
-$s = $w.CreateShortcut((Join-Path ([Environment]::GetFolderPath($env:CB_FOLDER)) 'Cardboard.lnk'))
+$s = $w.CreateShortcut((Join-Path ([Environment]::GetFolderPath($env:CB_FOLDER)) ($env:CB_NAME + '.lnk')))
 $s.TargetPath = $env:CB_EXE
 $s.Arguments = $env:CB_ARGS
 $s.WorkingDirectory = $env:CB_DIR
 $s.IconLocation = $env:CB_EXE + ',0'
-$s.Description = 'Cardboard'
+$s.Description = $env:CB_NAME
 $s.Save()`
 	cmd := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "-")
 	cmd.Stdin = strings.NewReader(script)
-	cmd.Env = append(os.Environ(), "CB_FOLDER="+folder, "CB_EXE="+exe, "CB_ARGS="+args, "CB_DIR="+dir)
+	cmd.Env = append(os.Environ(), "CB_FOLDER="+folder, "CB_EXE="+exe, "CB_ARGS="+args, "CB_DIR="+dir, "CB_NAME="+name)
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: createNoWindow}
 	_ = cmd.Run()
 }

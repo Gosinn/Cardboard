@@ -122,6 +122,7 @@ For the video Discord won't take, or the folder you'd otherwise put in a shared 
 - **Location stays home.** Phones write where every photo and video was taken into the file. Cardboard takes just that out, on your device, before it's sealed: the picture, the date and which way up it is stay. (You → Privacy turns it off for your own uploads.)
 - **Big uploads survive a bad connection.** A dropped connection is tried again; if it stays down, what got there is kept, and adding the same file again carries on from where it stopped.
 - **Find duplicates** in your personal box and friend boxes: the same content under any name, by its fingerprint. The oldest stays; the copies go (and can be undone).
+- **Backups somewhere else.** Everything lives on the computer Cardboard runs on; a copy on another drive (a USB stick, an SSD) is what brings it back if that computer dies. Cardboard.exe asks where once (Start menu → *Cardboard backups* to change it), copies every day, retries every hour when the drive isn't plugged in, and your shelf says how backups are doing. The copies are sealed like everything else, so any drive will do. (`--backup-to <folder>` when you run it another way.)
 - **Cardboard.exe keeps itself up to date** while it runs: it looks for a new version every hour and restarts on it in a few seconds.
 
 ## Convert

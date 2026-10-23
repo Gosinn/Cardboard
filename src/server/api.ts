@@ -1,5 +1,5 @@
-import { mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statfsSync, statSync, writeFileSync } from "node:fs";
+import { basename, join } from "node:path";
 import { CardboardError, fail } from "../shared/errors.ts";
 import { parseDuration } from "../shared/duration.ts";
 import { ctx } from "../shared/contexts.ts";
@@ -896,6 +896,7 @@ export class Api {
             signup: info.signup,
             invites: info.invites,
             shake: this.lastShake ? { ok: this.lastShake.ok, summary: this.lastShake.summary, at: this.lastShake.at } : null,
+            backup: this.backupStatus(),
           },
         };
       },
@@ -1670,7 +1671,7 @@ export class Api {
    * over). Only sealed data is inside, so a copy can live anywhere; restoring
    * also needs the server key file (for sign-in keys and apps' private IDs).
    */
-  backup(): { file: string; bytes: number; kept: number } {
+  backup(): { file: string; bytes: number; kept: number; places: Array<{ ok: boolean; error?: string }> } {
     const { db, info, vault } = this.ctx;
     const dir = join(info.dataDir, "backups");
     const size = statSync(info.dbFile).size;
@@ -1689,14 +1690,39 @@ export class Api {
       .sort()
       .slice(0, -keep);
     for (const f of old) rmSync(join(dir, f));
-    return { file, bytes: statSync(file).size, kept: keep };
+    const places = (info.backupTo ?? []).map((place) => {
+      try {
+        copyBackup(file, place, info.keyFile, keep);
+        return { ok: true };
+      } catch (err) {
+        return { ok: false, error: `${place}: ${(err as Error).message}` };
+      }
+    });
+    setMeta(db, "backup_places", JSON.stringify({ at: this.now(), ok: places.filter((p) => p.ok).length, failed: places.filter((p) => !p.ok).map((p) => p.error) }));
+    return { file, bytes: statSync(file).size, kept: keep, places };
+  }
+
+  /** How backups are doing, for the people here (no paths, nothing about anyone): when, and in how many places. */
+  backupStatus(): { every: number; at: number | null; places: number; failing: number } | null {
+    const { db, info } = this.ctx;
+    if (!info.backupEveryMs) return null;
+    const last = getMeta(db, "last_backup_at");
+    let failing = 0;
+    try {
+      failing = (JSON.parse(getMeta(db, "backup_places") ?? "{}") as { failed?: unknown[] }).failed?.length ?? 0;
+    } catch {
+      failing = 0;
+    }
+    return { every: info.backupEveryMs, at: last ? Number(last) : null, places: 1 + (info.backupTo?.length ?? 0), failing };
   }
 
   /** Makes a backup if the last one is older than `everyMs` (checked by a timer; survives restarts). */
   backupIfDue(everyMs: number): boolean {
     const last = Number(getMeta(this.ctx.db, "last_backup_at") ?? 0);
     const tried = Number(getMeta(this.ctx.db, "backup_tried_at") ?? 0);
-    if (this.now() - last < everyMs || this.now() - tried < HOUR) return false;
+    // A place that didn't get its copy (a drive that wasn't plugged in) is tried again every hour.
+    const failing = (this.backupStatus()?.failing ?? 0) > 0;
+    if ((this.now() - last < everyMs && !failing) || this.now() - tried < HOUR) return false;
     setMeta(this.ctx.db, "backup_tried_at", String(this.now()));
     try {
       this.backup();
@@ -1705,7 +1731,8 @@ export class Api {
       this.ctx.audit.record({ accountId: null, actor: "system", action: "backup", outcome: "error", note: (err as Error).message });
       return false;
     }
-    this.ctx.audit.record({ accountId: null, actor: "system", action: "backup", note: "scheduled" });
+    const status = this.backupStatus();
+    this.ctx.audit.record({ accountId: null, actor: "system", action: "backup", outcome: status?.failing ? "error" : "ok", note: status?.failing ? `scheduled; ${status.failing} other place(s) didn't get a copy` : "scheduled" });
     return true;
   }
 
@@ -1880,6 +1907,55 @@ function parseWhen(input: unknown, now: number): number {
     return now - parseDuration(input.replace(/\s*ago\s*$/i, ""));
   }
   throw fail("bad_time", 400, '`to` must be a time like "10m" (ten minutes ago), an ISO date, or a timestamp.');
+}
+
+/**
+ * Copies a backup to another place (another drive, another computer), with the
+ * server key it needs to be restored, keeping the newest `keep` there too.
+ * Everything in it is sealed, so the place doesn't need to be trusted.
+ */
+function copyBackup(file: string, place: string, keyFile: string, keep: number) {
+  try {
+    if (!existsSync(place)) mkdirSync(place, { recursive: true });
+  } catch {
+    throw new Error("it isn't there (is the drive plugged in, or the other computer on?)");
+  }
+  const size = statSync(file).size;
+  try {
+    const fs = statfsSync(place);
+    if (fs.bavail * fs.bsize - size < 256 * 1024 * 1024) throw new Error(`there isn't room (it needs ${formatBytes(size)})`);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOSYS") throw err;
+  }
+  // Copied under another name first, so a copy cut off half way never looks like a backup.
+  copyFileSync(file, join(place, `${basename(file)}.part`));
+  renameSync(join(place, `${basename(file)}.part`), join(place, basename(file)));
+  const key = join(place, "server.key");
+  if (!existsSync(key) || !readFileSync(key).equals(readFileSync(keyFile))) copyFileSync(keyFile, key);
+  const readme = join(place, "README.txt");
+  if (!existsSync(readme)) {
+    writeFileSync(
+      readme,
+      [
+        "Cardboard backups",
+        "",
+        "Copies of a Cardboard server's database. Everything people keep in it is sealed",
+        "with keys only their own devices have: these files can't be opened without them.",
+        "",
+        "To bring a Cardboard back from here, on a computer with Cardboard installed:",
+        "  1. Stop Cardboard.",
+        "  2. Copy the newest cardboard-<date>.db here to cardboard-data\\cardboard.db",
+        "     (in the Cardboard folder), and server.key to cardboard-data\\server.key.",
+        "  3. Start Cardboard. Everyone signs in as before, with their devices or recovery kits.",
+        "",
+      ].join("\r\n"),
+    );
+  }
+  const old = readdirSync(place)
+    .filter((f) => /^cardboard-.*\.db$/.test(f))
+    .sort()
+    .slice(0, -keep);
+  for (const f of old) rmSync(join(place, f));
 }
 
 function requireRead(who: { read: boolean }) {
