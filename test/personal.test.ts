@@ -151,7 +151,9 @@ describe("your personal box", () => {
     await box.batch([0, 1].map((n) => ({ op: "put" as const, key: filePartKey("abandoned", n), value: new Uint8Array([n]) })));
     const { things } = await listThings(box);
     assert.deepEqual(await strayParts(box, things), [], "too recent: it may still be going on another device");
-    const stray = await strayParts(box, things, Date.now() + 7 * 60 * 60 * 1000);
+    assert.deepEqual(await strayParts(box, things, Date.now() + 7 * 60 * 60 * 1000), [], "within two days it may still be carried on");
+    assert.deepEqual(await strayParts(box, things, Date.now() + 3 * 24 * 60 * 60 * 1000, ["abandoned"]), [], "nor while this device means to carry it on");
+    const stray = await strayParts(box, things, Date.now() + 3 * 24 * 60 * 60 * 1000);
     assert.deepEqual(stray.sort(), [filePartKey("abandoned", 0), filePartKey("abandoned", 1)]);
     await purgeKeys(box, stray);
     assert.equal(await box.get(filePartKey("abandoned", 0)), null);
@@ -486,6 +488,23 @@ describe("friend boxes", () => {
     assert.notDeepEqual(Buffer.from(who.names.root), Buffer.from((t.me as unknown as { keys: { names: { root: Uint8Array } } }).keys.names.root));
   });
 
+  it("collects: a link that can only add, and never see what's there", async () => {
+    await t.me.setProfile({ name: "Gosinn" });
+    const { box, link } = await t.me.makeFriendBox({ title: "Wedding photos", see: false });
+    assert.equal(link.see, false);
+    assert.equal(link.write, true);
+    assert.match(link.link, /&title=Wedding%20photos&from=Gosinn$/, "the title travels in the link, after the #");
+    const mine = await t.me.open(box);
+    await addFile(mine, new Blob(["the couple's own"]), { name: "ours.jpg" });
+    const guest = openBox({ url: t.cb.url, tape: secretOf(link.link.split("&")[0]!), onNotice: false });
+    const added = await addFile(guest, new Blob(["a guest's photo"]), { name: "guest.jpg", sentFrom: "Siggi" });
+    assert.equal(added.value.name, "guest.jpg");
+    await rejectsWith(listThings(guest), "write_only");
+    await rejectsWith(guest.get("friend/about"), "write_only");
+    const seen = (await listThings(mine)).things.map((x) => `${x.value.title}${x.value.inbox ? ` from ${x.value.from}` : ""}`);
+    assert.deepEqual(seen.sort(), ["guest.jpg from Siggi", "ours.jpg"]);
+  });
+
   it("stops working when you stop it, or when it expires", async () => {
     const { box, link } = await t.me.makeFriendBox({ expires: "1d" });
     const friend = () => openBox({ url: t.cb.url, tape: secretOf(link.link), onNotice: false });
@@ -499,5 +518,68 @@ describe("friend boxes", () => {
     await rejectsWith(openBox({ url: t.cb.url, tape: secretOf(last.link), onNotice: false }).get("friend/about"), "bad_tape");
     assert.equal((await t.me.friendBoxes())[box.id], null, "still a friend box, with no link");
     t.cb.api.limiter.reset("127.0.0.1");
+  });
+});
+
+describe("big uploads that get cut off", () => {
+  let t: TestServer;
+  before(async () => {
+    t = await startTestServer({ shake: false });
+  });
+  after(() => t.stop());
+
+  /** A connection that drops for the `batch` calls numbered in `dropped` (1-based), and counts them. */
+  const flaky = (dropped: Set<number>) => {
+    let n = 0;
+    const counter = { batches: 0 };
+    const fetchFn = (async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).endsWith("/v1/batch")) {
+        n++;
+        counter.batches++;
+        if (dropped.has(n)) throw new TypeError("network error");
+      }
+      return fetch(input, init);
+    }) as typeof fetch;
+    return { fetchFn, counter };
+  };
+
+  it("tries again when the connection drops for a moment", async () => {
+    const { link } = await t.me.makeFriendBox({ write: true });
+    const { fetchFn } = flaky(new Set([2, 3]));
+    const box = openBox({ url: t.cb.url, tape: link.link.split("#friend=")[1]!, fetch: fetchFn, onNotice: false });
+    const data = randomBytes(FILE_PART_BYTES * 10);
+    const thing = await addFile(box, new Blob([data]), { name: "video.mp4", retryMs: 5 });
+    assert.ok(Buffer.from(await readFile(box, thing)).equals(data));
+  });
+
+  it("carries on where it stopped, sending only what's missing", async () => {
+    const { link } = await t.me.makeFriendBox({ write: true });
+    const tape = link.link.split("#friend=")[1]!;
+    const data = randomBytes(FILE_PART_BYTES * 20);
+    // The second batch (parts 9–16) never gets through, however often it's tried.
+    const first = flaky(new Set([2, 3, 4, 5, 6, 7, 8, 9]));
+    const box = openBox({ url: t.cb.url, tape, fetch: first.fetchFn, onNotice: false });
+    const err = await addFile(box, new Blob([data]), { name: "film.mp4", keepPartsOnError: true, retryMs: 1 }).then(
+      () => null,
+      (e: { stopped?: { id: string; sentBytes: number } }) => e,
+    );
+    assert.ok(err?.stopped, "it says where it stopped");
+    assert.equal(err.stopped.sentBytes, 8 * FILE_PART_BYTES);
+    const again = flaky(new Set());
+    const box2 = openBox({ url: t.cb.url, tape, fetch: again.fetchFn, onNotice: false });
+    const thing = await addFile(box2, new Blob([data]), { name: "film.mp4", continueId: err.stopped.id, keepPartsOnError: true });
+    assert.equal(again.counter.batches, 2, "only the 12 missing parts went (two batches)");
+    assert.ok(Buffer.from(await readFile(box2, thing)).equals(data));
+    assert.equal(thing.value.sha256, createHash("sha256").update(Buffer.concat(Array.from({ length: 20 }, (_, n) => createHash("sha256").update(data.subarray(n * FILE_PART_BYTES, (n + 1) * FILE_PART_BYTES)).digest()))).digest("hex"));
+  });
+
+  it("removes what was sent when you stop it, and when nobody will carry on", async () => {
+    const { box: info, link } = await t.me.makeFriendBox({ write: true });
+    const tape = link.link.split("#friend=")[1]!;
+    const stop = flaky(new Set([2, 3, 4, 5, 6]));
+    const box = openBox({ url: t.cb.url, tape, fetch: stop.fetchFn, onNotice: false });
+    await assert.rejects(addFile(box, new Blob([randomBytes(FILE_PART_BYTES * 12)]), { name: "x", retryMs: 1 }));
+    const mine = await t.me.open(info);
+    assert.deepEqual(await mine.keys("file-data/"), [], "without keepPartsOnError, the parts sent are removed");
   });
 });

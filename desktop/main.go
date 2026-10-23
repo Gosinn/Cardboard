@@ -177,22 +177,82 @@ if ($d.ShowDialog() -eq 'OK') { $d.SelectedPath }`
 	return strings.TrimSpace(string(out))
 }
 
-// keepRunning starts Cardboard and starts it again if it stops, like start-cardboard.cmd.
+// keepRunning starts Cardboard and starts it again if it stops, like start-cardboard.cmd. While it
+// runs, it looks for a new version every hour, and restarts Cardboard on it (a few seconds offline).
 func keepRunning(dir, node string) {
+	git, _ := exec.LookPath("git")
+	_, repoErr := os.Stat(filepath.Join(dir, ".git"))
+	canUpdate := git != "" && repoErr == nil
 	for {
 		if answering() {
 			// Something else (start-cardboard.cmd?) is running it. Look again in a minute.
 			time.Sleep(time.Minute)
 			continue
 		}
-		if git, err := exec.LookPath("git"); err == nil {
-			if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
-				update(dir, git)
+		if canUpdate {
+			update(dir, git)
+		}
+		cmd := hidden(dir, node, "src/cli.ts", "start", "--tunnel", "tailscale")
+		if cmd.Start() != nil {
+			time.Sleep(15 * time.Second)
+			continue
+		}
+		stopped := make(chan struct{})
+		go func() {
+			_ = cmd.Wait()
+			close(stopped)
+		}()
+		updating := false
+		hourly := time.NewTicker(time.Hour)
+	running:
+		for {
+			select {
+			case <-stopped:
+				break running
+			case <-hourly.C:
+				if canUpdate && newer(dir, git) {
+					updating = true
+					_ = cmd.Process.Kill()
+					<-stopped
+					break running
+				}
 			}
 		}
-		run(dir, 0, node, "src/cli.ts", "start", "--tunnel", "tailscale")
-		time.Sleep(15 * time.Second)
+		hourly.Stop()
+		if !updating {
+			time.Sleep(15 * time.Second)
+		}
 	}
+}
+
+// newer says whether the Cardboard folder is behind the version on GitHub, in a way a pull can
+// simply move forward to.
+func newer(dir, git string) bool {
+	run(dir, 2*time.Minute, git, "fetch", "--quiet")
+	head := output(dir, git, "rev-parse", "HEAD")
+	upstream := output(dir, git, "rev-parse", "@{u}")
+	return head != "" && upstream != "" && head != upstream && quiet(dir, git, "merge-base", "--is-ancestor", "HEAD", "@{u}")
+}
+
+func hidden(dir, name string, args ...string) *exec.Cmd {
+	cmd := exec.Command(name, args...)
+	cmd.Dir = dir
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: createNoWindow}
+	return cmd
+}
+
+// output runs a command in dir with no window, and gives what it printed ("" if it failed).
+func output(dir, name string, args ...string) string {
+	out, err := hidden(dir, name, args...).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// quiet runs a command in dir with no window, and says whether it succeeded.
+func quiet(dir, name string, args ...string) bool {
+	return hidden(dir, name, args...).Run() == nil
 }
 
 // update brings the Cardboard folder up to date. Windows won't let git replace a program

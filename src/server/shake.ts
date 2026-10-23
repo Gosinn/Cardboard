@@ -358,6 +358,24 @@ export async function runShake(api: Api): Promise<ShakeReport> {
         : failed(`A friend link went wrong (opens ${opens}, own names key ${ownNames}, read-only ${readOnly}, stopped ${stopped}).`);
     });
 
+    await check("collection-link", "A collection box's link can add, and never read", async () => {
+      const { box, link } = await me.makeFriendBox({ title: "shake", see: false });
+      const guest = new Box({ url, tape: link.link.split("#friend=")[1]!.split("&")[0]!, fetch: inProcess, onNotice: false });
+      await guest.put("files/from-guest", { title: "x" });
+      const reads = await Promise.all([
+        rejects(() => guest.get("files/from-guest"), "write_only"),
+        rejects(() => guest.list("files/"), "write_only"),
+        rejects(() => guest.get("friend/about"), "write_only"),
+      ]);
+      const landed = (await (await me.open(box.name)).get<{ title: string }>("files/from-guest"))?.title === "x";
+      await me.stopFriendLink(box.name);
+      await me.shredBox(box.name).catch(() => undefined);
+      api.limiter.reset(PROBE_IP);
+      return reads.every(Boolean) && landed
+        ? pass("What the link added reached the box; reading it back, listing the box and its title were all refused.")
+        : failed(`A collection link could read (${reads.join(", ")}), or couldn't add (${landed}).`);
+    });
+
     await check("device-removed", "Removed devices are locked out", async () => {
       const second = await recoverWithKit({ url, code: kit, store: new MemoryStore(), kind: "other", fetch: inProcess });
       const token = second.rpc.token!;

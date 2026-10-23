@@ -113,7 +113,16 @@ For the video Discord won't take, or the folder you'd otherwise put in a shared 
 - **The key is in the link**, after the `#`, which browsers never send to the server. Whoever runs the server still can't see inside.
 - **The link opens that box only.** It carries a key for that one box, never one of your account's.
 - **Links expire** (1 day, 7 days, 30 days, or when you stop them), and *Stop the link* shuts it straight away. What's in the box stays yours.
-- What friends add shows up for you live, marked *from a friend*, and can be undone like everything else.
+- What friends add shows up for you live, marked with the name they give, and can be undone like everything else.
+- **Collection boxes:** choose *Only add files* and the people with the link can add, but can't see what's in the box: only you can. For the wedding, the trip, the class photos.
+- Where photos and videos were taken is taken out of whatever friends add, on their device, before it's sealed.
+
+## Small things that matter
+
+- **Location stays home.** Phones write where every photo and video was taken into the file. Cardboard takes just that out, on your device, before it's sealed: the picture, the date and which way up it is stay. (You → Privacy turns it off for your own uploads.)
+- **Big uploads survive a bad connection.** A dropped connection is tried again; if it stays down, what got there is kept, and adding the same file again carries on from where it stopped.
+- **Find duplicates** in your personal box and friend boxes: the same content under any name, by its fingerprint. The oldest stays; the copies go (and can be undone).
+- **Cardboard.exe keeps itself up to date** while it runs: it looks for a new version every hour and restarts on it in a few seconds.
 
 ## Convert
 

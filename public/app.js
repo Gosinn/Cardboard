@@ -35,6 +35,7 @@ import {
 } from "/lib/client/personal.ts";
 import { Rpc } from "/lib/client/rpc.ts";
 import { open as openBox } from "/lib/sdk/index.ts";
+import { withoutLocation } from "/lib/client/privacy.ts";
 import { browserName, browserStore, makeKey } from "/device.js";
 
 const app = document.getElementById("app");
@@ -1284,7 +1285,7 @@ async function sendNow(box, from, text, files, status) {
   for (const file of files) {
     const progress = h("span", {}, `Sealing ${file.name}…`);
     status.replaceChildren(progress);
-    await sendFile(box, file, from, { onProgress: (f, done) => (progress.textContent = `Sealing ${file.name}… ${Math.round(f * 100)}% (${bytes(done)} of ${bytes(file.size)})`) });
+    await sealFile(box, file, { sentFrom: from, onProgress: (f, done) => (progress.textContent = `Sealing ${file.name}… ${Math.round(f * 100)}% (${bytes(done)} of ${bytes(file.size)})`) });
   }
   status.replaceChildren(h("span", { class: "chip ok" }, "Sent. It's on your other devices now."));
 }
@@ -1374,6 +1375,70 @@ async function renderSend() {
   } catch (err) {
     fill(status, errorBox(err), h("a", { href: "#/" }, "Go to your shelf"));
   }
+}
+
+// ── Sealing files: location left behind, and carrying on after a dropped connection ──
+
+const RESUME = "cardboard-resume";
+
+function resumeList() {
+  try {
+    const list = JSON.parse(localStorage.getItem(RESUME) || "{}");
+    // A week on, it's not coming back: the box tidies those parts away by itself.
+    for (const [key, v] of Object.entries(list)) if (!v || Date.now() - v.at > 7 * 24 * 60 * 60_000) delete list[key];
+    return list;
+  } catch {
+    return {};
+  }
+}
+
+function resumeSave(list) {
+  try {
+    localStorage.setItem(RESUME, JSON.stringify(list));
+  } catch {
+    // Private windows may not keep it: then a cut-off upload starts over.
+  }
+}
+
+/** Uploads this device means to carry on in a box: tidying up leaves their parts be. */
+function resumingIds(boxId) {
+  return Object.entries(resumeList())
+    .filter(([key]) => key.startsWith(`${boxId}|`))
+    .map(([, v]) => v.id);
+}
+
+/**
+ * Seals a file into a box: its location taken out first (unless you keep it, in
+ * You → Privacy), and if the connection drops for good, what got there is kept
+ * so adding the same file again carries on from there. Resolves with a note to add.
+ */
+async function sealFile(box, file, options = {}) {
+  const { boxId } = await box.ready();
+  const key = `${boxId}|${file.name}|${file.size}|${file.lastModified ?? 0}`;
+  const strip = options.stripLocation ?? !(account ? (await account.me().catch(() => null))?.profile.keepLocation : false);
+  let source = file;
+  let note = "";
+  if (strip) {
+    const { blob, removed } = await withoutLocation(file);
+    source = blob;
+    if (removed) note = " Where it was taken was taken out first.";
+  }
+  const list = resumeList();
+  const carryOn = list[key]?.id;
+  const { stripLocation: _, ...rest } = options;
+  try {
+    await addFile(box, source, { name: file.name, type: file.type, ...rest, continueId: carryOn, keepPartsOnError: true });
+  } catch (err) {
+    if (err.stopped) {
+      resumeSave({ ...resumeList(), [key]: { id: err.stopped.id, at: Date.now() } });
+      err.hint = `${bytes(err.stopped.sentBytes)} of ${bytes(file.size)} got there and is kept. Add the same file again (here, on this device) and it carries on from there.`;
+    }
+    throw err;
+  }
+  const done = resumeList();
+  delete done[key];
+  resumeSave(done);
+  return { note: carryOn ? `${note} It carried on from where it stopped.` : note };
 }
 
 // ── Convert ─────────────────────────────────────────────────────────────────
@@ -1508,7 +1573,7 @@ async function renderConvert() {
       withBusy(keep, async () => {
         try {
           const box = await account.open(await account.makePersonalBox());
-          await addFile(box, r.blob, { name: r.name, type: r.type });
+          await sealFile(box, new File([r.blob], r.name, { type: r.type }));
           note.textContent = "Kept, sealed, in your personal box.";
         } catch (err) {
           note.replaceChildren(errorBox(err));
@@ -1521,7 +1586,7 @@ async function renderConvert() {
         try {
           const me = await account.me();
           const box = await account.open(await account.makePersonalBox());
-          await sendFile(box, r.blob, thisDeviceName(me), { name: r.name });
+          await sealFile(box, new File([r.blob], r.name, { type: r.type }), { sentFrom: thisDeviceName(me) });
           note.textContent = "Sent. It's on your other devices now.";
         } catch (err) {
           note.replaceChildren(errorBox(err));
@@ -1651,19 +1716,39 @@ function linkExpired(link) {
   return Boolean(link?.expiresAt && link.expiresAt <= Date.now());
 }
 
+/** What people with the link can do, in words. (Links made before collection boxes can always see.) */
+function linkCan(link) {
+  if (link.see === false) return "they can only add";
+  return link.write ? "they can open, download and add" : "they can open and download";
+}
+
 function linkState(link) {
   if (!link) return "no link";
   if (linkExpired(link)) return "its link expired";
-  return `${link.write ? "they can add too" : "they can open and download"} · ${link.expiresAt ? `until ${new Date(link.expiresAt).toLocaleDateString()}` : "until you stop it"}`;
+  return `${linkCan(link)} · ${link.expiresAt ? `until ${new Date(link.expiresAt).toLocaleDateString()}` : "until you stop it"}`;
 }
 
+const LINK_KINDS = [
+  ["open", "Open and download what you put in"],
+  ["both", "That, and add files too (you get what they add)"],
+  ["add", "Only add files: they can't see what's in it (a collection box, for a wedding or a trip)"],
+];
+
 /** What people with a friend link can do, and for how long. */
-function linkChoices(write = false) {
-  const canAdd = h("input", { type: "checkbox", checked: write });
+function linkChoices(current = null) {
+  const now = current ? (current.see === false ? "add" : current.write ? "both" : "open") : "open";
+  const name = `can-${Math.random().toString(36).slice(2)}`;
+  const kinds = LINK_KINDS.map(([value, label]) => ({ value, input: h("input", { type: "radio", name, value, checked: value === now }), label }));
   const how = h("select", {}, LINK_DURATIONS.map(([value, label]) => h("option", { value, selected: value === "7d" }, label)));
   return {
-    fields: [h("label", { class: "row small" }, canAdd, "They can add files too (and you get what they add)"), h("label", { class: "field" }, "The link works for", how)],
-    value: () => ({ write: canAdd.checked, expires: how.value || null }),
+    fields: [
+      h("fieldset", { class: "stack small plain-fieldset" }, h("legend", {}, "People with the link can"), kinds.map((k) => h("label", { class: "row" }, k.input, k.label))),
+      h("label", { class: "field" }, "The link works for", how),
+    ],
+    value: () => {
+      const kind = kinds.find((k) => k.input.checked)?.value ?? "open";
+      return { see: kind !== "add", write: kind !== "open", expires: how.value || null };
+    },
   };
 }
 
@@ -1695,7 +1780,7 @@ function showFriendLink(link, boxName) {
   openModal(
     render,
     h("h2", {}, "The friend box's link"),
-    h("p", {}, "Send this to your friend. Anyone who has it can open the box", link.write ? " and add to it" : "", ", with no account. The key is in the link itself, so send it only to people you mean."),
+    h("p", {}, link.see === false ? "Send this to the people you're collecting from. They can add files, with no account, but can't see what's in the box: only you can. " : `Send this to your friend. Anyone who has it can open the box${link.write ? " and add to it" : ""}, with no account. `, "The key is in the link itself, so send it only to people you mean."),
     h("code", { class: "secret" }, link.link),
     sendButtons(link.link, "Files for you"),
     qrCode(link.link, "QR code of the friend box's link"),
@@ -1709,7 +1794,7 @@ function friendLinkCard(info, link) {
   const card = h("section", { class: "card stack" });
   const status = h("div");
   const newLink = (current) => {
-    const choices = linkChoices(current?.write ?? false);
+    const choices = linkChoices(current);
     const formStatus = h("div");
     const form = h(
       "form",
@@ -1747,7 +1832,7 @@ function friendLinkCard(info, link) {
       card,
       h("h2", {}, "Its link"),
       live
-        ? [h("p", { class: "small" }, `Anyone with this link can open this box${current.write ? " and add to it" : ""}. ${current.expiresAt ? `It works until ${new Date(current.expiresAt).toLocaleString()}.` : "It works until you stop it."}`), h("code", { class: "secret" }, current.link), sendButtons(current.link, "Files for you")]
+        ? [h("p", { class: "small" }, `Anyone with this link: ${linkCan(current)}. ${current.expiresAt ? `It works until ${new Date(current.expiresAt).toLocaleString()}.` : "It works until you stop it."}`), h("code", { class: "secret" }, current.link), sendButtons(current.link, "Files for you")]
         : h("p", { class: "small" }, current ? "Its link expired. Make a new one to let people in again." : "No link right now: nobody can open this box but you."),
       h("div", { class: "row" }, live ? stop : null, fresh),
       status,
@@ -1760,16 +1845,34 @@ function friendLinkCard(info, link) {
 /** The live connection while someone is looking at a friend box through its link. */
 let friendWatch = null;
 
+/** What a guest calls themselves when adding to a friend box, remembered on their device. */
+function guestName() {
+  try {
+    return (localStorage.getItem("cardboard-guest-name") || "").trim().slice(0, 60) || "a friend";
+  } catch {
+    return "a friend";
+  }
+}
+
 /** A friend box, opened with its link: no account, just this box. */
-async function renderFriendView(secret) {
+async function renderFriendView(pending) {
   nav.hidden = true;
   friendWatch?.close();
   friendWatch = null;
-  const box = openBox({ url: ORIGIN, tape: secret, onNotice: false });
+  let link;
+  try {
+    link = JSON.parse(pending);
+  } catch {
+    link = { secret: pending };
+  }
+  const box = openBox({ url: ORIGIN, tape: link.secret, onNotice: false });
   let who;
   let about;
+  const added = [];
   try {
-    [who, about] = await Promise.all([box.whoami(), box.get(FRIEND_ABOUT)]);
+    who = await box.whoami();
+    // A collection link can't read the box: its title came in the link.
+    about = who.tape?.read ? await box.get(FRIEND_ABOUT) : { title: link.title, from: link.from };
   } catch (err) {
     const gone = err.code === "bad_tape";
     return fill(
@@ -1783,12 +1886,16 @@ async function renderFriendView(secret) {
     );
   }
   const canAdd = Boolean(who.tape?.write);
+  const canSee = Boolean(who.tape?.read);
   const expiresAt = who.tape?.expiresAt;
   const list = h("ul", { class: "list things" });
   const notice = h("div", { class: "stack" });
   const picker = h("input", { type: "file", multiple: true, hidden: true });
 
   async function load() {
+    if (!canSee) {
+      return fill(list, added.length ? added.map((name) => h("li", { class: "thing" }, h("span", { class: "thing-icon", "aria-hidden": "true" }, "✓"), h("span", { class: "thing-text" }, h("strong", {}, name), h("span", { class: "muted small" }, "added")))) : h("li", { class: "muted" }, "Add your files below. Only the box's owner can see what's in it."));
+    }
     const { things } = await listThings(box);
     fill(
       list,
@@ -1821,12 +1928,14 @@ async function renderFriendView(secret) {
         const progress = h("span", {}, `Sealing ${file.name}…`);
         fill(notice, h("div", { class: "insight tip row spread" }, progress, stopButton));
         try {
-          await addFile(box, file, {
-            sentFrom: "a friend",
+          const { note } = await sealFile(box, file, {
+            sentFrom: guestName(),
+            stripLocation: true,
             signal: stop.signal,
             onProgress: (f, done) => (progress.textContent = `Sealing ${file.name}… ${Math.round(f * 100)}% (${bytes(done)} of ${bytes(file.size)})`),
           });
-          fill(notice, h("div", { class: "insight tip" }, `Added ${file.name}. It was sealed here before it left this device.`));
+          added.push(file.name);
+          fill(notice, h("div", { class: "insight tip" }, `Added ${file.name}. It was sealed here before it left this device.${note}`));
         } catch (err) {
           fill(notice, err.name === "AbortError" ? h("div", { class: "insight tip" }, `Stopped. Nothing of ${file.name} was kept.`) : errorBox(err));
           break;
@@ -1854,7 +1963,9 @@ async function renderFriendView(secret) {
         "div",
         { class: "stack" },
         h("h1", {}, `🎁 ${about?.title || "A friend box"}`),
-        h("div", { class: "muted" }, about?.from ? `From ${about.from}. ` : "Someone sent you this. ", "Sealed end to end: only people with this link can see inside, not even the server it's kept on."),
+        canSee
+          ? h("div", { class: "muted" }, about?.from ? `From ${about.from}. ` : "Someone sent you this. ", "Sealed end to end: only people with this link can see inside, not even the server it's kept on.")
+          : h("div", { class: "muted" }, about?.from ? `${about.from} is collecting files here. ` : "Someone is collecting files here. ", "Add yours: they're sealed on this device first, and only they can see what's in the box (not the other people adding, and not the server)."),
         expiresAt ? h("div", { class: "muted small" }, `The link works until ${new Date(expiresAt).toLocaleString()}.`) : null,
       ),
     ),
@@ -1863,7 +1974,9 @@ async function renderFriendView(secret) {
       { class: "card stack" },
       list,
       notice,
+      canAdd ? guestNameField() : null,
       canAdd ? h("div", { class: "row" }, h("button", { type: "button", onclick: () => picker.click() }, "+ Add files"), picker, h("span", { class: "muted small drop-hint" }, "or drop them here")) : null,
+      canAdd ? h("p", { class: "muted small" }, "Where photos and videos were taken is taken out of them first.") : null,
     ),
     h("p", { class: "muted small" }, "This is Cardboard: a private, end-to-end encrypted place for your things. Want your own? Ask whoever sent you this for an invite."),
   );
@@ -1877,6 +1990,7 @@ async function renderFriendView(secret) {
   }
   fill(app, page);
   await load();
+  if (!canSee) return;
   // Live: something added (by the sender, or another friend) shows up straight away.
   let timer = null;
   friendWatch = box.watch(
@@ -1887,6 +2001,18 @@ async function renderFriendView(secret) {
     },
     { onError: () => {} },
   );
+}
+
+function guestNameField() {
+  const input = h("input", { value: guestName() === "a friend" ? "" : guestName(), maxlength: 60, placeholder: "e.g. Siggi", autocomplete: "name" });
+  input.addEventListener("change", () => {
+    try {
+      localStorage.setItem("cardboard-guest-name", input.value.trim());
+    } catch {
+      // Then it says "a friend".
+    }
+  });
+  return h("label", { class: "field" }, "Your name (so they know who it's from)", input);
 }
 
 /** One thing in a friend box, opened: play, look at or download a file; read a note; open a link. */
@@ -2126,7 +2252,7 @@ async function renderPersonal(info, me, openKey, friend = null) {
     if (tidied) return;
     tidied = true;
     // Parts left by an upload that was cut off (the page closed part way): nothing lists them, so they go.
-    strayParts(box, things)
+    strayParts(box, things, Date.now(), resumingIds(info.id))
       .then((stray) => stray.length && purgeKeys(box, stray))
       .catch(() => {});
   }
@@ -2228,12 +2354,12 @@ async function renderPersonal(info, me, openKey, friend = null) {
         const progress = h("span", {}, `Sealing ${file.name}…`);
         say(progress, stopButton);
         try {
-          await addFile(box, file, {
+          const { note } = await sealFile(box, file, {
             signal: stop.signal,
             onProgress: (f, done) => (progress.textContent = `Sealing ${file.name}… ${Math.round(f * 100)}% (${bytes(done)} of ${bytes(file.size)})`),
           });
           room -= file.size;
-          say(h("span", {}, `Added ${file.name}. Sealed here before it left this device.`));
+          say(h("span", {}, `Added ${file.name}. Sealed here before it left this device.${note}`));
         } catch (err) {
           say(err.name === "AbortError" ? h("span", {}, `Stopped. Nothing of ${file.name} was kept.`) : errorBox(err));
           break;
@@ -2455,8 +2581,84 @@ async function renderPersonal(info, me, openKey, friend = null) {
     // No passwords in a friend box: everyone with the link would see them.
     (friend ? ["note", "link"] : ["note", "password", "link"]).map((k) => h("button", { type: "button", onclick: () => editThing(k) }, `+ ${NEW_LABEL[k]}`)),
     h("button", { type: "button", onclick: () => files.click() }, friend ? "+ Files" : "+ File"),
+    h("button", { type: "button", class: "secondary", onclick: () => duplicates() }, "Find duplicates"),
     files,
   );
+
+  /** Things that are here more than once: the same file (by its fingerprint), note, link or password. */
+  function duplicates() {
+    const groups = new Map();
+    for (const t of things) {
+      const v = t.value;
+      const key =
+        t.kind === "file"
+          ? v.sha256 && `file|${v.size}|${v.hashOf ?? ""}|${v.partSize ?? ""}|${v.sha256}`
+          : t.kind === "note"
+            ? `note|${v.title}|${v.text}`
+            : t.kind === "link"
+              ? `link|${v.url}`
+              : `password|${v.url}|${v.username}|${v.password}`;
+      if (!key) continue;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(t);
+    }
+    const sets = [...groups.values()].filter((g) => g.length > 1).map((g) => g.sort((a, b) => a.createdAt - b.createdAt));
+    if (!sets.length) {
+      openModal(null, h("h2", {}, "No duplicates"), h("p", {}, "Everything here is here once."), h("div", { class: "row" }, h("button", { type: "button", onclick: () => closeModal() }, "Good")));
+      return;
+    }
+    // The oldest of each stays; the copies are ticked to go.
+    const rows = sets.map((group) =>
+      group.map((t, i) => ({ t, input: h("input", { type: "checkbox", checked: i > 0, "aria-label": `Remove ${t.value.title}` }) })),
+    );
+    const status = h("div");
+    const go = h("button", { type: "button" }, "Remove the ticked copies");
+    const spare = sets.reduce((n, g) => n + g.slice(1).reduce((m, t) => m + (t.kind === "file" ? t.value.size : 0), 0), 0);
+    go.addEventListener("click", () =>
+      withBusy(go, async () => {
+        const gone = rows.flat().filter((r) => r.input.checked).map((r) => r.t);
+        if (rows.some((group) => group.every((r) => r.input.checked)) && !confirm("Every copy of something is ticked, so it would go altogether. Go ahead?")) return;
+        try {
+          for (const t of gone) await removeThing(box, t);
+          closeModal(false);
+          const undo = h("button", { type: "button", class: "secondary tiny" }, "Undo");
+          undo.addEventListener("click", () =>
+            withBusy(undo, async () => {
+              for (const t of gone) await restoreThing(box, t);
+              say();
+              await load();
+            }),
+          );
+          const free = h("button", { type: "button", class: "secondary tiny" }, "Free the space now");
+          free.addEventListener("click", () =>
+            withBusy(free, async () => {
+              if (!confirm("Delete the copies for good? It can't be undone after this.")) return;
+              await purgeKeys(box, gone.flatMap(keysOf));
+              say(h("span", {}, "The copies are gone for good."));
+            }),
+          );
+          say(h("span", {}, `Removed ${plural(gone.length, "copy").replace("copys", "copies")}. Their space comes back when their history runs out (${info.settings.historyDays} days), or now.`), h("span", { class: "row" }, undo, free));
+          await load();
+        } catch (err) {
+          status.replaceChildren(errorBox(err));
+        }
+      }),
+    );
+    openModal(
+      null,
+      h("h2", {}, `${plural(sets.length, "thing")} here more than once`),
+      h("p", { class: "small" }, "The same content, by its fingerprint (not just the same name). The oldest of each is kept", spare ? `; removing the copies frees ${bytes(spare)}.` : "."),
+      rows.map((group) =>
+        h(
+          "ul",
+          { class: "list dupes" },
+          group.map(({ t, input }) => h("li", { class: "row" }, input, h("span", { "aria-hidden": "true" }, iconOf(t)), h("span", {}, h("strong", {}, t.value.title), h("span", { class: "muted small" }, ` · ${t.kind === "file" ? `${bytes(t.value.size)} · ` : ""}added ${ago(t.createdAt)}${t.value.from ? ` from ${t.value.from}` : ""}`)))),
+        ),
+      ),
+      h("div", { class: "row" }, go, h("button", { type: "button", class: "secondary", onclick: () => closeModal() }, "Cancel")),
+      status,
+    );
+  }
   files.addEventListener("change", () => {
     const chosen = [...files.files];
     files.value = "";
@@ -3889,11 +4091,38 @@ async function renderYou() {
         "div",
         {},
         h("section", { class: "card stack" }, h("h2", {}, "If you lose every device"), h("p", { class: "small" }, "Pick how you'd get back in. Cardboard can't reset anything for you: that's what keeps everyone else out."), recovery),
+        privacyCard(me),
         await emergencyCard(),
         await inviteCard(me),
         h("section", { class: "card stack danger-zone" }, h("h2", {}, "Delete account"), h("p", { class: "small" }, "Everything goes: boxes, history, tapes, docks, connected apps, devices."), h("div", { class: "row" }, confirmDelete, deleteBtn), deleteStatus),
       ),
     ),
+  );
+}
+
+/** You → Privacy: whether photos and videos keep where they were taken. */
+function privacyCard(me) {
+  const strip = h("input", { type: "checkbox", checked: !me.profile.keepLocation });
+  const status = h("span", { class: "muted small" });
+  strip.addEventListener("change", async () => {
+    strip.disabled = true;
+    try {
+      await account.setKeepLocation(!strip.checked);
+      status.textContent = strip.checked ? "On." : "Off: photos and videos keep where they were taken.";
+    } catch (err) {
+      status.replaceChildren(errorBox(err));
+      strip.checked = !strip.checked;
+    } finally {
+      strip.disabled = false;
+    }
+  });
+  return h(
+    "section",
+    { class: "card stack" },
+    h("h2", {}, "Privacy"),
+    h("label", { class: "row small" }, strip, "Take where photos and videos were taken out of them, on this device, before they're sealed"),
+    h("p", { class: "muted small" }, "Phones write the place (GPS) into every photo and video. This takes only that out: the picture, the date and which way up it is stay. Files that friends add to your friend boxes always lose it."),
+    status,
   );
 }
 
@@ -3927,9 +4156,10 @@ function takeShareFromUrl() {
 function takeFriendFromUrl() {
   const secret = hashParam("friend");
   if (secret) {
-    pendingFriend = secret;
+    // A collection box's link also carries its title and who it's for (it can't read them from the box).
+    pendingFriend = JSON.stringify({ secret, title: hashParam("title"), from: hashParam("from") });
     try {
-      sessionStorage.setItem("cardboard-friend", secret);
+      sessionStorage.setItem("cardboard-friend", pendingFriend);
     } catch {
       // A private window may not keep it: then a reload needs the link again.
     }

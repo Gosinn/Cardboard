@@ -893,3 +893,19 @@ svg.qr,
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
+
+.plain-fieldset {
+  border: 0;
+  padding: 0;
+  margin: 0;
+}
+
+.plain-fieldset legend {
+  padding: 0;
+  margin-bottom: 4px;
+}
+
+ul.dupes {
+  border-bottom: 1px dashed var(--line, #e2d3bd);
+  padding-bottom: 8px;
+}

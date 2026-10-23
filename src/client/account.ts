@@ -64,8 +64,10 @@ export interface FriendLink {
   link: string;
   /** The tape behind it (to stop it). */
   tape: string;
-  /** Whether people with the link can add things too, not only open and download them. */
+  /** Whether people with the link can add things. */
   write: boolean;
+  /** Whether they can see what's in it. Without it (a collection box) they can only add. */
+  see: boolean;
   expiresAt: number | null;
 }
 
@@ -73,6 +75,8 @@ export interface FriendLinkOptions {
   /** What the people opening it see as its name. */
   title?: string;
   write?: boolean;
+  /** false: they can only add (a collection box). Default true. */
+  see?: boolean;
   /** "1d", "7d", "30d"…, or null to work until you stop it. */
   expires?: string | null;
 }
@@ -83,7 +87,7 @@ export interface Me {
   recovery: RecoveryPlan;
   recoveryReady: boolean;
   /** Sealed: only your devices read it. `personal` is the id of your personal box; `friends`, your friend boxes and their links. */
-  profile: { name?: string; email?: string; personal?: string; friends?: Record<string, FriendLink | null> };
+  profile: { name?: string; email?: string; personal?: string; friends?: Record<string, FriendLink | null>; keepLocation?: boolean };
   quota: { used: number; limit: number };
   device: { id: string; kind: DeviceKind; lock: "passkey" | null };
   devices: Array<{ id: string; kind: DeviceKind; lock: "passkey" | null; name: string; createdAt: number; lastSeenAt: number | null; current: boolean }>;
@@ -820,6 +824,9 @@ export class Account {
     const me = await this.me();
     const box = await this.box(boxName);
     if (box.shared) throw fail("not_your_box", 403, "Only the owner of a box can make a friend link for it.", "Make a friend box of your own.");
+    const see = options.see ?? true;
+    const write = options.write ?? !see;
+    if (!see && !write) throw fail("bad_request", 400, "A link that can neither see nor add would do nothing.", "Let them see what's in it, or add to it, or both.");
     const old = me.profile.friends?.[box.id];
     if (old) await this.revokeTape(old.tape).catch(() => undefined);
     const about = (await (await this.open(box)).get<{ title?: string }>(FRIEND_ABOUT).catch(() => null)) ?? {};
@@ -835,17 +842,25 @@ export class Account {
       bundle: toB64u(sealedBundle),
       label: await this.sealMeta("friend link", ctx.tapeLabel(box.id)),
       kind: "link",
-      read: true,
-      write: options.write ?? false,
+      read: see,
+      write,
       idle: null,
       expires: options.expires ?? null,
     });
     // Cardboard's public address, even when this device reaches it another way (like localhost on the computer it runs on).
     const base = (me.server.issuer || this.rpc.url).replace(/\/+$/, "");
-    const link: FriendLink = { link: `${base}/#friend=cbt_${toB64u(concat(token, tapeKey))}`, tape: res.tape.id, write: res.tape.write, expiresAt: res.tape.expiresAt };
+    // A link that can't see can't read the box's title either: it travels in the link (after the #, like the key).
+    const extra = see ? "" : `&title=${encodeURIComponent(title)}&from=${encodeURIComponent((me.profile.name ?? "").slice(0, 100))}`;
+    const link: FriendLink = { link: `${base}/#friend=cbt_${toB64u(concat(token, tapeKey))}${extra}`, tape: res.tape.id, write: res.tape.write, see: res.tape.read, expiresAt: res.tape.expiresAt };
     await this.writeProfile({ ...me.profile, friends: { ...me.profile.friends, [box.id]: link } });
     this.boxCache = null;
     return link;
+  }
+
+  /** Whether photos and videos keep where they were taken (off: the location is taken out on the device first). */
+  async setKeepLocation(keep: boolean): Promise<void> {
+    const me = await this.me();
+    await this.writeProfile({ ...me.profile, keepLocation: keep || undefined });
   }
 
   /** Stops a friend box's link: nobody can open the box with it any more. The box stays, with everything in it. */

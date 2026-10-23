@@ -216,7 +216,7 @@ export async function sendText(box: Box, text: string, from: string): Promise<Th
   return toThing((await box.getItem(key))!)!;
 }
 
-export function sendFile(box: Box, file: Blob, from: string, options: { name?: string; signal?: AbortSignal; onProgress?: (fraction: number, bytes: number) => void } = {}) {
+export function sendFile(box: Box, file: Blob, from: string, options: Omit<Parameters<typeof addFile>[2] & {}, "sentFrom"> = {}) {
   return addFile(box, file, { ...options, sentFrom: from });
 }
 
@@ -249,37 +249,97 @@ export async function restoreThing(box: Box, thing: Thing): Promise<void> {
 
 const hex = (bytes: Uint8Array) => [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
 
+/** A connection that dropped, or a server that's busy or restarting: worth trying again. */
+function passing(err: unknown): boolean {
+  const e = err as { code?: string; status?: number };
+  return e.code === "unreachable" || e.code === "slow_down" || (typeof e.status === "number" && e.status >= 500);
+}
+
+const wait = (ms: number, signal?: AbortSignal) =>
+  new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(resolve, ms);
+    signal?.addEventListener("abort", () => (clearTimeout(timer), reject(signal.reason)), { once: true });
+  });
+
+/** Runs `fn`, trying again a few times (waiting longer each time) when the connection drops. */
+async function patiently<T>(fn: () => Promise<T>, signal?: AbortSignal, firstWaitMs = 1000, tries = 5): Promise<T> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (attempt >= tries || !passing(err) || signal?.aborted) throw err;
+      await wait(firstWaitMs * 3 ** (attempt - 1), signal);
+    }
+  }
+}
+
+/** Why an upload stopped part way, and what's needed to carry on from there. */
+export interface UploadStopped {
+  /** The file's id: pass it back as `continueId` with the same file to send only what's missing. */
+  id: string;
+  /** How much of it the box already has. */
+  sentBytes: number;
+}
+
 /**
  * Seals a file into the box a part at a time (so it never has to fit in
  * memory), then writes the entry that lists it, so a file never shows up half
- * sent. If it fails or is stopped part way, the parts already sent are removed.
+ * sent. A dropped connection is tried again a few times. If it still fails,
+ * the parts already sent are removed, unless `keepPartsOnError`: then the
+ * error carries `stopped` ({ id, sentBytes }), and calling again with the same
+ * file and `continueId: id` sends only the parts that are missing. Stopping it
+ * (the signal) always removes what was sent.
  */
 export async function addFile(
   box: Box,
   file: Blob,
-  options: { name?: string; type?: string; title?: string; notes?: string; sentFrom?: string; signal?: AbortSignal; onProgress?: (fraction: number, bytes: number) => void } = {},
+  options: {
+    name?: string;
+    type?: string;
+    title?: string;
+    notes?: string;
+    sentFrom?: string;
+    signal?: AbortSignal;
+    onProgress?: (fraction: number, bytes: number) => void;
+    continueId?: string;
+    keepPartsOnError?: boolean;
+    /** How long to wait before the first try again (then three times longer each time). */
+    retryMs?: number;
+  } = {},
 ): Promise<Thing<FileValue>> {
   const name = (options.name ?? (file as File).name ?? "file").slice(0, 500) || "file";
   const size = file.size;
   if (size > MAX_FILE_BYTES) {
     throw fail("file_too_big", 413, `${name} is ${formatBytes(size)}; a file can be at most ${formatBytes(MAX_FILE_BYTES)}.`, "Split it, or keep a smaller copy.");
   }
-  const id = sortableId(Date.now());
+  const id = options.continueId && /^[\w-]{8,40}$/.test(options.continueId) ? options.continueId : sortableId(Date.now());
   const parts = Math.max(1, Math.ceil(size / FILE_PART_BYTES));
   const hashes = new Uint8Array(parts * 32);
-  const sent: string[] = [];
+  // Carrying on: the parts the box already has (from the same file, cut off before) aren't sent again.
+  const have = new Set<number>();
+  if (options.continueId) {
+    for (const key of await patiently(() => box.keys(`${FILE_DATA}${id}/`), options.signal, options.retryMs)) {
+      const n = Number(key.slice(`${FILE_DATA}${id}/`.length));
+      if (Number.isInteger(n) && n < parts) have.add(n);
+    }
+  }
+  const sent: string[] = [...have].map((n) => filePartKey(id, n));
+  let done = have.size;
   try {
     for (let first = 0; first < parts; first += PARTS_PER_REQUEST) {
       options.signal?.throwIfAborted();
-      const ops = [];
+      const ops: Array<{ op: "put"; key: string; value: Uint8Array }> = [];
       for (let n = first; n < Math.min(parts, first + PARTS_PER_REQUEST); n++) {
         const bytes = new Uint8Array(await file.slice(n * FILE_PART_BYTES, (n + 1) * FILE_PART_BYTES).arrayBuffer());
         hashes.set(await sha256(bytes), n * 32);
-        ops.push({ op: "put" as const, key: filePartKey(id, n), value: bytes });
+        if (!have.has(n)) ops.push({ op: "put" as const, key: filePartKey(id, n), value: bytes });
       }
-      await box.batch(ops);
-      sent.push(...ops.map((o) => o.key));
-      options.onProgress?.(sent.length / parts, Math.min(size, sent.length * FILE_PART_BYTES));
+      if (ops.length) {
+        await patiently(() => box.batch(ops), options.signal, options.retryMs);
+        sent.push(...ops.map((o) => o.key));
+        done += ops.length;
+      }
+      options.onProgress?.(done / parts, Math.min(size, done * FILE_PART_BYTES));
     }
     options.signal?.throwIfAborted();
     const value: FileValue = {
@@ -295,10 +355,24 @@ export async function addFile(
       ...(options.sentFrom !== undefined ? { inbox: true as const, from: options.sentFrom.slice(0, 100) } : {}),
     };
     const key = thingKey("file", id);
-    await box.put(key, value, { ifVersion: 0 });
-    return toThing((await box.getItem(key))!)! as Thing<FileValue>;
+    await patiently(() => box.put(key, value, { ifVersion: 0 }), options.signal, options.retryMs);
+    // A link that may only add (a collection box) can't read it back: what it wrote is what's there.
+    const item = await box.getItem(key).catch((err) => {
+      if ((err as { code?: string }).code === "write_only") return null;
+      throw err;
+    });
+    if (!item) return { kind: "file", id, key, value, version: 1, createdAt: Date.now(), updatedAt: Date.now() };
+    return toThing(item)! as Thing<FileValue>;
   } catch (err) {
-    for (let i = 0; i < sent.length; i += 200) await box.batch(sent.slice(i, i + 200).map((key) => ({ op: "delete" as const, key, purge: true }))).catch(() => {});
+    if (options.keepPartsOnError && !options.signal?.aborted && passing(err)) {
+      (err as { stopped?: UploadStopped }).stopped = { id, sentBytes: Math.min(size, done * FILE_PART_BYTES) };
+      throw err;
+    }
+    for (let i = 0; i < sent.length; i += 200) {
+      const chunk = sent.slice(i, i + 200);
+      // Gone for good when allowed; an app or link may only delete (history then lets them go in time).
+      await box.batch(chunk.map((key) => ({ op: "delete" as const, key, purge: true }))).catch(() => box.batch(chunk.map((key) => ({ op: "delete" as const, key }))).catch(() => {}));
+    }
     throw err;
   }
 }
@@ -389,8 +463,8 @@ export async function readFile(box: Box, file: Thing<FileValue>, onProgress?: (f
  * part way): parts with no file listing them, untouched for 6 hours, so an
  * upload still running on another device is left alone.
  */
-export async function strayParts(box: Box, things: Thing[], now = Date.now()): Promise<string[]> {
-  const files = new Set(things.filter((t) => t.kind === "file").map((t) => t.id));
+export async function strayParts(box: Box, things: Thing[], now = Date.now(), keep: Iterable<string> = []): Promise<string[]> {
+  const files = new Set([...things.filter((t) => t.kind === "file").map((t) => t.id), ...keep]);
   const byId = new Map<string, { keys: string[]; newest: number }>();
   for (const entry of await box.list(FILE_DATA, { limit: Infinity })) {
     const id = entry.key.slice(FILE_DATA.length).split("/")[0]!;
@@ -400,7 +474,8 @@ export async function strayParts(box: Box, things: Thing[], now = Date.now()): P
     group.newest = Math.max(group.newest, entry.updatedAt);
     byId.set(id, group);
   }
-  return [...byId.values()].filter((g) => g.newest < now - 6 * 60 * 60 * 1000).flatMap((g) => g.keys);
+  // Two days' grace: an upload cut off on another device may still be carried on.
+  return [...byId.values()].filter((g) => g.newest < now - 2 * 24 * 60 * 60 * 1000).flatMap((g) => g.keys);
 }
 
 /** Removes things for good (no undo), with their file parts: frees the space now rather than when their history runs out. */
