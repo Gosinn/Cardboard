@@ -1206,7 +1206,8 @@ function androidAppLink(label) {
 }
 
 /** The newest Cardboard app for Android (VERSION in android/…/MainActivity.java). */
-const ANDROID_APP_LATEST = 3;
+/** The oldest app that still works with this Cardboard: older ones are asked to update. Raise it only when an old app breaks. */
+const ANDROID_APP_NEEDED = 2;
 const ANDROID_APP_VERSION = Number(navigator.userAgent.match(/CardboardAndroid\/(\d+)/)?.[1] ?? 0);
 
 /** Inside an older Cardboard app: the new one, saved to the phone's Downloads through the app. */
@@ -1230,7 +1231,9 @@ function androidUpdateCard() {
 }
 
 function androidAppCard() {
-  if (IN_ANDROID_APP && ANDROID_APP_VERSION < ANDROID_APP_LATEST) return androidUpdateCard();
+  // Everything you see comes from your Cardboard, so it updates with it: the app itself only needs
+  // updating when an older one stops working (ANDROID_APP_NEEDED), not for every new version.
+  if (IN_ANDROID_APP && ANDROID_APP_VERSION < ANDROID_APP_NEEDED) return androidUpdateCard();
   if (!ON_ANDROID) return null;
   return h(
     "section",
@@ -1513,6 +1516,16 @@ async function renderSend() {
   // Shown first, and sent only when you say so: a web page (or another app) can send things here
   // too, and nothing should land in your Cardboard that you didn't mean to keep.
   const files = shared.files ?? [];
+  // Phones sometimes hand Cardboard the same share again (an app reopened from Recents): it says so.
+  // Kept as a fingerprint only, never what was shared.
+  const print = toBase64(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify([shared.text ?? "", files.map((f) => [f.name, f.size])])))));
+  let sentBefore = [];
+  try {
+    sentBefore = (JSON.parse(recall("cardboard-sent-shares") ?? "[]") ?? []).filter((s) => Date.now() - s.at < 2 * 24 * 60 * 60_000);
+  } catch {
+    sentBefore = [];
+  }
+  const already = sentBefore.find((s) => s.print === print);
   const send = await new Promise((resolve) => {
     const yes = h("button", { type: "button" }, "Send to my devices");
     const no = h("button", { type: "button", class: "secondary" }, "Don't send");
@@ -1520,7 +1533,7 @@ async function renderSend() {
     no.addEventListener("click", () => resolve(false));
     fill(
       status,
-      h("p", {}, "This was shared to Cardboard. Send it to your devices?"),
+      already ? h("p", { class: "insight warn small" }, `You already sent this ${ago(already.at)}. Send it again?`) : h("p", {}, "This was shared to Cardboard. Send it to your devices?"),
       shared.text ? h("div", { class: "note-text card-inset" }, shared.text.length > 600 ? `${shared.text.slice(0, 600)}…` : shared.text) : null,
       files.length ? h("ul", { class: "list small" }, files.map((f) => h("li", {}, `📎 ${f.name} · ${bytes(f.size ?? 0)}`))) : null,
       h("div", { class: "row" }, yes, no),
@@ -1536,6 +1549,7 @@ async function renderSend() {
   try {
     await sendNow(box, thisDeviceName(me), shared.text ?? "", files, status);
     await shared.done?.();
+    remember("cardboard-sent-shares", JSON.stringify([...sentBefore.filter((s) => s.print !== print), { print, at: Date.now() }].slice(-20)));
     // Not #/ itself, or "Go to your shelf" (#/) would go nowhere.
     history.replaceState(null, "", "#/send");
     fill(status, h("p", {}, h("span", { class: "chip ok" }, "Sent"), " It's on your other devices now."), h("a", { href: "#/" }, "Go to your shelf"));

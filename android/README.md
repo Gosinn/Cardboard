@@ -32,4 +32,4 @@ Needs a JDK (17 or newer), `curl`, `zip` and Node, on Linux or macOS. No Android
 
 It signs with `~/.cardboard/android-key.p12` (or `CARDBOARD_ANDROID_KEY`), made the first time. **Keep that file private and keep it**: Android installs an update over the app only if it's signed with the same key. With a new key, uninstall the old app first and pair the phone again.
 
-Most changes don't need a new app at all: the app shows whatever your Cardboard serves, so updating Cardboard updates what you see.
+Most changes don't need a new app at all: the app shows whatever your Cardboard serves, so updating Cardboard updates what you see. The app is kept as small as it can be so it rarely has to change, and anything that can be done in the page is done there. Cardboard asks people to update the app only when an older one stops working (`ANDROID_APP_NEEDED` in `public/app.js`); a newer one is there for new installs.
