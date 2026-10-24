@@ -1,6 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android" package="io.github.gosinn.cardboard">
   <uses-permission android:name="android.permission.INTERNET" />
+  <!-- Installing apps you open with Cardboard (Android asks you to allow it, and to say yes to each one). -->
+  <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+  <!-- Seeing whether an app you're about to install is already on the phone, and which version. -->
+  <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
   <!-- No backups and no phone-to-phone copies: this app's storage holds the device key the
        dashboard keeps. A new phone is paired, never copied. -->
   <application
@@ -26,6 +30,12 @@
         <action android:name="android.intent.action.SEND" />
         <category android:name="android.intent.category.DEFAULT" />
         <data android:mimeType="*/*" />
+      </intent-filter>
+      <!-- "Open with Cardboard": an app to install, or any file to fix, convert or keep. -->
+      <intent-filter>
+        <action android:name="android.intent.action.VIEW" />
+        <category android:name="android.intent.category.DEFAULT" />
+        <data android:scheme="content" android:mimeType="*/*" />
       </intent-filter>
       <intent-filter>
         <action android:name="android.intent.action.SEND_MULTIPLE" />

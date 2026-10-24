@@ -101,6 +101,7 @@ export function targetsFor(files) {
     t.push({ id: "pdf-images", label: files.length > 1 ? "One PDF of them all" : "PDF", many: true });
     if (files.length > 1) t.push({ id: "gif-images", label: "An animated GIF of them", many: true });
     t.push({ id: "ico", label: "Icon (.ico)" });
+    t.push({ id: "rotate-right", label: "Turned right ↻" }, { id: "rotate-left", label: "Turned left ↺" }, { id: "rotate-180", label: "Upside down" }, { id: "flip", label: "Mirrored" });
   }
   if (only("video")) t.push({ id: "gif-video", label: "Animated GIF (a clip)" }, { id: "frame", label: "A still picture (JPEG)" }, { id: "opus", label: "Just the sound (Opus .ogg, small)" }, { id: "wav", label: "Just the sound (WAV, any player)" });
   if (only("audio")) t.push({ id: "opus", label: "Opus .ogg (small)" }, { id: "wav", label: "WAV (any player)" });
@@ -147,6 +148,27 @@ export async function convert(target, files, options = {}) {
         const blob = await canvasBlob(await drawn(f, options.maxSide, target === "jpeg"), type, options.quality ?? 0.9);
         if (blob.type !== type) throw new Error(`This browser can't make ${target.toUpperCase()} pictures. Try another kind (PNG always works).`);
         return out(name(f, target === "jpeg" ? "jpg" : target), type, blob);
+      });
+    case "rotate-right":
+    case "rotate-left":
+    case "rotate-180":
+    case "flip":
+      // Changed, and kept as the same kind of picture (PNG when the browser can't write that kind).
+      return each(async (f) => {
+        const img = await loadImage(f);
+        const quarter = target === "rotate-right" || target === "rotate-left";
+        const canvas = sized(quarter ? img.height : img.width, quarter ? img.width : img.height);
+        const ctx = canvas.getContext("2d");
+        ctx.translate(canvas.width / 2, canvas.height / 2);
+        if (target === "flip") ctx.scale(-1, 1);
+        else ctx.rotate({ "rotate-right": Math.PI / 2, "rotate-left": -Math.PI / 2, "rotate-180": Math.PI }[target]);
+        ctx.drawImage(pixels(img), -img.width / 2, -img.height / 2, img.width, img.height);
+        img.close?.();
+        const wanted = /^image\/(jpeg|png|webp)$/.test(f.type) ? f.type : "image/png";
+        let blob = await canvasBlob(canvas, wanted, 0.92);
+        if (blob.type !== wanted) blob = await canvasBlob(canvas, "image/png");
+        const ext = { "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp" }[blob.type] ?? "png";
+        return out(`${baseOf(f.name)} (${{ "rotate-right": "turned", "rotate-left": "turned", "rotate-180": "turned", flip: "mirrored" }[target]}).${ext}`, blob.type, blob);
       });
     case "ico":
       return each(async (f) => {

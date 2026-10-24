@@ -7,6 +7,14 @@ import android.content.ClipboardManager;
 import android.content.ContentResolver;
 import android.content.ContentValues;
 import android.content.Intent;
+import android.content.pm.PackageInfo;
+import android.content.pm.PackageInstaller;
+import android.content.pm.PackageManager;
+import android.content.pm.Signature;
+import android.app.DownloadManager;
+import android.app.PendingIntent;
+import android.os.LocaleList;
+import android.provider.Settings;
 import android.content.SharedPreferences;
 import android.content.res.Configuration;
 import android.database.Cursor;
@@ -49,6 +57,7 @@ import android.widget.Toast;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -68,7 +77,7 @@ import org.json.JSONObject;
  * talks to the page only through a message port it hands to your Cardboard's address alone.
  */
 public class MainActivity extends Activity {
-  static final String VERSION = "3";
+  static final String VERSION = "4";
   static final int PICK_FILES = 1;
   /** The most the page reads or writes in one message, in bytes (it travels as base64). */
   static final int PIECE_MAX = 1 << 20;
@@ -98,6 +107,11 @@ public class MainActivity extends Activity {
   volatile Shared shared;
   final Map<Integer, Saving> saving = new HashMap<>();
   int nextSave = 1;
+  /** Apps being installed: the parts being written into each install session, and how each one ended. */
+  final Map<Integer, Map<String, OutputStream>> installing = new HashMap<>();
+  final Map<Integer, String[]> installed = new HashMap<>();
+  static final String INSTALL_RESULT = "io.github.gosinn.cardboard.INSTALL_RESULT";
+
 
   @Override
   protected void onCreate(Bundle state) {
@@ -124,20 +138,29 @@ public class MainActivity extends Activity {
     boolean sharing = fresh && take(getIntent());
     setIntent(new Intent(Intent.ACTION_MAIN));
     if (origin == null) ask(null);
-    else open(sharing ? sendPath() : "/");
+    else open(sharing ? pathFor(shared) : "/");
   }
 
   @Override
   protected void onNewIntent(Intent intent) {
     super.onNewIntent(intent);
+    if (INSTALL_RESULT.equals(intent.getAction())) {
+      installResult(intent);
+      return;
+    }
     boolean sharing = take(intent);
     setIntent(new Intent(Intent.ACTION_MAIN));
-    if (sharing && origin != null) open(sendPath());
+    if (sharing && origin != null) open(pathFor(shared));
   }
 
   /** The dashboard's "Send to yourself" page; a fresh path each time, so the page sees the change. */
   static String sendPath() {
     return "/#/send?app=" + System.currentTimeMillis();
+  }
+
+  /** A file opened with Cardboard ("Open with") goes to the page that installs, fixes or keeps it; a share, to Send. */
+  static String pathFor(Shared s) {
+    return s != null && s.opened ? "/#/open?app=" + System.currentTimeMillis() : sendPath();
   }
 
   boolean night() {
@@ -339,6 +362,7 @@ public class MainActivity extends Activity {
       closeShared();
       for (Saving s : saving.values()) s.abandon(getContentResolver());
       saving.clear();
+
     });
     io.shutdown();
     if (web != null) web.destroy();
@@ -394,7 +418,7 @@ public class MainActivity extends Activity {
         if (s == null) return out.put("none", true);
         JSONArray files = new JSONArray();
         for (int i = 0; i < s.uris.size(); i++) files.put(describe(resolver, s.uris.get(i)).put("n", i));
-        return out.put("text", s.text).put("files", files);
+        return out.put("text", s.text).put("files", files).put("opened", s.opened);
       }
       case "read": {
         Shared s = shared;
@@ -443,9 +467,168 @@ public class MainActivity extends Activity {
         main.post(() -> toast("Saved in Downloads › Cardboard: " + s.name));
         return out.put("where", "Downloads › Cardboard");
       }
+      case "device": {
+        JSONArray abis = new JSONArray();
+        for (String a : Build.SUPPORTED_ABIS) abis.put(a);
+        JSONArray languages = new JSONArray();
+        LocaleList locales = LocaleList.getDefault();
+        for (int i = 0; i < locales.size(); i++) languages.put(locales.get(i).toLanguageTag());
+        return out.put("abis", abis).put("dpi", getResources().getDisplayMetrics().densityDpi).put("languages", languages).put("sdk", Build.VERSION.SDK_INT)
+            .put("canInstall", getPackageManager().canRequestPackageInstalls()).put("model", Build.MANUFACTURER + " " + Build.MODEL);
+      }
+      case "allow-installs": {
+        // Android's own switch: "Install unknown apps" for Cardboard. The page asks again when you're back.
+        Intent settings = new Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:" + getPackageName()));
+        main.post(() -> startActivity(settings));
+        return out;
+      }
+      case "installed": {
+        String name = m.getString("package");
+        try {
+          PackageInfo info = getPackageManager().getPackageInfo(name, PackageManager.GET_SIGNING_CERTIFICATES);
+          Signature[] signers = info.signingInfo == null ? new Signature[0] : info.signingInfo.hasMultipleSigners() ? info.signingInfo.getApkContentsSigners() : info.signingInfo.getSigningCertificateHistory();
+          JSONArray prints = new JSONArray();
+          for (Signature sig : signers) prints.put(hex(MessageDigest.getInstance("SHA-256").digest(sig.toByteArray())));
+          return out.put("versionName", info.versionName == null ? "" : info.versionName).put("versionCode", info.getLongVersionCode()).put("signers", prints);
+        } catch (PackageManager.NameNotFoundException e) {
+          return out.put("none", true);
+        }
+      }
+      case "install-start": {
+        PackageInstaller.SessionParams params = new PackageInstaller.SessionParams(PackageInstaller.SessionParams.MODE_FULL_INSTALL);
+        String name = m.optString("package");
+        if (!name.isEmpty()) params.setAppPackageName(name);
+        if (m.optLong("size") > 0) params.setSize(m.optLong("size"));
+        int id = getPackageManager().getPackageInstaller().createSession(params);
+        installing.put(id, new HashMap<>());
+        return out.put("handle", id);
+      }
+      case "install-write": {
+        int id = m.getInt("handle");
+        Map<String, OutputStream> parts = installing.get(id);
+        if (parts == null) throw new IOException("This install was stopped. Start it again.");
+        String part = m.getString("name").replaceAll("[^\\w.-]", "_");
+        OutputStream stream = parts.get(part);
+        if (stream == null) {
+          PackageInstaller.Session session = getPackageManager().getPackageInstaller().openSession(id);
+          stream = session.openWrite(part, 0, m.optLong("size", -1));
+          parts.put(part, stream);
+        }
+        stream.write(Base64.decode(m.getString("data"), Base64.NO_WRAP));
+        return out;
+      }
+      case "install-commit": {
+        int id = m.getInt("handle");
+        Map<String, OutputStream> parts = installing.remove(id);
+        if (parts == null) throw new IOException("This install was stopped. Start it again.");
+        PackageInstaller.Session session = getPackageManager().getPackageInstaller().openSession(id);
+        for (OutputStream stream : parts.values()) {
+          session.fsync(stream);
+          stream.close();
+        }
+        Intent back = new Intent(this, MainActivity.class).setAction(INSTALL_RESULT).putExtra("handle", id).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP);
+        // Android fills in how it went, so the intent has to stay changeable.
+        int flags = PendingIntent.FLAG_UPDATE_CURRENT | (Build.VERSION.SDK_INT >= 31 ? 0x02000000 : 0);
+        installed.put(id, new String[] {"waiting", ""});
+        session.commit(PendingIntent.getActivity(this, id, back, flags).getIntentSender());
+        session.close();
+        return out;
+      }
+      case "install-status": {
+        String[] status = installed.get(m.getInt("handle"));
+        if (status == null) return out.put("status", "unknown");
+        return out.put("status", status[0]).put("message", status[1]);
+      }
+      case "install-abandon": {
+        int id = m.getInt("handle");
+        Map<String, OutputStream> parts = installing.remove(id);
+        if (parts != null) for (OutputStream stream : parts.values()) stream.close();
+        try {
+          getPackageManager().getPackageInstaller().abandonSession(id);
+        } catch (SecurityException ignored) {
+          // Already finished or gone.
+        }
+        return out;
+      }
+      case "download": {
+        // Android's own downloader: it carries on when the connection drops, works for files of any size,
+        // keeps going with Cardboard closed, and says when it's done. Straight from the site to this phone.
+        Uri url = Uri.parse(m.getString("url"));
+        if (!"https".equals(url.getScheme()) && !"http".equals(url.getScheme())) throw new IOException("Only web addresses (https://…) can be downloaded.");
+        String name = cleanName(m.optString("name", ""));
+        if (name.equals("file")) name = cleanName(url.getLastPathSegment());
+        DownloadManager.Request request = new DownloadManager.Request(url)
+            .setTitle(name)
+            .setDescription("Cardboard")
+            .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+            .setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, "Cardboard/" + name);
+        long id = ((DownloadManager) getSystemService(DOWNLOAD_SERVICE)).enqueue(request);
+        return out.put("id", id).put("name", name);
+      }
+      case "download-status": {
+        DownloadManager dm = (DownloadManager) getSystemService(DOWNLOAD_SERVICE);
+        try (Cursor c = dm.query(new DownloadManager.Query().setFilterById(m.getLong("id")))) {
+          if (c == null || !c.moveToFirst()) return out.put("state", "gone");
+          int status = c.getInt(c.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS));
+          String state = status == DownloadManager.STATUS_SUCCESSFUL ? "done" : status == DownloadManager.STATUS_FAILED ? "failed" : status == DownloadManager.STATUS_PAUSED ? "waiting" : "running";
+          return out.put("state", state)
+              .put("bytes", c.getLong(c.getColumnIndexOrThrow(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR)))
+              .put("size", c.getLong(c.getColumnIndexOrThrow(DownloadManager.COLUMN_TOTAL_SIZE_BYTES)))
+              .put("name", c.getString(c.getColumnIndexOrThrow(DownloadManager.COLUMN_TITLE)))
+              .put("reason", c.getInt(c.getColumnIndexOrThrow(DownloadManager.COLUMN_REASON)));
+        }
+      }
+      case "download-open": {
+        // A finished download, handed to the page like a file opened with Cardboard (to install, fix or keep).
+        Uri uri = ((DownloadManager) getSystemService(DOWNLOAD_SERVICE)).getUriForDownloadedFile(m.getLong("id"));
+        if (uri == null) throw new IOException("That download isn't on the phone any more.");
+        Shared old = shared;
+        Shared now = new Shared("", new ArrayList<>(Arrays.asList(uri)));
+        now.opened = true;
+        shared = now;
+        if (old != null) old.close();
+        return out;
+      }
       default:
         throw new IOException("This Cardboard app is older than your Cardboard. Install the new app.");
     }
+  }
+
+  static String hex(byte[] bytes) {
+    StringBuilder out = new StringBuilder();
+    for (byte b : bytes) out.append(String.format("%02x", b));
+    return out.toString();
+  }
+
+  /** How an install ended (or that Android needs you to say yes first: then it asks). */
+  void installResult(Intent intent) {
+    int id = intent.getIntExtra("handle", -1);
+    int status = intent.getIntExtra(PackageInstaller.EXTRA_STATUS, PackageInstaller.STATUS_FAILURE);
+    String message = intent.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE);
+    if (status == PackageInstaller.STATUS_PENDING_USER_ACTION) {
+      Intent confirm = intent.getParcelableExtra(Intent.EXTRA_INTENT);
+      if (confirm != null) {
+        try {
+          startActivity(confirm.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+          return;
+        } catch (ActivityNotFoundException e) {
+          message = "Android's installer didn't open.";
+        }
+      }
+    }
+    String word;
+    switch (status) {
+      case PackageInstaller.STATUS_SUCCESS: word = "installed"; break;
+      case PackageInstaller.STATUS_FAILURE_ABORTED: word = "cancelled"; break;
+      case PackageInstaller.STATUS_FAILURE_BLOCKED: word = "blocked"; break;
+      case PackageInstaller.STATUS_FAILURE_CONFLICT: word = "conflict"; break;
+      case PackageInstaller.STATUS_FAILURE_INCOMPATIBLE: word = "incompatible"; break;
+      case PackageInstaller.STATUS_FAILURE_INVALID: word = "invalid"; break;
+      case PackageInstaller.STATUS_FAILURE_STORAGE: word = "storage"; break;
+      default: word = "failed";
+    }
+    final String said = message == null ? "" : message;
+    io.execute(() -> installed.put(id, new String[] {word, said}));
   }
 
   static void put(JSONObject o, String key, Object value) {
@@ -484,6 +667,8 @@ public class MainActivity extends Activity {
   static final class Shared {
     final String text;
     final List<Uri> uris;
+    /** Opened with Cardboard (a file tapped in Files or a download), rather than shared to it. */
+    boolean opened;
     InputStream in;
     int inFile = -1;
     long inAt;
@@ -537,9 +722,11 @@ public class MainActivity extends Activity {
     if (intent == null) return false;
     String action = intent.getAction();
     boolean one = Intent.ACTION_SEND.equals(action);
-    if (!one && !Intent.ACTION_SEND_MULTIPLE.equals(action)) return false;
+    boolean view = Intent.ACTION_VIEW.equals(action) && intent.getData() != null;
+    if (!one && !view && !Intent.ACTION_SEND_MULTIPLE.equals(action)) return false;
     List<Uri> found = new ArrayList<>();
-    if (one) {
+    if (view) found.add(intent.getData());
+    else if (one) {
       Uri u = intent.getParcelableExtra(Intent.EXTRA_STREAM);
       if (u != null) found.add(u);
     } else {
@@ -558,8 +745,10 @@ public class MainActivity extends Activity {
     if (body != null) text.append(body);
     String t = text.toString().trim();
     if (t.isEmpty() && uris.isEmpty()) return false;
+    if (view && uris.isEmpty()) return false;
     Shared old = shared;
     shared = new Shared(t, uris);
+    shared.opened = view;
     if (old != null) io.execute(old::close);
     return true;
   }

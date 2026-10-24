@@ -142,6 +142,20 @@ For the video Discord won't take, or the folder you'd otherwise put in a shared 
 
 Not yet: iPhone photos (HEIC), PDFs into pictures or text, making videos smaller. It says so rather than pretending.
 
+## Install apps, fix files, download links
+
+- **Install apps (Android).** Open an `.apk`, or a bundle from APKMirror (`.apkm`), SAI (`.apks`) or APKPure (`.xapk`), with the Cardboard app: from Files (*Open with Cardboard*), from a box, or downloaded with *Download a link*. It reads the app on the phone: its name, version, size, the Android it needs, its permissions, and **who signed it** (the SHA-256 that APKMirror shows, so you can tell it's the real app). It compares that with the copy already on the phone (an update, the same version, an older one, or signed by someone else) and installs just the parts the phone needs (its processor, screen density and languages), which you can change.
+- **Fix a broken file** (Convert → *Fix a broken file*, or *Fix it* on any file): it looks for the ways files really get broken and fixes them into a copy.
+  - A file named wrong (a PNG called `.jpg`, no extension) gets the right name.
+  - A picture, GIF or PNG that was cut off is closed off so it opens, and wrong PNG checksums are put right.
+  - A zip, Word or Excel file with a damaged or missing table of contents is rebuilt from the files that are whole.
+  - A PDF whose table of contents points to the wrong places is rebuilt.
+  - A recording stopped half way (WAV) gets its length counted again.
+  - Text saved in an old encoding, or scrambled (`Ã©` for `é`), is turned back into proper letters, and JSON with comments or stray commas is cleaned up.
+  - Some things can't be fixed here, and it says so: a video whose index never got written, or a damaged app (fixing it would break its signature).
+- **Download a link (Android).** The phone downloads it straight from the site with Android's own downloader (it carries on when the connection drops), then you can install it, fix it or keep it.
+- **Change pictures:** Convert turns them right or left, upside down, or mirrored.
+
 ## Your personal box
 
 Not everything belongs to an app. On your shelf, *Make my personal box* gives you one box that's just for you: **notes, passwords, links and files** (photos, videos, music, PDFs, anything up to 20 GB each), added and edited right in the dashboard, on your phone or your laptop. Every device you've signed in on opens it.

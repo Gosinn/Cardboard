@@ -45,6 +45,11 @@ async function through(data: Uint8Array, stream: CompressionStream | Decompressi
   }
 }
 
+/** Unpacks raw deflate data (a zip entry's), stopping past `limit` bytes. */
+export function inflateRaw(data: Uint8Array, limit = ZIP_LIMIT): Promise<Uint8Array> {
+  return through(data, new DecompressionStream("deflate-raw"), limit);
+}
+
 /** What a .zip may unpack to here, in all: more than a phone can hold in memory at once. */
 export const ZIP_LIMIT = 1024 * 1024 * 1024;
 const tooBig = () => fail("zip_too_big", 413, "That .zip unpacks to over 1 GB, more than this can open at once.", "Open it on a computer, or zip fewer files together.");

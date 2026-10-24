@@ -7,6 +7,8 @@ import { qrEncode, qrPath } from "/lib/shared/qr.ts";
 import { describeDuration } from "/lib/shared/duration.ts";
 import { toName } from "/lib/shared/names.ts";
 import { createPasskey, hasBuiltInPasskeys, passkeyBlocker, passkeySecret } from "/lib/client/passkey.ts";
+import { androidVersion, cantRun, isAppFileName, itemStream, partsFor, readAppFile, zipItems } from "/lib/client/apk.ts";
+import { repairFile } from "/lib/client/repair.ts";
 import {
   addFile,
   FILE_DATA,
@@ -584,7 +586,7 @@ async function takeAndroidShare() {
     }
     files.push(new File(parts, f.name, { type: f.type }));
   }
-  return { text: shared.text, files, done: () => androidCall("share-done").catch(() => {}) };
+  return { text: shared.text, files, opened: Boolean(shared.opened), done: () => androidCall("share-done").catch(() => {}) };
 }
 
 function lockIfIdle() {
@@ -1314,7 +1316,15 @@ async function sendCard(me, personal, onChange = () => {}) {
     h("h2", {}, "Send to yourself"),
     text,
     attached,
-    h("div", { class: "row" }, send, h("button", { type: "button", class: "secondary", onclick: () => picker.click() }, "Attach files"), picker, h("span", { class: "muted small" }, "Sealed here, then it's on every device you're signed in on.")),
+    h(
+      "div",
+      { class: "row" },
+      send,
+      h("button", { type: "button", class: "secondary", onclick: () => picker.click() }, "Attach files"),
+      picker,
+      ANDROID_APP_VERSION >= 4 ? h("button", { type: "button", class: "secondary", onclick: () => downloadLink(status) }, "Download a link") : null,
+      h("span", { class: "muted small" }, "Sealed here, then it's on every device you're signed in on."),
+    ),
     status,
     arrived,
   );
@@ -1556,6 +1566,330 @@ async function renderSend() {
   } catch (err) {
     fill(status, errorBox(err), h("a", { href: "#/" }, "Go to your shelf"));
   }
+}
+
+// ── Apps to install, files to fix, and files opened with Cardboard ──────────
+
+/** The Cardboard app installs apps from version 4 (older ones can't ask Android for that). */
+const ANDROID_CAN_INSTALL = IN_ANDROID_APP && ANDROID_APP_VERSION >= 4;
+const FORMAT_WORDS = { apk: "an APK", apkm: "an APKMirror bundle (.apkm)", apks: "an app bundle (.apks)", xapk: "an XAPK bundle" };
+const languageName = (code) => {
+  try {
+    return new Intl.DisplayNames([navigator.language], { type: "language" }).of(code.replace(/^b\+/, "").replace(/_r?/, "-")) || code;
+  } catch {
+    return code;
+  }
+};
+
+/** What's in an app file (name, version, who signed it, the parts for this phone), and installing it, as APKMirror's installer does. */
+function appCard(source) {
+  const card = h("section", { class: "card stack app-card" }, h("p", { class: "muted" }, "Looking inside the app…"));
+  const draw = async () => {
+    const phone = ANDROID_CAN_INSTALL ? await androidCall("device").catch(() => null) : null;
+    const app = await readAppFile(source, { languages: phone?.languages ?? navigator.languages ?? [] });
+    const there = phone && app.package ? await androidCall("installed", { package: app.package }).catch(() => null) : null;
+    const fallback = { abis: [], dpi: 0, languages: [...(navigator.languages ?? [])], sdk: 0 };
+    const chosen = new Set(partsFor(app, phone ?? fallback));
+    const name = app.label || app.package;
+    const short = app.signer ? app.signer.sha256.slice(0, 16).replace(/(..)(?=.)/g, "$1:") : "";
+
+    // How it compares with what's on this phone.
+    let compare = null;
+    if (there && !there.none) {
+      const sameSigner = !app.signer || there.signers.includes(app.signer.sha256);
+      if (!sameSigner)
+        compare = h(
+          "p",
+          { class: "insight danger small" },
+          `This is signed by someone else than the ${name} on this phone. Android won't install it over that one, and it may not be the real app. Only install it if you trust where it came from: you'd uninstall the other one first, and its data goes with it.`,
+        );
+      else if (app.versionCode !== null && app.versionCode > there.versionCode) compare = h("p", { class: "insight tip small" }, `An update: ${there.versionName || there.versionCode} → ${app.versionName || app.versionCode}. Your data in it stays.`);
+      else if (app.versionCode === there.versionCode) compare = h("p", { class: "muted small" }, "This version is already on this phone. Installing it again keeps its data.");
+      else compare = h("p", { class: "insight warn small" }, `This is older than the version on this phone (${there.versionName || there.versionCode}). Android won't put an older version over a newer one: uninstall it first, and its data goes with it.`);
+    } else if (there?.none) compare = h("p", { class: "muted small" }, "Not on this phone yet.");
+
+    const problem = phone ? cantRun(app, phone) : null;
+    const parts = app.parts.length > 1
+      ? h(
+          "details",
+          {},
+          h(
+            "summary",
+            {},
+            `Installs ${[...chosen].length} of its ${app.parts.length} parts${phone ? ", the ones for this phone" : ""}: ${[...chosen]
+              .filter((p) => p.kind !== "base")
+              .map((p) => (p.kind === "abi" ? `${p.value} processor` : p.kind === "density" ? `${p.value} screen` : p.kind === "language" ? languageName(p.value) : p.value))
+              .join(", ") || "just the base"}`,
+          ),
+          h(
+            "div",
+            { class: "stack small" },
+            app.parts.map((p) => {
+              const box = h("input", { type: "checkbox", checked: chosen.has(p), disabled: p.kind === "base" });
+              box.addEventListener("change", () => (box.checked ? chosen.add(p) : chosen.delete(p)));
+              return h("label", { class: "choice" }, box, h("span", {}, `${p.kind === "base" ? "The app itself" : p.kind === "abi" ? `Processor: ${p.value}` : p.kind === "density" ? `Screen: ${p.value}` : p.kind === "language" ? `Language: ${languageName(p.value)}` : `Feature: ${p.value}`} · ${bytes(p.size)}`));
+            }),
+          ),
+        )
+      : null;
+
+    const status = h("div", { class: "stack" });
+    let action;
+    if (!IN_ANDROID_APP) action = h("p", { class: "muted small" }, ON_ANDROID ? ["To install it, open it in the Cardboard app on this phone. ", androidAppLink("Get the app")] : "To install it, open it on your Android phone, in the Cardboard app.");
+    else if (!ANDROID_CAN_INSTALL) action = h("div", { class: "stack" }, h("p", { class: "small" }, "Installing apps needs the new Cardboard app (once: Android only lets an app install apps if it asked for that when it was built)."), androidUpdateCard());
+    else if (problem) action = h("p", { class: "insight danger small" }, problem);
+    else if (!phone?.canInstall) {
+      const allow = h("button", { type: "button" }, "Allow Cardboard to install apps");
+      allow.addEventListener("click", () => androidCall("allow-installs").catch((err) => status.replaceChildren(errorBox(err))));
+      const again = () => {
+        if (!card.isConnected) return document.removeEventListener("visibilitychange", again);
+        if (document.visibilityState === "visible") (document.removeEventListener("visibilitychange", again), draw().catch((err) => fill(card, errorBox(err))));
+      };
+      document.addEventListener("visibilitychange", again);
+      action = h("div", { class: "stack" }, h("p", { class: "small" }, "First, Android needs your OK for Cardboard to install apps: switch on “Allow from this source”, then come back."), h("div", { class: "row" }, allow));
+    } else {
+      const install = h("button", { type: "button" }, there && !there.none ? "Update" : "Install");
+      install.addEventListener("click", () => withBusy(install, () => installApp(source, app, [...chosen], status)));
+      action = h("div", { class: "row" }, install);
+    }
+
+    fill(
+      card,
+      h("h2", {}, `📱 ${name}`),
+      h("div", { class: "muted small" }, [app.package, app.versionName ? `version ${app.versionName}` : null, bytes(source.size), FORMAT_WORDS[app.format]].filter(Boolean).join(" · ")),
+      app.minSdk ? h("div", { class: "muted small" }, `Needs Android ${androidVersion(app.minSdk)} or newer.`) : null,
+      app.signer
+        ? h("details", { class: "small" }, h("summary", {}, `Signed by ${app.signer.name ?? "an unnamed key"} · ${short}…`), h("p", { class: "mono small", style: "overflow-wrap:anywhere" }, `SHA-256 ${app.signer.sha256}`), h("p", { class: "muted small" }, "Compare it with the one the app's maker publishes (APKMirror shows it on each download page) to know it's the real app."))
+        : h("p", { class: "insight warn small" }, "It isn't signed, so Android won't install it."),
+      compare,
+      parts,
+      app.extras.length ? h("p", { class: "muted small" }, `It also holds ${plural(app.extras.length, "file")} of game data (Android/obb) that installing doesn't put in place: copy ${app.extras.length === 1 ? "it" : "them"} with a file manager if the app asks.`) : null,
+      app.permissions.length ? h("details", { class: "small" }, h("summary", {}, `Asks for ${plural(app.permissions.length, "permission")}`), h("ul", { class: "small mono" }, app.permissions.map((p) => h("li", {}, p.replace(/^android\.permission\./, ""))))) : null,
+      action,
+      status,
+    );
+  };
+  draw().catch((err) => fill(card, h("h2", {}, "📱 An app?"), errorBox(err)));
+  return card;
+}
+
+/** Writes the chosen parts into an Android install session, then lets Android (and you) take it from there. */
+async function installApp(source, app, parts, status) {
+  const progress = h("span", {}, "Getting it ready…");
+  fill(status, progress);
+  const total = parts.reduce((n, p) => n + p.size, 0);
+  const items = app.format === "apk" ? [] : await zipItems(source);
+  const { handle } = await androidCall("install-start", { package: app.package, size: total });
+  let done = 0;
+  try {
+    for (const part of parts) {
+      const name = part.file ? part.file.split("/").pop() : "base.apk";
+      const stream = part.file
+        ? await itemStream(source, items.find((i) => i.name === part.file))
+        : new ReadableStream({
+            at: 0,
+            async pull(controller) {
+              const at = this.at ?? 0;
+              if (at >= source.size) return controller.close();
+              const end = Math.min(source.size, at + ANDROID_PIECE);
+              controller.enqueue(new Uint8Array(await source.slice(at, end).arrayBuffer()));
+              this.at = end;
+            },
+          });
+      const reader = stream.getReader();
+      let held = [];
+      let heldBytes = 0;
+      const flush = async () => {
+        if (!heldBytes) return;
+        const piece = held.length === 1 ? held[0] : new Uint8Array(await new Blob(held).arrayBuffer());
+        await androidCall("install-write", { handle, name, size: part.size, data: toBase64(piece) });
+        done += piece.length;
+        held = [];
+        heldBytes = 0;
+        progress.textContent = `Handing it to Android… ${Math.round((done / Math.max(1, total)) * 100)}%`;
+      };
+      for (;;) {
+        const { done: end, value } = await reader.read();
+        if (end) break;
+        for (let i = 0; i < value.length; i += ANDROID_PIECE) {
+          const bit = value.subarray(i, i + ANDROID_PIECE);
+          held.push(bit);
+          heldBytes += bit.length;
+          if (heldBytes >= ANDROID_PIECE) await flush();
+        }
+      }
+      await flush();
+    }
+    await androidCall("install-commit", { handle });
+  } catch (err) {
+    androidCall("install-abandon", { handle }).catch(() => {});
+    throw err;
+  }
+  progress.textContent = "Android is asking you to confirm…";
+  // Android says how it went (after you say yes or no in its own window).
+  for (let waited = 0; waited < 30 * 60_000; waited += 800) {
+    await new Promise((r) => setTimeout(r, 800));
+    const { status: how, message } = await androidCall("install-status", { handle });
+    if (how === "waiting" || how === "unknown") continue;
+    const words = {
+      installed: "Installed. It's on your home screen (or in the app drawer).",
+      cancelled: "Not installed: you said no (or closed Android's window).",
+      conflict: "Android wouldn't put it over the app that's already there: it's signed by someone else, or older. Uninstall that one first (its data goes too), then install this.",
+      incompatible: "It doesn't work on this phone (its Android, processor or screen).",
+      invalid: "Android says the file is damaged or incomplete. Download it again.",
+      storage: "There isn't enough space on the phone. Free some up and try again.",
+      blocked: "Android blocked it (a work profile, or a setting on this phone).",
+    }[how];
+    return fill(status, h("p", { class: how === "installed" ? "chip ok" : "insight warn small" }, words ?? `It didn't install: ${message || how}.`), how !== "installed" && message ? h("p", { class: "muted small mono" }, message) : null);
+  }
+  fill(status, h("p", { class: "muted small" }, "Android hasn't said yet how it went. Look in your apps."));
+}
+
+/** Looks a file over and fixes what it can: shows what was wrong, and offers the fixed copy. */
+async function fixPane(where, file, options = {}) {
+  if (file.size > IN_MEMORY_MAX) return fill(where, h("p", { class: "insight warn small" }, `${bytes(file.size)} is too big to fix on this device (most is ${bytes(IN_MEMORY_MAX)}).`));
+  fill(where, h("p", { class: "muted small" }, "Looking it over…"));
+  const data = new Uint8Array(await file.slice(0, file.size).arrayBuffer());
+  const result = await repairFile(file.name || "file", data);
+  const actions = h("div", { class: "row" });
+  const note = h("span", { class: "muted small" });
+  if (result.data) {
+    const fixedFile = new File([result.data], result.name, { type: result.type });
+    const download = h("button", { type: "button" }, "Download the fixed copy");
+    download.addEventListener("click", () => withBusy(download, async () => (note.textContent = await saveBlob(fixedFile, result.name))));
+    const keep = h("button", { type: "button", class: "secondary" }, options.box ? "Keep it here" : "Keep in my personal box");
+    keep.addEventListener("click", () =>
+      withBusy(keep, async () => {
+        const box = options.box ?? (await account.open(await account.makePersonalBox()));
+        await sealFile(box, fixedFile);
+        note.textContent = `Kept as “${result.name}”, sealed. The original is still there too.`;
+      }),
+    );
+    actions.append(download, account ? keep : "", note);
+  }
+  fill(
+    where,
+    h(
+      "div",
+      { class: `insight ${result.fixes.length ? "tip" : ""} stack small` },
+      result.fixes.length ? h("strong", {}, "Fixed") : h("strong", {}, "Nothing to fix"),
+      result.fixes.map((f) => h("div", {}, `✓ ${f}`)),
+      result.notes.map((n) => h("div", { class: "muted" }, n)),
+      actions,
+    ),
+  );
+}
+
+/**
+ * In the Android app: a file from a link, downloaded by the phone itself (Android's own downloader, which
+ * carries on when the connection drops), straight from the site: the server never sees it. Then it can be
+ * installed, fixed or kept like any file opened with Cardboard.
+ */
+function downloadLink(status) {
+  const url = h("input", { type: "url", placeholder: "https://…", required: true, inputmode: "url" });
+  const form = h(
+    "form",
+    { class: "stack" },
+    h("h2", {}, "Download a link"),
+    h("p", { class: "small" }, "Paste the link to a file (an app, a video, anything). This phone downloads it into Downloads › Cardboard, straight from the site: even a big one, even if the connection drops."),
+    h("label", { class: "field" }, "Link", url),
+    h("div", { class: "row" }, h("button", { type: "submit" }, "Download"), h("button", { type: "button", class: "secondary", onclick: () => closeModal() }, "Cancel")),
+  );
+  const said = h("div");
+  form.append(said);
+  onSubmit(form, said, async () => {
+    const link = safeUrl(url.value.trim());
+    if (!link) throw new Error("That doesn't look like a web address.");
+    const { id, name } = await androidCall("download", { url: link });
+    closeModal();
+    const line = h("span", {}, `Downloading ${name}…`);
+    fill(status, h("div", { class: "row" }, line));
+    watchDownload(id, name, line, status).catch((err) => fill(status, errorBox(err)));
+  });
+  openModal(null, form);
+  url.focus();
+}
+
+/** Follows a download until Android has it (or the page moves on: Android carries on, and says when it's done). */
+async function watchDownload(id, name, line, status) {
+  for (;;) {
+    await new Promise((r) => setTimeout(r, 1000));
+    if (!line.isConnected) return; // Android carries on, and says when it's done.
+    const d = await androidCall("download-status", { id });
+    if (d.state === "running" || d.state === "waiting") {
+      line.textContent = `Downloading ${d.name}… ${bytes(d.bytes)}${d.size > 0 ? ` of ${bytes(d.size)}` : ""}${d.state === "waiting" ? " (waiting for the connection)" : ""}`;
+      continue;
+    }
+    if (d.state !== "done") return fill(status, errorBox(new Error(`The download of ${d.name ?? name} didn't work. The link may have expired: copy it again.`)));
+    const open = h("button", { type: "button", class: "secondary tiny" }, "Open it");
+    open.addEventListener("click", () => withBusy(open, async () => (await androidCall("download-open", { id }), (location.hash = `#/open?d=${id}`))));
+    return fill(status, h("span", { class: "row" }, h("span", { class: "chip ok" }, `Downloaded: ${d.name}`), h("span", { class: "muted small" }, "In Downloads › Cardboard."), open));
+  }
+}
+
+/** #/open: a file opened with Cardboard on Android ("Open with"): install it, fix it, convert it or keep it. */
+async function renderOpen() {
+  const status = h("div", { class: "stack" });
+  fill(app, h("section", { class: "card stack" }, h("h1", {}, "Open with Cardboard"), status));
+  let shared;
+  try {
+    shared = await takePendingShare();
+  } catch (err) {
+    return fill(status, errorBox(err), h("a", { href: "#/" }, "Go to your shelf"));
+  }
+  if (!shared?.files?.length) return fill(status, h("p", {}, "There's nothing waiting to be opened."), h("a", { href: "#/" }, "Go to your shelf"));
+  history.replaceState(null, "", "#/open");
+  const me = await account.me();
+  fill(status, shared.files.map((file) => openedFile(file, me)), h("div", { class: "row" }, h("a", { href: "#/", class: "button secondary", onclick: () => shared.done?.() }, "Done")));
+}
+
+function openedFile(file, me) {
+  const note = h("div", { class: "stack" });
+  const fixed = h("div", { class: "stack" });
+  const keep = h("button", { type: "button" }, "Keep in my personal box");
+  keep.addEventListener("click", () =>
+    withBusy(keep, async () => {
+      try {
+        const box = await account.open(await account.makePersonalBox());
+        const progress = h("span", { class: "muted small" }, "Sealing…");
+        fill(note, progress);
+        const { note: extra } = await sealFile(box, file, { onProgress: (f) => (progress.textContent = `Sealing… ${Math.round(f * 100)}%`) });
+        fill(note, h("span", { class: "chip ok" }, "Kept, sealed, in your personal box."), extra ? h("span", { class: "muted small" }, extra) : null);
+      } catch (err) {
+        fill(note, errorBox(err));
+      }
+    }),
+  );
+  const send = h("button", { type: "button", class: "secondary" }, "Send to my devices");
+  send.addEventListener("click", () =>
+    withBusy(send, async () => {
+      try {
+        const box = await account.open(await account.makePersonalBox());
+        await sendNow(box, thisDeviceName(me), "", [file], note, me.devices.length < 2);
+      } catch (err) {
+        fill(note, errorBox(err));
+      }
+    }),
+  );
+  const fix = h("button", { type: "button", class: "secondary" }, "Fix it");
+  fix.addEventListener("click", () => withBusy(fix, () => fixPane(fixed, file).catch((err) => fill(fixed, errorBox(err)))));
+  const convert = h("button", { type: "button", class: "secondary" }, "Convert…");
+  convert.addEventListener("click", () =>
+    withBusy(convert, async () => {
+      if (file.size > 400 * 1024 * 1024) return fill(note, errorBox(new Error(`${bytes(file.size)} is too big to convert on this device (most is about 400 MB).`)));
+      convertQueue = [new File([await file.slice(0, file.size).arrayBuffer()], file.name, { type: file.type || "" })];
+      location.hash = "#/convert";
+    }),
+  );
+  return h(
+    "div",
+    { class: "stack" },
+    h("div", {}, h("strong", {}, file.name), h("span", { class: "muted small" }, ` · ${bytes(file.size)}${kindOfFile(file.type) ? ` · ${kindOfFile(file.type)}` : ""}`)),
+    isAppFileName(file.name) || file.type === "application/vnd.android.package-archive" ? appCard(file) : null,
+    h("div", { class: "row" }, keep, send, fix, convert),
+    note,
+    fixed,
+  );
 }
 
 // ── Sealing files: location left behind, and carrying on after a dropped connection ──
@@ -1819,10 +2153,42 @@ async function renderConvert() {
     e.preventDefault();
     take([...e.dataTransfer.files]);
   });
+  // Fixing: a file that won't open (cut off, named wrong, garbled), looked over and mended here.
+  const fixPicker = h("input", { type: "file", multiple: true, hidden: true });
+  const fixResults = h("div", { class: "stack" });
+  const fixFiles = async (list) => {
+    fill(fixResults);
+    for (const file of list) {
+      const one = h("div", { class: "stack" });
+      fixResults.append(h("div", { class: "stack" }, h("strong", {}, file.name), one));
+      await fixPane(one, file).catch((err) => fill(one, errorBox(err)));
+    }
+  };
+  fixPicker.addEventListener("change", () => {
+    const list = [...fixPicker.files];
+    fixPicker.value = "";
+    fixFiles(list);
+  });
+  const fixCard = h(
+    "section",
+    { class: "card stack" },
+    h("h2", {}, "Fix a broken file"),
+    h("p", { class: "small" }, "A file that won't open: a download that was cut off, a photo named .jpg that isn't one, text with scrambled letters (Ã© for é), a zip or Word document that's damaged, a recording stopped half way. It's fixed on this device, into a copy."),
+    h("div", { class: "row" }, h("button", { type: "button", onclick: () => fixPicker.click() }, "Choose a file to fix"), fixPicker),
+    fixResults,
+  );
+  fixCard.addEventListener("dragover", (e) => [...(e.dataTransfer?.types ?? [])].includes("Files") && e.preventDefault());
+  fixCard.addEventListener("drop", (e) => {
+    if (!e.dataTransfer?.files.length) return;
+    e.preventDefault();
+    fixFiles([...e.dataTransfer.files]);
+  });
+
   fill(
     app,
     h("div", { class: "page-head" }, h("div", {}, h("h1", {}, "Convert"), h("div", { class: "muted" }, "Turn files into other kinds of files: pictures, videos, sound, spreadsheets, documents, zips. It all happens on this device: nothing is uploaded to convert it."))),
     card,
+    fixCard,
     h(
       "details",
       { class: "card" },
@@ -1836,6 +2202,8 @@ async function renderConvert() {
         h("li", {}, "Spreadsheets (Excel .xlsx, CSV, TSV, JSON) → each other, a web page or a Markdown table"),
         h("li", {}, "Word (.docx), Markdown and text → PDF, a web page, plain text; JSON → YAML"),
         h("li", {}, "Anything → a .zip, or Base64 text (and back); a .zip → the files inside; text → a QR code"),
+        h("li", {}, "Pictures → turned right or left, upside down, mirrored"),
+        h("li", {}, "Fix a broken file: the right name for what it really is; pictures, GIFs, zips (and Word, Excel), PDFs and recordings that were cut off; scrambled or old-encoding text; JSON with comments"),
         h("li", { class: "muted" }, "Not yet: iPhone photos (HEIC), PDF to pictures or text, making videos smaller."),
       ),
     ),
@@ -2775,10 +3143,17 @@ async function renderPersonal(info, me, openKey, friend = null, plain = false) {
           }
         }),
       );
+      // A file in the box, read a piece at a time when it's looked into (an app's insides, say).
+      const source = { name: v.name || "file", type: v.type || "", size: v.size, slice: (start = 0, end = v.size) => ({ arrayBuffer: async () => (Math.min(end, v.size) <= start ? new ArrayBuffer(0) : (await readRange(box, thing, start, Math.min(end, v.size) - 1)).slice().buffer) }) }; // readRange's end is the last byte, slice's is just past it
+      const fixIt = h("button", { type: "button", class: "secondary" }, "Fix it…");
+      const fixed = h("div", { class: "stack" });
+      fixIt.addEventListener("click", () => withBusy(fixIt, () => fixPane(fixed, source, { box }).catch((err) => fill(fixed, errorBox(err)))));
       body.push(
         h("div", { class: "muted small" }, `${v.name} · ${bytes(v.size)}${kindOfFile(v.type) ? ` · ${kindOfFile(v.type)}` : ""}`),
         preview,
-        h("div", { class: "row" }, save, send, convertIt, progress),
+        h("div", { class: "row" }, save, send, convertIt, fixIt, progress),
+        fixed,
+        isAppFileName(v.name || "") ? appCard(source) : null,
         h("label", { class: "field" }, "Notes", fields.notes),
       );
       if (/^image\/(png|jpe?g|gif|webp|avif|bmp)$/.test(v.type) && v.size <= 25 * 1024 * 1024) {
@@ -4635,6 +5010,7 @@ async function render() {
     else if (page === "security") await renderSecurity();
     else if (page === "you") await renderYou();
     else if (page === "send") await renderSend();
+    else if (page === "open") await renderOpen();
     else if (page === "convert") await renderConvert();
     else await renderShelf();
     if (gen === renderGen) renderedGen = gen;
