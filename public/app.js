@@ -300,8 +300,31 @@ function showRecovery(result, onDone) {
   );
 }
 
+/** What this browser remembers about having been signed in, so the welcome screen can say why it doesn't know you now. */
+function remember(key, value) {
+  try {
+    if (value === null) localStorage.removeItem(key);
+    else localStorage.setItem(key, value);
+  } catch {
+    // A private window: nothing to say later anyway.
+  }
+}
+function recall(key) {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
 async function signOutHere() {
-  if (!confirm("Sign this browser out? Its copy of your account key is deleted from the server, so you'd pair it again (or use your recovery kit) to come back.")) return;
+  if (
+    !confirm(
+      "You don't need to sign out: closing Cardboard keeps you signed in, and nobody else can open it from here. (To keep someone who picks up this device out, lock it with Face ID under You.)\n\nSign out only if you're done with this device. Its key is deleted, so coming back means adding it again as a new device.\n\nSign out anyway?",
+    )
+  )
+    return;
+  remember("cardboard-left", "signed-out");
   try {
     await account.signOut();
   } catch {
@@ -313,7 +336,6 @@ async function signOutHere() {
   render();
 }
 
-document.getElementById("signout").addEventListener("click", signOutHere);
 
 // ── Locking (Face ID…) ──────────────────────────────────────────────────────
 
@@ -752,7 +774,20 @@ function renderWelcome(info) {
   nav.hidden = true;
   const invite = hashParam("invite");
   const logo = document.querySelector(".brand svg").cloneNode(true);
-  const remembers = browserStore.remembers ? null : h("p", { class: "error small" }, "This browser won't remember you (private window?). You'll need to sign in again next time.");
+  const left = recall("cardboard-left");
+  const remembers = !browserStore.remembers
+    ? h("p", { class: "error small" }, "This browser won't remember you (private window?). You'll need to sign in again next time.")
+    : left === "signed-out"
+      ? h("p", { class: "insight tip small" }, "You signed out in this browser, which deleted its key: add it again below (it shows up as a new device). Next time, just close Cardboard: you stay signed in.")
+      : left === "removed"
+        ? h("p", { class: "insight tip small" }, "This browser was removed from your Cardboard (under You → Devices, maybe on another device). Add it again below.")
+        : recall("cardboard-seen")
+          ? h(
+              "p",
+              { class: "insight warn small" },
+              "This browser was signed in before, but it has forgotten its key, so it has to be added again as a new device. That happens when a browser clears site data (cookies and storage) when it closes, or a cleaner app clears it: turn that off for this address, and it remembers you.",
+            )
+          : null;
   const intro = pendingConnect
     ? h("p", {}, h("strong", {}, pendingConnect.appName ?? "An app"), " wants you to sign in with Cardboard. First, open your Cardboard in this browser.")
     : pendingShare
@@ -4547,7 +4582,10 @@ async function render() {
     try {
       account = await unlock(browserStore);
     } catch (err) {
-      if (err.code === "bad_device") await browserStore.clear();
+      if (err.code === "bad_device") {
+        await browserStore.clear();
+        remember("cardboard-left", "removed");
+      }
       else {
         fill(app, errorBox(err));
         return;
@@ -4565,6 +4603,11 @@ async function render() {
   if (pendingPair) return renderApprovePair(pendingPair);
   nav.hidden = false;
   showBuilder();
+  // Signed in here: remembered, so if this browser ever forgets its key, the welcome screen can say so.
+  remember("cardboard-seen", "1");
+  remember("cardboard-left", null);
+  // Asks the browser not to clear Cardboard's storage (and with it this device's key) when space runs low.
+  navigator.storage?.persist?.().catch(() => {});
   shelfWatch?.close();
   shelfWatch = null;
   const [, rawPage, arg, key] = location.hash.split("/");

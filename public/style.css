@@ -945,10 +945,6 @@ ul.dupes {
 }
 
 @media (max-width: 560px) {
-  /* Signing out is under You → Devices ("Sign out here"), not one stray tap from You. */
-  #signout {
-    display: none;
-  }
   nav {
     flex-wrap: nowrap;
     overflow-x: auto;
