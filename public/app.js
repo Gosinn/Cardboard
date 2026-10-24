@@ -816,7 +816,13 @@ async function guardCard() {
         location.hash = "#/";
       }),
     );
-    return h("section", { class: "card stack" }, h("h2", {}, "Guard ", h("span", { class: "chip warn" }, "off here")), h("p", { class: "small" }, "Anyone who picks up this device can open your Cardboard. With the guard on, it asks for your PIN."), h("div", { class: "row" }, on));
+    const faceIdOff = !IN_ANDROID_APP && !(await passkeyBlocker()) ? await lockCard() : null;
+    return h(
+      "div",
+      { class: "stack" },
+      h("section", { class: "card stack" }, h("h2", {}, "Guard ", h("span", { class: "chip warn" }, "off here")), h("p", { class: "small" }, "Anyone who picks up this device can open your Cardboard. With the guard on, it asks for your PIN."), h("div", { class: "row" }, on)),
+      faceIdOff,
+    );
   }
   const me = await account.me();
   const shown = h("span", { class: "pin-show" }, "••• •••");
