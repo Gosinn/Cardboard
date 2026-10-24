@@ -241,7 +241,7 @@ function onSubmit(form, status, fn) {
     const button = form.querySelector("button[type=submit]");
     if (button) button.disabled = true;
     try {
-      await fn();
+      await fn(e);
     } catch (err) {
       status.replaceChildren(errorBox(err));
     } finally {
@@ -1088,8 +1088,10 @@ async function renderShelf() {
     account
       .inventory(b)
       .then((inv) => {
-        summary.textContent = inv.summary;
-        fill(chips, sensitiveChips(inv.sensitive));
+        // A box you keep things in says what's in it the way your personal box does ("2 files · 1 note").
+        const counts = thingCounts(inv);
+        summary.textContent = counts === null ? inv.summary : counts || "Empty so far.";
+        if (counts === null) fill(chips, sensitiveChips(inv.sensitive));
       })
       .catch((err) => (summary.textContent = err.message));
     return h(
@@ -1101,7 +1103,7 @@ async function renderShelf() {
       b.docks.length ? h("div", { class: "row" }, b.docks.map((d) => h("span", { class: `chip ${d.waiting ? "warn" : ""}` }, `⚓ ${docks.docks.find((x) => x.id === d.dock)?.name ?? "dock"}`))) : null,
       peopleChip(b),
       chips,
-      h("div", { class: "stats" }, `${plural(b.items, "item")} · ${bytes(b.bytes)} · ${plural(b.tapes.filter((t) => t.state === "active").length, "tape")} · ${b.lastActivity ? `active ${ago(b.lastActivity)}` : "never used"}`),
+      h("div", { class: "stats" }, [plural(b.items, "item"), bytes(b.bytes), b.tapes.some((t) => t.state === "active") ? plural(b.tapes.filter((t) => t.state === "active").length, "tape") : null, b.lastActivity ? `active ${ago(b.lastActivity)}` : "never used"].filter(Boolean).join(" · ")),
     );
   });
 
@@ -1122,7 +1124,7 @@ async function renderShelf() {
     ON_ANDROID ? null : installCard(),
     friendBoxesCard(boxes, friends),
     insightsBox,
-    cards.length || builderOn() ? h("div", { class: "grid" }, cards, builderOn() ? newBoxCard() : null) : null,
+    h("div", { class: "grid" }, cards, newBoxCard()),
   );
 
   const insights = (await account.insights({ boxes, me, docks })).filter((i) => !(i.fix || "").startsWith("cardboard dock approve"));
@@ -1792,6 +1794,17 @@ async function renderConvert() {
   draw();
 }
 
+/** "2 files · 1 note" for a box holding only notes, passwords, links and files ("" if empty); null for an app's box. */
+function thingCounts(inv) {
+  const ours = new Set([...Object.values(KINDS).map((k) => k.collection), FILE_DATA.slice(0, -1)]);
+  if (inv.collections.some((c) => !ours.has(c.name))) return null;
+  return Object.values(KINDS)
+    .map((k) => [inv.collections.find((c) => c.name === k.collection)?.items ?? 0, k])
+    .filter(([n]) => n > 0)
+    .map(([n, k]) => `${n} ${n === 1 ? k.one : k.many}`)
+    .join(" · ");
+}
+
 /** Your personal box on the shelf, or the button that makes it. */
 function personalCard(box) {
   if (!box) {
@@ -1819,13 +1832,7 @@ function personalCard(box) {
   const counts = h("div", { class: "muted" }, "…");
   account
     .inventory(box)
-    .then((inv) => {
-      const parts = Object.entries(KINDS)
-        .map(([, k]) => [inv.collections.find((c) => c.name === k.collection)?.items ?? 0, k])
-        .filter(([n]) => n > 0)
-        .map(([n, k]) => `${n} ${n === 1 ? k.one : k.many}`);
-      counts.textContent = parts.length ? parts.join(" · ") : "Empty so far: add your first note, password, link or file.";
-    })
+    .then((inv) => (counts.textContent = thingCounts(inv) || "Empty so far: add your first note, password, link or file."))
     .catch((err) => (counts.textContent = err.message));
   return h(
     "a",
@@ -2275,21 +2282,25 @@ function nameField(label, example) {
   };
 }
 
+/** A new box: to keep things in (files, notes, links; share it with family), or, for app builders, for an app (with its tape). */
 function newBoxCard() {
-  const name = nameField("Box name", "e.g. LORE");
+  const name = nameField("Box name", builderOn() ? "e.g. Photos, or LORE" : "e.g. Photos");
   const status = h("div");
+  const forApp = h("button", { type: "submit", class: "secondary", value: "app" }, "Make box + tape (for an app)");
   const form = h(
     "form",
     { class: "boxcard new stack" },
     h("h3", {}, "New box"),
-    h("div", { class: "muted small" }, "One box per app."),
+    h("div", { class: "muted small" }, "Another place to keep files, notes and links, apart from your personal box. Share it with family if you like."),
     name.input,
     name.preview,
-    h("button", { type: "submit" }, "Make box + tape"),
+    h("div", { class: "row" }, h("button", { type: "submit", value: "things" }, "Make box"), builderOn() ? forApp : null),
     status,
   );
-  onSubmit(form, status, async () => {
-    const box = await account.createBox(name.value());
+  onSubmit(form, status, async (e) => {
+    const app = e?.submitter?.value === "app";
+    const box = await account.createBox(name.value(), app ? undefined : PERSONAL_SETTINGS);
+    if (!app) return void (location.hash = `#/box/${encodeURIComponent(box.name)}`);
     const { secret } = await account.createTape(box.name, { label: "dashboard" });
     showSecret(`${box.name} is ready`, secret, box.name, null, render);
   });
@@ -2304,6 +2315,15 @@ async function renderBox(name, openKey) {
   if (box.id === me.profile.personal && !box.shared) return renderPersonal(box, me, openKey);
   const friends = me.profile.friends ?? {};
   if (box.id in friends && !box.shared) return renderPersonal(box, me, openKey, { link: friends[box.id] });
+  // A box to keep things in opens like your personal box.
+  // Only a box an app keeps its own data in opens as an app's box (#/box/<name>/~app shows that view for any box).
+  if (openKey === "~things") return renderPersonal(box, me, undefined, null, true);
+  if (openKey !== "~app") {
+    // An app's box: it has a tape, or data that isn't notes, links and files. (Its own notes/… keys don't make it yours.)
+    const forApp = box.tapes.some((t) => t.state === "active" && t.kind !== "link") || (await listThings(await account.open(box))).other > 0;
+    if (!forApp) return renderPersonal(box, me, openKey, null, true);
+  }
+  if (openKey === "~app") openKey = undefined;
   const [inventory, log] = await Promise.all([account.inventory(box), account.log({ box: name, limit: 30 })]);
   const head = h(
     "div",
@@ -2315,6 +2335,7 @@ async function renderBox(name, openKey) {
       h("h1", { class: "mono" }, box.name),
       h("div", { class: "muted" }, `${plural(box.items, "item")} · ${bytes(box.bytes)} · made ${ago(box.createdAt)}`),
       peopleChip(box),
+      h("a", { href: `#/box/${encodeURIComponent(box.name)}/~things`, class: "small" }, "Keep notes, links and files in it too →"),
     ),
   );
 
@@ -2436,15 +2457,19 @@ const iconOf = (t) => (t.kind !== "file" ? ICON[t.kind] : /^video\//.test(t.valu
 const NEW_LABEL = { note: "Note", password: "Password", link: "Link", file: "File" };
 
 /** Your personal box; and, with `friend`, a friend box (the same, with its link, and no passwords). */
-async function renderPersonal(info, me, openKey, friend = null) {
-  // Personal boxes made before 0.6 had the 512 MB every box got: only the account's limit applies now.
-  if (!friend && info.settings.quotaBytes === OLD_BOX_QUOTA) info = await account.setBoxSettings(info.name, PERSONAL_SETTINGS);
+/**
+ * Your personal box, a friend box, or (`plain`) any other box you keep things in: notes, passwords, links
+ * and files, sealed here.
+ */
+async function renderPersonal(info, me, openKey, friend = null, plain = false) {
+  // Boxes got 512 MB each before 0.6 (and app boxes still do): a box you keep files in has your whole room.
+  if (!friend && !info.shared && info.settings.quotaBytes === OLD_BOX_QUOTA) info = await account.setBoxSettings(info.name, PERSONAL_SETTINGS);
   const box = await account.open(info);
   const about = friend ? await box.get(FRIEND_ABOUT).catch(() => null) : null;
   let things = [];
   let other = 0;
   let show = "all";
-  const find = h("input", { type: "search", placeholder: friend ? "Find in this box…" : "Find in your personal box…", "aria-label": friend ? "Find in this box" : "Find in your personal box" });
+  const find = h("input", { type: "search", placeholder: friend || plain ? "Find in this box…" : "Find in your personal box…", "aria-label": friend || plain ? "Find in this box" : "Find in your personal box" });
   const tabs = h("div", { class: "row tabs" });
   const list = h("ul", { class: "list things" });
   const notice = h("div", { class: "stack" });
@@ -2902,19 +2927,29 @@ async function renderPersonal(info, me, openKey, friend = null) {
         "div",
         { class: "stack" },
         h("a", { href: "#/", class: "small" }, "← Shelf"),
-        h("h1", {}, friend ? `🎁 ${about?.title || info.name}` : "Your personal box"),
-        h("div", { class: "muted" }, friend ? "A friend box: anyone with its link can open it, with no account. Sealed like everything else: the server can't see inside." : "Just for you. Everything is sealed on this device before it leaves, and opens on every device you've signed in on."),
+        h("h1", {}, friend ? `🎁 ${about?.title || info.name}` : plain ? `📦 ${info.name}` : "Your personal box"),
+        h(
+          "div",
+          { class: "muted" },
+          friend
+            ? "A friend box: anyone with its link can open it, with no account. Sealed like everything else: the server can't see inside."
+            : plain
+              ? info.shared
+                ? "Shared with you. Everything is sealed on your device before it leaves: the server can't see inside."
+                : "Sealed on this device before it leaves, and opens on every device you've signed in on. Share it with family or a friend under “Sharing” below."
+              : "Just for you. Everything is sealed on this device before it leaves, and opens on every device you've signed in on.",
+        ),
         usage,
         peopleChip(info),
       ),
     ),
-    friend ? friendLinkCard(info, friend.link) : me.device.lock ? null : h("p", { class: "insight tip small" }, "Tip: ", h("a", { href: "#/you" }, "lock this browser with Face ID"), " so nobody who picks up this device can open your personal box."),
+    friend ? friendLinkCard(info, friend.link) : me.device.lock || plain ? null : h("p", { class: "insight tip small" }, "Tip: ", h("a", { href: "#/you" }, "lock this browser with Face ID"), " so nobody who picks up this device can open your personal box."),
     h("section", { class: "card stack" }, add, find, tabs, notice, list, h("p", { class: "muted small drop-hint" }, "You can also drop files here.")),
     h(
       "details",
       { class: "card" },
       h("summary", {}, "Sharing, apps, history and settings"),
-      h("div", { class: "stack" }, h("p", { class: "muted small" }, other ? `${plural(other, "other item")} here came from apps or the CLI. They're in Browse.` : "Everything a regular box has, for when you need it."), h("div", { class: "two" }, h("div", {}, await browser(info)), h("div", {}, await peopleSection(info), await tapesSection(info), activitySection(log))), h("div", { class: "two" }, settingsSection(info), timeMachine(info.name)), dangerZone(info)),
+      h("div", { class: "stack" }, h("p", { class: "muted small" }, other ? `${plural(other, "other item")} here came from apps or the CLI. They're in Browse.` : "Everything a regular box has, for when you need it."), h("div", { class: "two" }, h("div", {}, await browser(info)), h("div", {}, await peopleSection(info), await tapesSection(info), activitySection(log))), info.shared ? null : h("div", { class: "two" }, settingsSection(info), timeMachine(info.name)), dangerZone(info)),
     ),
   );
   page.addEventListener("dragover", (e) => {
