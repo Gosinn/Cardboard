@@ -321,6 +321,25 @@ export async function runShake(api: Api): Promise<ShakeReport> {
         : failed("A tampered pairing request was approved.");
     });
 
+    await check("pin-tries", "A PIN gets three tries, and the server never sees it", async () => {
+      const store = new MemoryStore();
+      const extra = await recoverWithKit({ url, code: kit, store, kind: "other", fetch: inProcess });
+      const pin = "482913";
+      await extra.lockWithPin(pin);
+      const proofHash = db.prepare("SELECT proof_hash FROM device_pins WHERE device_id = ?").get(extra.deviceId) as { proof_hash: Uint8Array };
+      const blind = !Buffer.from(proofHash.proof_hash).includes(Buffer.from(pin));
+      const opens = Boolean(await unlock(store, { pin, fetch: inProcess }));
+      const wrongs = [];
+      for (let i = 0; i < 3; i++) wrongs.push(await rejects(() => unlock(store, { pin: "135790", fetch: inProcess }), i < 2 ? "wrong_pin" : "pin_locked"));
+      const shut = await rejects(() => unlock(store, { pin, fetch: inProcess }), "pin_locked");
+      await me.removeDevice(extra.deviceId);
+      api.pinGuesses.reset(PROBE_IP);
+      api.limiter.reset(PROBE_IP);
+      return blind && opens && wrongs.every(Boolean) && shut
+        ? pass("The right PIN opens the device; three wrong ones and even the right one doesn't. The server keeps only a check made from it.")
+        : failed(`The PIN guard didn't hold (opens ${opens}, wrong tries ${wrongs.join("/")}, locked ${shut}, blind ${blind}).`);
+    });
+
     await check("pairing-numbers", "Adding a device by matching numbers can't be hijacked", async () => {
       // The device you have looks less often, so the swap below lands before it reads the new device's key.
       const offering = me.offerDevice({ everyMs: 300 }).then(

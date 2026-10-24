@@ -269,6 +269,56 @@ describe("accounts, devices and recovery", () => {
     await assert.rejects(account.me(), "the session from before the unlock uses a retired token");
   });
 
+  it("locks a device with your PIN: quick to open, three wrong tries and it stops working", async () => {
+    const store = new MemoryStore();
+    const { account } = await signUp({ ...device(), store, invite: (await t.host("host.invite")).body.code, label: "Phone" });
+    await account.createBox("notes");
+    const { pin, made } = await account.ensurePin();
+    assert.ok(made && /^\d{6}$/.test(pin), "a first PIN is made for you");
+    assert.deepEqual(await account.ensurePin(), { pin, made: false }, "and kept (sealed in your profile)");
+    await account.lockWithPin(pin);
+    const locked = (await store.load())!;
+    assert.equal(locked.token, null);
+    assert.equal(locked.lock?.kind, "pin");
+    assert.equal((await account.me()).device.lock, "pin");
+    const row = t.cb.api.ctx.db.prepare("SELECT * FROM device_pins WHERE device_id = ?").get(account.deviceId) as Record<string, unknown>;
+    assert.ok(!Buffer.from(row["proof_hash"] as Uint8Array).toString("latin1").includes(pin), "the server never gets the PIN");
+
+    await rejectsWith(unlock(store), "device_locked");
+    const started = Date.now();
+    const again = await unlock(store, { pin });
+    assert.ok(Date.now() - started < 5000, "opening with the PIN is quick");
+    assert.deepEqual((await again!.boxes()).map((b) => b.name), ["notes"]);
+
+    // What the server has (the envelope, the share once it's handed out) opens nothing without this device's storage.
+    const envelope = new Uint8Array(t.cb.api.ctx.accounts.device(account.deviceId)!.envelope!);
+    await assert.rejects(open(random(32), envelope, ctx.lockedEnvelope));
+
+    const wrong = pin === "135791" ? "246802" : "135791";
+    await rejectsWith(unlock(store, { pin: wrong }), "wrong_pin");
+    assert.ok(await unlock(store, { pin }), "a right one in between starts the count again");
+    await assert.rejects(unlock(store, { pin: wrong }), /2 tries left/);
+    await assert.rejects(unlock(store, { pin: wrong }), /1 try left/);
+    await rejectsWith(unlock(store, { pin: wrong }), "pin_locked");
+    await rejectsWith(unlock(store, { pin }), "pin_locked");
+    t.cb.api.pinGuesses.reset("127.0.0.1");
+
+    // Your other devices hear about it.
+    assert.ok(t.cb.api.ctx.audit.alarmsSince(account.id, 0).some((a) => /wrong PIN 3 times/.test(a.text)));
+
+    // Changing the PIN: the one you have first.
+    const store2 = new MemoryStore();
+    const { account: second } = await signUp({ ...device(), store: store2, invite: (await t.host("host.invite")).body.code, label: "Laptop" });
+    const first = (await second.ensurePin()).pin;
+    await second.lockWithPin(first);
+    await rejectsWith(second.changePin("000000", "482913"), "wrong_pin");
+    await second.changePin(first, "482913");
+    assert.ok(await unlock(store2, { pin: "482913" }));
+    await rejectsWith(unlock(store2, { pin: first }), "wrong_pin");
+    await rejectsWith(second.changePin("482913", "12345"), "bad_pin");
+    t.cb.api.pinGuesses.reset("127.0.0.1");
+  });
+
   it("refuses a lock without a new token", async () => {
     const res = await t.raw(t.me.rpc.token!, "device.envelope", { envelope: toB64u(random(60)), lock: "passkey" });
     assert.equal(res.status, 400);

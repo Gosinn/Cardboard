@@ -5,7 +5,7 @@
  * never change.
  */
 export const ctx = {
-  accountKey: (via: "device" | "kit" | "friends" | "pairing" | "passkey" | "emergency") => `account-key|${via}`,
+  accountKey: (via: "device" | "kit" | "friends" | "pairing" | "passkey" | "pin" | "emergency") => `account-key|${via}`,
   /** A passkey-locked device's envelope: the passkey-sealed account key, sealed again by the device's own key. */
   lockedEnvelope: "locked-envelope",
   /** A locked device's token, sealed by its passkey. Kept on that device only. */

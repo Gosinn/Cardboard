@@ -64,9 +64,9 @@ export function describe(e: OpenedEntry): string {
     case "device.remove":
       return `${who} removed a device${e.what ? `: “${e.what}”` : ""}`;
     case "device.lock":
-      return `${who} locked ${e.what ? `“${e.what}”` : "a device"} with Face ID (a passkey)`;
+      return `${who} locked ${e.what ? `“${e.what}”` : "a device"} with ${e.note === "pin" ? "your PIN" : "Face ID (a passkey)"}`;
     case "device.unlock":
-      return `${who} took the Face ID lock off ${e.what ? `“${e.what}”` : "a device"}`;
+      return `${who} took the lock off ${e.what ? `“${e.what}”` : "a device"}`;
     case "share.create":
       return `${who} made a link to share ${box}${e.what ? ` with ${e.what}` : ""}${e.note ? ` (${e.note})` : ""}`;
     case "share.revoke":

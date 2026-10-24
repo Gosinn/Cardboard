@@ -2,7 +2,7 @@
 // browser, so everything is opened right here: the server only ever sends
 // sealed bytes. Anything that came from an app (key names, values, labels) is
 // inserted with textContent, never as HTML.
-import { claimEmergency, cleanInvite, deviceLock, joinDevice, recoverWithFriends, recoverWithKit, requestEmergency, signUp, startPairing, unlock, viewEmergency } from "/lib/client/account.ts";
+import { claimEmergency, cleanInvite, deviceLock, joinDevice, PIN_LENGTH, recoverWithFriends, recoverWithKit, requestEmergency, signUp, startPairing, unlock, viewEmergency } from "/lib/client/account.ts";
 import { qrEncode, qrPath } from "/lib/shared/qr.ts";
 import { describeDuration } from "/lib/shared/duration.ts";
 import { toName } from "/lib/shared/names.ts";
@@ -348,6 +348,7 @@ for (const event of ["pointerdown", "keydown", "wheel", "touchstart"]) addEventL
 /** Drops the opened account (and its keys) from this page and shows the lock screen. */
 function lockNow() {
   if (!account?.lock) return;
+  lockedWith = account.lock.kind;
   account = null;
   forgetMedia();
   delete modal.dataset.sticky;
@@ -608,6 +609,7 @@ const IDLE_CHOICES = [
 
 function renderLocked() {
   nav.hidden = true;
+  if (lockedWith === "pin") return renderPinLock();
   const logo = document.querySelector(".brand svg").cloneNode(true);
   const status = h("div");
   const button = h("button", { type: "button" }, "Unlock");
@@ -652,10 +654,235 @@ function renderLocked() {
   button.focus();
 }
 
+/** How this device is locked ("pin" or "passkey"), read when the page opens: the lock screen to show. */
+let lockedWith = null;
+
+/** The PIN screen: type it, and you're in (it goes as soon as the sixth digit is in). */
+function renderPinLock(note) {
+  nav.hidden = true;
+  const logo = document.querySelector(".brand svg").cloneNode(true);
+  const status = h("div", { class: "stack" });
+  const pin = h("input", { type: "password", inputmode: "numeric", pattern: "[0-9]*", maxlength: PIN_LENGTH, autocomplete: "off", class: "pin-input", "aria-label": "Your PIN" });
+  const form = h("form", { class: "stack" }, pin, status);
+  let busy = false;
+  const go = async () => {
+    if (busy || pin.value.length !== PIN_LENGTH) return;
+    busy = true;
+    status.replaceChildren(h("span", { class: "muted small" }, "Opening…"));
+    try {
+      account = await unlock(browserStore, { pin: pin.value });
+      lastActive = Date.now();
+      render();
+    } catch (err) {
+      busy = false;
+      pin.value = "";
+      if (err.code === "bad_device" || err.code === "no_pin") {
+        await browserStore.clear();
+        remember("cardboard-left", "removed");
+        return render();
+      }
+      if (err.code === "pin_locked") return stepUp(err.message);
+      status.replaceChildren(h("p", { class: "error" }, err.message));
+      pin.focus();
+    }
+  };
+  pin.addEventListener("input", () => {
+    pin.value = pin.value.replace(/\D/g, "").slice(0, PIN_LENGTH);
+    if (pin.value.length === PIN_LENGTH) go();
+  });
+  form.addEventListener("submit", (e) => (e.preventDefault(), go()));
+  const forgot = h("button", { type: "button", class: "link small" }, "Forgot your PIN?");
+  forgot.addEventListener("click", () => stepUp(null));
+  fill(
+    app,
+    h(
+      "section",
+      { class: "card stack login pin-lock" },
+      h("div", { class: "row" }, logo, h("h1", {}, "Your PIN")),
+      note ? h("p", { class: "small" }, note) : pendingConnect ? h("p", {}, "An app wants you to sign in with Cardboard. Your PIN first.") : pendingShare ? h("p", {}, "Someone shared a box with you. Your PIN first, then you can join it.") : null,
+      form,
+      h("div", {}, forgot),
+    ),
+  );
+  pin.focus();
+}
+
+/** Three wrong PINs (or a forgotten one): the guard steps up. Your recovery kit, or another device, gets you back in. */
+function stepUp(why) {
+  const kit = h("input", { placeholder: "XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX", autocomplete: "off", spellcheck: "false", required: true });
+  const status = h("div");
+  const form = h("form", { class: "stack" }, h("label", { class: "field" }, "Your recovery kit", kit), h("button", { type: "submit" }, "Open my Cardboard"), status);
+  onSubmit(form, status, async () => {
+    const old = (await browserStore.load())?.deviceId;
+    account = await recoverWithKit({ ...getInOptions(thisBrowserLabel()), code: kit.value });
+    // This device's old entry (with its locked PIN) goes: it's this same device again, signed in afresh.
+    if (old) await account.removeDevice(old).catch(() => {});
+    render();
+  });
+  const other = h("button", { type: "button", class: "secondary" }, "Add it from another device instead");
+  other.addEventListener("click", async () => {
+    await browserStore.clear();
+    remember("cardboard-left", null);
+    render();
+  });
+  fill(
+    app,
+    h(
+      "section",
+      { class: "card stack login" },
+      h("h1", {}, why ? "The guard stepped in" : "Forgot your PIN?"),
+      why ? h("p", { class: "insight warn" }, why) : h("p", {}, "Your PIN is under You → Guard on any device you're signed in on. Or get back in here:"),
+      h("p", { class: "small" }, "With your recovery kit, this device is in again straight away (and you choose a new PIN under You → Guard if you like)."),
+      form,
+      h("p", { class: "small" }, "Or, from a device you're signed in on (your laptop): this one starts again, and you press Add a device there."),
+      h("div", {}, other),
+      h("p", { class: "muted small" }, "Somebody else trying PINs here gets three tries, and then nothing: the server counts them, not this device."),
+    ),
+  );
+}
+
+/**
+ * On a device you're signed in on: when a new device is waiting to be added (someone pressed "Add this
+ * device"), a bar says so, and one tap opens Add a device. You still check the numbers match.
+ */
+let waitingWatch = null;
+function watchForWaitingDevices() {
+  if (waitingWatch) return;
+  const bar = h("div", { class: "waiting-bar", hidden: true });
+  const add = h("button", { type: "button" }, "Add it");
+  add.addEventListener("click", () => ((bar.hidden = true), addDevice()));
+  const no = h("button", { type: "button", class: "link small" }, "Not mine");
+  let ignoredUntil = 0;
+  no.addEventListener("click", () => ((bar.hidden = true), (ignoredUntil = Date.now() + 60_000)));
+  bar.append(h("span", {}, "📱 A device is waiting to be added. Yours?"), add, no);
+  app.before(bar);
+  waitingWatch = setInterval(async () => {
+    if (!account || document.visibilityState !== "visible" || !modal.hidden || Date.now() < ignoredUntil) return (bar.hidden = bar.hidden || !modal.hidden);
+    bar.hidden = !(await account.pairWaiting().catch(() => false));
+  }, 4000);
+}
+
+/** What this browser calls itself when it signs in again. */
+function thisBrowserLabel() {
+  return IN_ANDROID_APP ? "Cardboard app on Android" : "";
+}
+
+/** Turned off on this device (You → Guard): then Cardboard doesn't lock it again by itself. */
+const guardOff = () => recall("cardboard-guard") === "off";
+
+/**
+ * The guard, on every device: locked with your PIN (one PIN for the whole account, made for you
+ * the first time). A device signed in without one is locked with it now, and told the PIN.
+ */
+async function guardThisDevice() {
+  if (account.lock || guardOff()) return null;
+  const { pin, made } = await account.ensurePin();
+  await account.lockWithPin(pin);
+  return { pin, made };
+}
+
+/** On the shelf after the guard went on here: your PIN, once, until you say you've got it. */
+function pinNotice(guarded) {
+  const done = h("button", { type: "button", class: "secondary tiny" }, "Got it");
+  const card = h(
+    "section",
+    { class: "insight tip stack" },
+    h("div", { class: "title" }, guarded.made ? "🔒 Your PIN: " : "🔒 This device asks for your PIN now: ", h("span", { class: "pin-show" }, guarded.pin.replace(/(\d{3})(\d{3})/, "$1 $2"))),
+    h(
+      "div",
+      { class: "detail" },
+      guarded.made
+        ? "Cardboard asks for it when you open it, on every device (it's the same PIN everywhere). Three wrong tries and it takes your recovery kit instead. Change it under You → Guard."
+        : "The same PIN as on your other devices. Change it under You → Guard.",
+    ),
+    h("div", { class: "row" }, done),
+  );
+  done.addEventListener("click", () => card.remove());
+  return card;
+}
+let guardedJustNow = null;
+
+/** You → Guard: your PIN (see it, change it), when this device asks for it, or Face ID instead, or no guard here. */
+async function guardCard() {
+  const status = h("div");
+  const lock = account.lock;
+  if (lock?.kind === "passkey") return lockCard();
+  if (!lock) {
+    const on = h("button", { type: "button" }, "Turn the guard on");
+    on.addEventListener("click", () =>
+      withBusy(on, async () => {
+        remember("cardboard-guard", null);
+        guardedJustNow = await guardThisDevice();
+        location.hash = "#/";
+      }),
+    );
+    return h("section", { class: "card stack" }, h("h2", {}, "Guard ", h("span", { class: "chip warn" }, "off here")), h("p", { class: "small" }, "Anyone who picks up this device can open your Cardboard. With the guard on, it asks for your PIN."), h("div", { class: "row" }, on));
+  }
+  const me = await account.me();
+  const shown = h("span", { class: "pin-show" }, "••• •••");
+  const show = h("button", { type: "button", class: "secondary tiny" }, "Show");
+  show.addEventListener("click", () => {
+    const hidden = shown.textContent.startsWith("•");
+    shown.textContent = hidden ? (me.profile.pin ?? "").replace(/(\d{3})(\d{3})/, "$1 $2") : "••• •••";
+    show.textContent = hidden ? "Hide" : "Show";
+  });
+  const current = h("input", { type: "password", inputmode: "numeric", pattern: "[0-9]*", maxlength: PIN_LENGTH, autocomplete: "off", placeholder: "your PIN now" });
+  const next = h("input", { type: "password", inputmode: "numeric", pattern: "[0-9]*", maxlength: PIN_LENGTH, autocomplete: "off", placeholder: `${PIN_LENGTH} digits` });
+  const changeStatus = h("div");
+  const change = h(
+    "form",
+    { class: "stack" },
+    h("div", { class: "two" }, h("label", { class: "field" }, "Your PIN now", current), h("label", { class: "field" }, "New PIN", next)),
+    h("button", { type: "submit", class: "secondary" }, "Change my PIN"),
+    changeStatus,
+  );
+  onSubmit(change, changeStatus, async () => {
+    await account.changePin(current.value, next.value);
+    current.value = next.value = "";
+    changeStatus.replaceChildren(h("span", { class: "chip ok" }, "Changed. Your other devices take the new one after they're next opened."));
+  });
+  const idle = h(
+    "select",
+    { "aria-label": "Ask again after" },
+    IDLE_CHOICES.map(([ms, label]) => h("option", { value: String(ms), selected: ms === lock.idleMs }, label === "only when I press Lock" ? "only when I open Cardboard" : label)),
+  );
+  idle.addEventListener("change", async () => {
+    try {
+      await account.setLockIdle(idle.value === "null" ? null : Number(idle.value));
+      status.replaceChildren(h("span", { class: "chip ok" }, "Saved"));
+    } catch (err) {
+      status.replaceChildren(errorBox(err));
+    }
+  });
+  const off = h("button", { type: "button", class: "link small" }, "Turn the guard off on this device");
+  off.addEventListener("click", () =>
+    withBusy(off, async () => {
+      if (!confirm("Turn the guard off here? Anyone who picks up this device could open your Cardboard.")) return;
+      await account.removeLock();
+      remember("cardboard-guard", "off");
+      render();
+    }),
+  );
+  const faceId = !IN_ANDROID_APP && !(await passkeyBlocker()) ? h("details", { class: "small" }, h("summary", {}, "Face ID or fingerprint instead of the PIN, on this browser"), await lockCard()) : null;
+  return h(
+    "section",
+    { class: "card stack" },
+    h("h2", {}, "Guard ", h("span", { class: "chip ok" }, "on")),
+    h("p", { class: "small" }, "Opening Cardboard on this device takes your PIN (the same on all your devices). Three wrong tries, and it takes your recovery kit, or another device, instead: the server counts them, so a stolen phone can't be tried and tried."),
+    h("div", { class: "row" }, h("span", {}, "Your PIN: "), shown, show),
+    h("label", { class: "row small" }, "Ask for it again after", idle),
+    h("div", { class: "row" }, h("button", { type: "button", class: "secondary tiny", onclick: lockNow }, "Lock now")),
+    status,
+    h("details", { class: "small" }, h("summary", {}, "Change my PIN"), change),
+    faceId,
+    h("div", {}, off),
+  );
+}
+
 /** The "This browser" card on You: lock it with a passkey, or change how it locks. */
 async function lockCard() {
   const status = h("div");
-  if (!account.lock) {
+  if (!account.lock || account.lock.kind === "pin") {
     const blocker = await passkeyBlocker();
     if (blocker) return h("section", { class: "card stack" }, h("h2", {}, "Lock with Face ID"), h("p", { class: "small muted" }, blocker));
     const builtIn = await hasBuiltInPasskeys();
@@ -796,7 +1023,7 @@ function renderWelcome(info) {
       ? h("p", {}, "Someone shared a box with you. First, open your Cardboard in this browser. No account here yet? Ask whoever runs this Cardboard for an invite, then open the link again.")
       : pendingPair
         ? h("p", { class: "error" }, "That pairing code is for approving a new device, so scan it with a phone or computer that's already signed in to your Cardboard.")
-      : h("p", { class: "muted" }, "Your private, end-to-end encrypted deposit box. Your keys live on your devices: whoever runs this server can't read anything you keep here.");
+      : h("p", { class: "muted" }, "Your private place for your things. Only your devices can open it: not even whoever runs this server.");
 
   const panes = {
     pair: pairPane(),
@@ -804,20 +1031,31 @@ function renderWelcome(info) {
     kit: kitForm(),
     friends: friendsForm(),
   };
+  // Three plain choices first; the one you pick, then. (An invite link goes straight to making the account.)
   const ways = [
-    ["pair", "Add this device"],
-    ["invite", invite ? "Make my account" : "I'm new (I have an invite)"],
-    ["kit", "My recovery kit"],
-    ["friends", "Friends' pieces"],
+    ["pair", "📱", "I use Cardboard on another device", "Like your laptop: say yes there, and this one's in."],
+    ["kit", "🔑", "I have my recovery kit", "The code you saved when you made your account."],
+    ["invite", "✉️", "I'm new: I have an invite", "A link someone sent you."],
   ];
   const body = h("div", { class: "stack" });
-  // One way in on screen at a time; the others are a tap away underneath.
   const others = h("p", { class: "muted small row other-ways" });
+  const choose = () => {
+    fill(
+      body,
+      h(
+        "div",
+        { class: "stack ways" },
+        ways.map(([id, icon, title, detail]) => h("button", { type: "button", class: "way", onclick: () => show(id) }, h("span", { class: "way-icon", "aria-hidden": "true" }, icon), h("span", {}, h("strong", {}, title), h("span", { class: "muted small" }, detail)))),
+      ),
+    );
+    fill(others, h("button", { type: "button", class: "link small", onclick: () => show("friends") }, "My trusted friends have pieces of my key"));
+  };
   const show = (id) => {
     fill(body, panes[id]);
-    fill(others, "Other ways in:", ways.filter(([w]) => w !== id).map(([w, label]) => h("button", { type: "button", class: "link small", onclick: () => show(w) }, label)));
+    fill(others, h("button", { type: "button", class: "link small", onclick: choose }, "← Another way in"));
   };
-  show(invite ? "invite" : "pair");
+  if (invite) show("invite");
+  else choose();
   fill(app, 
     h(
       "section",
@@ -828,7 +1066,6 @@ function renderWelcome(info) {
       body,
       others,
       ON_ANDROID ? h("p", { class: "muted small row" }, "On this phone, Cardboard works best as its app. ", androidAppLink("Get the app")) : null,
-      info?.shake ? h("p", { class: "muted small" }, `This server's self-test: ${info.shake.summary}.`) : null,
     ),
   );
 }
@@ -872,7 +1109,7 @@ function pairPane() {
   const pane = h(
     "div",
     { class: "stack" },
-    h("p", {}, "Signed in on another device, like your laptop? Press the button, then say yes there. Nothing to type."),
+    h("p", {}, "Press the button. Then on your other device (your laptop), Cardboard says a device is waiting: press Add it there. Same number on both? Yes on both, and you're in."),
     start,
     status,
     h("details", { class: "small" }, h("summary", {}, "Or use a pairing code"), codePairPane()),
@@ -881,7 +1118,7 @@ function pairPane() {
     withBusy(start, async () => {
       fill(
         status,
-        h("p", {}, "Now, on your other device: open Cardboard and press ", h("strong", {}, "Add a device"), " (at the top of your shelf)."),
+        h("p", {}, "Now, on your other device: open Cardboard. It says ", h("strong", {}, "A device is waiting"), ": press ", h("strong", {}, "Add it"), ". (Or press Add a device at the top of your shelf.)"),
         h("p", { class: "muted small" }, "Waiting for it… (up to 5 minutes)"),
       );
       try {
@@ -1064,6 +1301,8 @@ function friendsForm() {
 
 async function renderShelf() {
   const [boxes, me, docks] = await Promise.all([account.boxes(), account.me(), account.docks()]);
+  const guardNote = guardedJustNow;
+  guardedJustNow = null;
   const personal = await account.personalBox(me);
   if (personal) PERSONAL_HOME = personal.name;
   const headLine = h("div", { class: "muted" }, `${bytes(me.quota.used)} of ${bytes(me.quota.limit)} used`);
@@ -1152,6 +1391,7 @@ async function renderShelf() {
       h("div", { class: "row" }, shakeChip, backupChip(me.server.backup), h("button", { type: "button", class: "secondary tiny", onclick: addDevice }, "Add a device")),
     ),
     emergencyAlerts(me),
+    guardNote ? pinNotice(guardNote) : null,
     search,
     results,
     pendingCard(docks.pending),
@@ -4829,7 +5069,7 @@ async function renderYou() {
           h("div", { class: "row" }, h("button", { type: "button", onclick: addDevice }, "Add a device")),
           h("details", {}, h("summary", {}, "Or type a pairing code from the new device"), add),
         ),
-        await lockCard(),
+        await guardCard(),
         h("section", { class: "card stack" }, h("h2", {}, "Your name and email"), profile),
       ),
       h(
@@ -4967,7 +5207,9 @@ async function render() {
   // A friend box's link: just that box, for anyone holding it, signed in here or not.
   if (pendingFriend) return renderFriendView(pendingFriend);
   if (!account) {
-    if (await deviceLock(browserStore)) return renderLocked();
+    const lock = await deviceLock(browserStore);
+    lockedWith = lock?.kind ?? null;
+    if (lock) return renderLocked();
     try {
       account = await unlock(browserStore);
     } catch (err) {
@@ -4990,8 +5232,19 @@ async function render() {
   }
   if (pendingShare) return renderJoin(pendingShare);
   if (pendingPair) return renderApprovePair(pendingPair);
+  // The guard goes on (with your PIN) on any device signed in without it, before anything else shows.
+  try {
+    const guarded = await guardThisDevice();
+    if (guarded) {
+      guardedJustNow = guarded;
+      lockedWith = "pin";
+    }
+  } catch {
+    // Offline, say: the next time.
+  }
   nav.hidden = false;
   showBuilder();
+  watchForWaitingDevices();
   // Signed in here: remembered, so if this browser ever forgets its key, the welcome screen can say so.
   remember("cardboard-seen", "1");
   remember("cardboard-left", null);

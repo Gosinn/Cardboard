@@ -74,9 +74,9 @@ So the smart parts moved to where your keys are. Search, the sensitive-data rada
 
 ## Getting in, and getting back in
 
-There are no passwords to forget or leak. **Each device is signed in with its own key.**
+There are no passwords to forget or leak. **Each device is signed in with its own key**, and remembers you: opening Cardboard on it takes **your PIN**, six digits, and it opens as you type the last one.
 
-- **A new device:** on it, press *Add this device*; on a device you already have, press *Add a device* (top of your shelf). Both show the same 6-digit number: press *Yes* if they match. Nothing to type. The new device commits to its key before your device picks its own random part of the number, so whoever passes the messages (even a malicious server) can't slip its own device in with a matching number. (The older way still works: *Or use a pairing code*, or `cardboard pair <url>` and `cardboard devices add <code>`.)
+- **A new device:** pick *I use Cardboard on another device* and press *Add this device*. Your other device (your laptop) says *A device is waiting to be added*: press *Add it* (or *Add a device*, top of your shelf). Both show the same 6-digit number: press *Yes* if they match. Nothing to type. The new device commits to its key before your device picks its own random part of the number, so whoever passes the messages (even a malicious server) can't slip its own device in with a matching number. (The older way still works: *Or use a pairing code*, or `cardboard pair <url>` and `cardboard devices add <code>`.)
 - **Lost a device?** Remove it from any other (`cardboard devices remove <id>`). Its token stops working and its sealed copy of your account key is deleted.
 
 **If you lose every device**, you choose how you get back in (*You → If you lose every device*, or `cardboard recovery`):
@@ -90,9 +90,18 @@ There are no passwords to forget or leak. **Each device is signed in with its ow
 
 Nobody can reset your account for you, not even whoever runs Cardboard. That's the price of the host being locked out, and it's why the recovery kit is the standard. If your kit or friends' pieces are ever used, Cardboard tells you, loudly, on every device.
 
+### The guard: your PIN
+
+Cardboard gives you a PIN when you make your account (it's on your shelf, and under *You → Guard* on any device you're signed in on). It's the same on all your devices, and you can change it there.
+
+- Opening Cardboard on a device takes the PIN, and it asks again after you leave it alone (15 minutes by default; you pick, under *You → Guard*).
+- **Three wrong tries and the guard steps up**: the PIN stops working on that device, and it takes your recovery kit (or adding it again from another device) to get back in. Your other devices are told.
+- The tries are counted by the server, not the device, so a stolen phone (or a copy of its storage) can't be tried and tried. The device's key is sealed by a key made from your PIN **and** a share the server gives out only for the right PIN; the server keeps a check made from the PIN (never the PIN), and on its own, without the device, opens nothing.
+- *Turn the guard off on this device* is there too, if a device never leaves your desk.
+
 ### Lock it with Face ID
 
-On *You → Lock with Face ID*, a browser makes a passkey (Face ID, Touch ID, Windows Hello, or a phone's fingerprint). From then on, opening your Cardboard there takes your face, finger or PIN, and it locks itself again when you leave it alone (15 minutes by default; you pick).
+Instead of the PIN, on *You → Guard → Face ID or fingerprint*, a browser makes a passkey (Face ID, Touch ID, Windows Hello, or a phone's fingerprint). From then on, opening your Cardboard there takes your face, finger or PIN, and it locks itself again when you leave it alone (15 minutes by default; you pick).
 
 This is a real lock, not a screen: the passkey makes a secret (WebAuthn's PRF extension) that the browser never stores, and this device's copy of your account key is sealed by it **and** by the device's own key. The device's token is swapped for a new one and kept sealed too. So someone who picks up your unlocked phone, or copies the browser's storage off a laptop, gets nothing. Passkeys are tied to your Cardboard's address, so a look-alike site can't ask for the same secret. Works in Safari 18+ (iPhone, iPad, Mac), Chrome and Edge 132+, Firefox 135+, over HTTPS.
 

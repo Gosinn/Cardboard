@@ -3,7 +3,7 @@ import { basename, join } from "node:path";
 import { CardboardError, fail } from "../shared/errors.ts";
 import { parseDuration } from "../shared/duration.ts";
 import { ctx } from "../shared/contexts.ts";
-import { DEVICE_KINDS, DEVICE_LOCKS, RECOVERY_PLANS, type Account, type Accounts, type Device, type DeviceKind, type DeviceLock, type RecoveryPlan } from "./accounts.ts";
+import { DEVICE_KINDS, DEVICE_LOCKS, PIN_TRIES, RECOVERY_PLANS, type Account, type Accounts, type Device, type DeviceKind, type DeviceLock, type RecoveryPlan } from "./accounts.ts";
 import type { Audit, LogInput, Outcome } from "./audit.ts";
 import { newId, sameBytes, sha256 } from "./crypto.ts";
 import { getMeta, setMeta, transaction, type DB } from "./db.ts";
@@ -175,6 +175,10 @@ export class Api {
   readonly offersMade = new FailureLimiter(10, 10 * 60 * 1000);
   /** New devices looking for an open "Add a device", per address: one every 3 seconds or so, for 10 minutes. */
   readonly offerLooks = new FailureLimiter(250, 10 * 60 * 1000);
+  /** PIN tries, per address, across devices: someone trying device after device is slowed down too. */
+  readonly pinGuesses = new FailureLimiter(30, 10 * 60 * 1000);
+  /** When a new device last looked for an "Add a device" (so signed-in devices can offer to add it). */
+  private lastPairLook = 0;
   /** New accounts, per address: 10 an hour (matters with open sign-up). */
   readonly signups = new FailureLimiter(10, 60 * 60 * 1000);
   lastShake: ShakeReport | null = null;
@@ -623,7 +627,28 @@ export class Api {
       "pair.find": (_body, req) => {
         if (this.offerLooks.blocked(req.ip, this.now())) throw slowDown();
         this.offerLooks.fail(req.ip, this.now());
+        this.lastPairLook = this.now();
         return { offers: accounts.offersWaiting().map(b64) };
+      },
+
+      // Opening a device locked with your PIN: the server's share of its key, for the right PIN's proof only.
+      "pin.open": (body, req) => {
+        if (this.pinGuesses.blocked(req.ip, this.now())) throw slowDown();
+        const result = accounts.openPin(requireString(body, "device", 64), requireBlob(body, "proof", 32, 32));
+        if (!result) {
+          this.pinGuesses.fail(req.ip, this.now());
+          throw fail("no_pin", 404, "This device isn't locked with a PIN here any more (it was removed, or signed in again).", "Get back in with your recovery kit, or add this device from another one.");
+        }
+        if ("share" in result) return { share: b64(result.share) };
+        this.pinGuesses.fail(req.ip, this.now());
+        if (result.locked) {
+          if (result.wrong === PIN_TRIES) {
+            this.log(req, { accountId: result.accountId, actor: "system", action: "alarm", outcome: "denied", note: `Someone typed a wrong PIN ${PIN_TRIES} times on one of your devices, so the PIN stopped working there` });
+          }
+          throw fail("pin_locked", 423, `This device's PIN stopped working after ${PIN_TRIES} wrong tries.`, "Get back in with your recovery kit, or add this device again from another one.");
+        }
+        const left = PIN_TRIES - result.wrong;
+        throw fail("wrong_pin", 401, `That PIN isn't right. ${left} ${left === 1 ? "try" : "tries"} left.`, left === 1 ? "One more wrong one and this device needs your recovery kit (or another device) to get back in." : "Try again.");
       },
 
       "pair.join": (body, req) => {
@@ -918,7 +943,11 @@ export class Api {
         const tokenHash = optBlob(body, "tokenHash", 32);
         if (lock !== undefined && !tokenHash) throw fail("bad_request", 400, "Locking or unlocking a device also swaps its token: send `tokenHash` for the new one.");
         if (tokenHash && tokenHash.length !== 32) throw fail("bad_request", 400, "`tokenHash` is a 32-byte SHA-256 hash.");
-        accounts.setEnvelope(a.device.id, requireBlob(body, "envelope", MAX_KEY_BLOB), { lock, tokenHash });
+        // A PIN lock: a proof made from the PIN on the device (the PIN never comes here), and the server's share of the key.
+        const pinBody = body["pin"];
+        const pin =
+          lock === "pin" && pinBody && typeof pinBody === "object" ? { proof: requireBlob(pinBody as Body, "proof", 32, 32), share: requireBlob(pinBody as Body, "share", 32, 32) } : undefined;
+        accounts.setEnvelope(a.device.id, requireBlob(body, "envelope", MAX_KEY_BLOB), { lock, tokenHash, pin });
         if (lock !== undefined && lock !== a.device.lock) {
           record(a, req, lock ? "device.lock" : "device.unlock", { ref: a.device.label ? { sealed: a.device.label, ctx: ctx.deviceLabel } : null, note: lock ?? undefined });
         }
@@ -938,6 +967,9 @@ export class Api {
       },
 
       // Adding a device by matching numbers: the steps of the device you already have.
+      // A new device looking for an "Add a device" right now: signed-in devices say so, so you can add it in one tap.
+      "pair.waiting": () => ({ waiting: this.now() - this.lastPairLook < 12_000 }),
+
       "pair.offer": (a) => {
         // An account opening offer after offer (to be the newest one new devices find) is slowed down.
         if (this.offersMade.blocked(a.account.id, this.now())) throw slowDown();

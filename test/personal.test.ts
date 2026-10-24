@@ -323,10 +323,10 @@ describe("keeping each value once", () => {
     db.exec("UPDATE history SET value = (SELECT i.value FROM items i WHERE i.box_id = history.box_id AND i.idx = history.idx AND i.version = history.version) WHERE value IS NULL AND EXISTS (SELECT 1 FROM items i WHERE i.box_id = history.box_id AND i.idx = history.idx AND i.version = history.version)");
     const version = (db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version;
     // Back to just before the "each value once" migration (and the ones after it).
-    db.exec("DROP INDEX items_meta; DROP INDEX history_kept");
+    db.exec("DROP TABLE device_pins; DROP INDEX items_meta; DROP INDEX history_kept");
     db.exec("DROP TABLE pair_offers");
     db.exec("ALTER TABLE history DROP COLUMN temporary");
-    db.exec(`PRAGMA user_version = ${version - 5}`);
+    db.exec(`PRAGMA user_version = ${version - 6}`);
     db.close();
     db = openDb(file);
     try {

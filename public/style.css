@@ -958,3 +958,67 @@ ul.dupes {
   color: var(--accent-ink);
   border-color: var(--accent);
 }
+
+/* ── Getting in: three plain choices, and the PIN ─────────────── */
+
+.ways .way {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  text-align: left;
+  width: 100%;
+  padding: 14px 16px;
+  background: var(--card-2);
+  color: var(--ink);
+  border: 1px solid var(--line);
+  font-weight: 400;
+}
+
+.ways .way strong,
+.ways .way .muted {
+  display: block;
+}
+
+.way-icon {
+  font-size: 1.6rem;
+}
+
+.pin-input {
+  font-size: 2rem;
+  letter-spacing: 0.5em;
+  text-align: center;
+  max-width: 12ch;
+  padding: 10px 0 10px 0.5em;
+}
+
+.pin-show {
+  font-family: ui-monospace, monospace;
+  font-weight: 700;
+  font-size: 1.15rem;
+  letter-spacing: 0.08em;
+}
+
+.waiting-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  align-items: center;
+  justify-content: center;
+  padding: 10px 16px;
+  background: var(--accent);
+  color: var(--accent-ink);
+  font-weight: 600;
+}
+
+.waiting-bar[hidden] {
+  display: none;
+}
+
+.waiting-bar button:not(.link) {
+  background: var(--accent-ink);
+  color: var(--accent);
+}
+
+.waiting-bar .link {
+  color: inherit;
+}

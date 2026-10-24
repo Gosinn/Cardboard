@@ -161,6 +161,12 @@ function locked() {
 }
 
 /** A key for one purpose, derived with HKDF-SHA256. Different purposes give unrelated keys. */
+/** A key from a short secret (a PIN): PBKDF2-SHA-256, slow enough to make each guess cost, quick enough to type and go. */
+export async function stretch(secret: string, salt: Uint8Array, iterations: number): Promise<Uint8Array> {
+  const base = await subtle.importKey("raw", utf8.encode(secret), "PBKDF2", false, ["deriveBits"]);
+  return new Uint8Array(await subtle.deriveBits({ name: "PBKDF2", hash: "SHA-256", salt, iterations }, base, 256));
+}
+
 export async function derive(key: Uint8Array, purpose: string): Promise<Uint8Array> {
   const base = await subtle.importKey("raw", key, "HKDF", false, ["deriveBits"]);
   const bits = await subtle.deriveBits(

@@ -27,6 +27,7 @@ import {
   sealTo,
   sha256,
   splitSecret,
+  stretch,
   toB64u,
   toCode,
   utf8,
@@ -87,10 +88,10 @@ export interface Me {
   recovery: RecoveryPlan;
   recoveryReady: boolean;
   /** Sealed: only your devices read it. `personal` is the id of your personal box; `friends`, your friend boxes and their links. */
-  profile: { name?: string; email?: string; personal?: string; friends?: Record<string, FriendLink | null>; keepLocation?: boolean };
+  profile: { name?: string; email?: string; personal?: string; friends?: Record<string, FriendLink | null>; keepLocation?: boolean; pin?: string };
   quota: { used: number; limit: number };
-  device: { id: string; kind: DeviceKind; lock: "passkey" | null };
-  devices: Array<{ id: string; kind: DeviceKind; lock: "passkey" | null; name: string; createdAt: number; lastSeenAt: number | null; current: boolean }>;
+  device: { id: string; kind: DeviceKind; lock: "passkey" | "pin" | null };
+  devices: Array<{ id: string; kind: DeviceKind; lock: "passkey" | "pin" | null; name: string; createdAt: number; lastSeenAt: number | null; current: boolean }>;
   alarms: Array<{ at: number; text: string }>;
   /** Emergency access links someone is using right now: stop them, or let them in. */
   emergency: EmergencyLinkInfo[];
@@ -220,9 +221,9 @@ export interface LogLine {
 
 interface WireMe {
   account: { id: string; createdAt: number; recovery: RecoveryPlan; recoveryReady: boolean; profile: string | null; quota: { used: number; limit: number } };
-  device: { id: string; kind: DeviceKind; lock: "passkey" | null };
+  device: { id: string; kind: DeviceKind; lock: "passkey" | "pin" | null };
   envelope: string | null;
-  devices: Array<{ id: string; kind: DeviceKind; lock: "passkey" | null; label: string | null; createdAt: number; lastSeenAt: number | null; current: boolean }>;
+  devices: Array<{ id: string; kind: DeviceKind; lock: "passkey" | "pin" | null; label: string | null; createdAt: number; lastSeenAt: number | null; current: boolean }>;
   alarms: Array<{ at: number; text: string }>;
   emergency: WireEmergency[];
   server: Me["server"];
@@ -304,6 +305,32 @@ const SHARE_BYTES = 16;
 const EMERGENCY_BYTES = 16;
 /** A locked device locks itself again after this long without use, unless you pick otherwise. */
 export const DEFAULT_LOCK_IDLE_MS = 15 * 60 * 1000;
+/** PINs are 6 digits. Stretched this much: about a quarter of a second on a phone, so typing it and going stays quick. */
+export const PIN_LENGTH = 6;
+const PIN_ITERATIONS = 120_000;
+
+/** A first PIN, made for you (you can change it). */
+export function newPin(): string {
+  const n = new Uint32Array(1);
+  let pin: string;
+  do {
+    crypto.getRandomValues(n);
+    pin = String(n[0]! % 10 ** PIN_LENGTH).padStart(PIN_LENGTH, "0");
+  } while (/^(\d)\1+$/.test(pin) || "0123456789".includes(pin) || "9876543210".includes(pin));
+  return pin;
+}
+
+export function checkPin(pin: string): string {
+  const clean = pin.replace(/\s/g, "");
+  if (!new RegExp(`^\\d{${PIN_LENGTH}}$`).test(clean)) throw fail("bad_pin", 400, `A PIN is ${PIN_LENGTH} digits.`, `Type ${PIN_LENGTH} numbers.`);
+  return clean;
+}
+
+/** From a PIN: the proof the server checks (it keeps only its hash), and the key that, with the server's share, opens this device. */
+async function pinKeys(pin: string, salt: Uint8Array) {
+  const stretched = await stretch(checkPin(pin), salt, PIN_ITERATIONS);
+  return { stretched, proof: await derive(stretched, "pin-proof") };
+}
 
 // ── Getting in ─────────────────────────────────────────────────────────────
 
@@ -383,6 +410,8 @@ export function cleanInvite(invite: string): string {
 
 export interface UnlockOptions {
   fetch?: typeof fetch;
+  /** For a device locked with your PIN. */
+  pin?: string;
   /**
    * For a device locked with a passkey: asks for it (Face ID…) and returns its
    * secret. In a browser, pass passkeySecret from passkey.ts.
@@ -403,6 +432,19 @@ export async function deviceLock(store: DeviceStore): Promise<DeviceLock | null>
 export async function unlock(store: DeviceStore, options: UnlockOptions = {}): Promise<Account | null> {
   const record = await store.load();
   if (!record) return null;
+  if (record.lock?.kind === "pin") {
+    if (options.pin === undefined) throw new CardboardError("device_locked", 0, "This device is locked.", "Unlock it with your PIN.");
+    const { stretched, proof } = await pinKeys(options.pin, fromB64u(record.lock.salt));
+    const res = await new Rpc(record.url, null, options.fetch).call<{ share: string }>("pin.open", { device: record.deviceId, proof: toB64u(proof) });
+    const lockKey = await derive(concat(stretched, fromB64u(res.share)), "device-lock-pin");
+    const token = await openText(lockKey, fromB64u(record.lock.token), ctx.deviceToken);
+    const rpc = new Rpc(record.url, token, options.fetch);
+    const me = await rpc.call<WireMe>("me");
+    if (!me.envelope || me.device.lock !== "pin") throw new CardboardError("no_envelope", 0, "This device's lock doesn't match what the server has.", "Sign in again: pair it from another device, or use your recovery kit.");
+    const inner = await open(record.key, fromB64u(me.envelope), ctx.lockedEnvelope);
+    const root = await open(lockKey, inner, ctx.accountKey("pin"));
+    return new Account(rpc, record, await accountKeys(root), store);
+  }
   if (record.lock) {
     if (!options.passkey) throw new CardboardError("device_locked", 0, "This device is locked.", "Unlock it with Face ID (or the passkey you locked it with).");
     const lockKey = await derive(await options.passkey(record.lock), "device-lock");
@@ -997,6 +1039,51 @@ export class Account {
     await this.swapEnvelope(envelope, "passkey", token, { ...this.record, token: null, lock });
   }
 
+  /**
+   * Locks this device with your PIN: opening it takes the PIN, checked by the server (three wrong
+   * tries and it stops working here). The key is made from the PIN and a share made here, handed to
+   * the server and forgotten; the PIN itself never leaves this device.
+   */
+  async lockWithPin(pin: string, options: { idleMs?: number | null } = {}) {
+    const salt = random(16);
+    const { stretched, proof } = await pinKeys(pin, salt);
+    const share = random(32);
+    const lockKey = await derive(concat(stretched, share), "device-lock-pin");
+    const envelope = await seal(this.record.key, await seal(lockKey, this.keys.root, ctx.accountKey("pin")), ctx.lockedEnvelope);
+    const token = newDeviceToken();
+    const lock: DeviceLock = {
+      kind: "pin",
+      credential: "",
+      salt: toB64u(salt),
+      token: toB64u(await seal(lockKey, token, ctx.deviceToken)),
+      idleMs: options.idleMs === undefined ? (this.record.lock?.idleMs ?? DEFAULT_LOCK_IDLE_MS) : options.idleMs,
+    };
+    await this.swapEnvelope(envelope, "pin", token, { ...this.record, token: null, lock }, { proof: toB64u(proof), share: toB64u(share) });
+  }
+
+  /** Whether a new device is waiting to be added right now (someone pressed "Add this device"), so you can add it in one tap. */
+  async pairWaiting(): Promise<boolean> {
+    return (await this.rpc.call<{ waiting: boolean }>("pair.waiting")).waiting;
+  }
+
+  /** Your PIN: the same on all your devices, kept sealed in your profile (so a device you add can lock itself with it). Made for you the first time. */
+  async ensurePin(): Promise<{ pin: string; made: boolean }> {
+    const me = await this.me();
+    if (me.profile.pin) return { pin: me.profile.pin, made: false };
+    const pin = newPin();
+    await this.writeProfile({ ...me.profile, pin });
+    return { pin, made: true };
+  }
+
+  /** Changes your PIN (you type the one you have first): on this device now, and on your others the next time they're opened. */
+  async changePin(current: string, next: string) {
+    const me = await this.me();
+    if (me.profile.pin && checkPin(current) !== me.profile.pin) throw fail("wrong_pin", 401, "That isn't your PIN now.", "Type the PIN you open Cardboard with.");
+    const pin = checkPin(next);
+    await this.writeProfile({ ...me.profile, pin });
+    if (this.record.lock?.kind !== "passkey") await this.lockWithPin(pin);
+  }
+
   /** Takes the passkey lock off this device: opening it needs only the device again. */
   async removeLock() {
     if (!this.record.lock) return;
@@ -1015,11 +1102,11 @@ export class Account {
   }
 
   /** Remembers the new lock here first, so a failed call to the server can be put back. */
-  private async swapEnvelope(envelope: Uint8Array, lock: "passkey" | null, token: string, record: DeviceRecord) {
+  private async swapEnvelope(envelope: Uint8Array, lock: "passkey" | "pin" | null, token: string, record: DeviceRecord, pin?: { proof: string; share: string }) {
     const previous = this.record;
     await this.store.save(record);
     try {
-      await this.rpc.call("device.envelope", { envelope: toB64u(envelope), lock, tokenHash: await hashOf(token) });
+      await this.rpc.call("device.envelope", { envelope: toB64u(envelope), lock, tokenHash: await hashOf(token), pin });
     } catch (err) {
       await this.store.save(previous);
       throw err;

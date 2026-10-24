@@ -378,6 +378,18 @@ const MIGRATIONS: string[] = [
   CREATE INDEX items_meta ON items(box_id, idx, name, size, version, created_at, updated_at, expires_at);
   CREATE INDEX history_kept ON history(box_id, (value IS NULL), size);
   `,
+  // A device locked with your PIN: its share of the key, given out only for the right PIN (a proof made from it,
+  // never the PIN itself), three wrong tries at most.
+  `
+  CREATE TABLE device_pins (
+    device_id  TEXT PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
+    proof_hash BLOB NOT NULL,
+    share      BLOB,
+    tries      INTEGER NOT NULL DEFAULT 0,
+    locked_at  INTEGER,
+    updated_at INTEGER NOT NULL
+  );
+  `,
 ];
 
 export function openDb(path: string): DB {

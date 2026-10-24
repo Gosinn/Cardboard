@@ -42,13 +42,15 @@ export interface Device {
   kind: DeviceKind;
   label: Buffer | null;
   envelope: Buffer | null;
-  /** "passkey" when opening this device's envelope also takes Face ID (or another passkey). */
+  /** "passkey" when opening this device's envelope also takes Face ID (or another passkey); "pin" when it takes your PIN. */
   lock: DeviceLock | null;
   createdAt: number;
   lastSeenAt: number | null;
 }
 
-export const DEVICE_LOCKS = ["passkey"] as const;
+export const DEVICE_LOCKS = ["passkey", "pin"] as const;
+/** Wrong PINs in a row before a device's PIN stops working (then: your recovery kit, or another device). */
+export const PIN_TRIES = 3;
 export type DeviceLock = (typeof DEVICE_LOCKS)[number];
 
 export interface NewDevice {
@@ -317,10 +319,15 @@ export class Accounts {
    * recovery, or when it's locked or unlocked). Locking also swaps its token,
    * so the old one, which sat unsealed on the device, stops working.
    */
-  setEnvelope(deviceId: string, envelope: Buffer, change: { lock?: DeviceLock | null; tokenHash?: Buffer } = {}) {
+  setEnvelope(deviceId: string, envelope: Buffer, change: { lock?: DeviceLock | null; tokenHash?: Buffer; pin?: { proof: Buffer; share: Buffer } } = {}) {
     transaction(this.db, () => {
       this.db.prepare("UPDATE devices SET envelope = ? WHERE id = ?").run(envelope, deviceId);
       if (change.lock !== undefined) this.db.prepare("UPDATE devices SET lock = ? WHERE id = ?").run(change.lock, deviceId);
+      // The PIN check goes in with the envelope it opens, or nothing does; and goes when the PIN lock does.
+      if (change.lock === "pin") {
+        if (!change.pin) throw fail("bad_request", 400, "A PIN lock needs its `pin` (proof and share).");
+        this.setPin(deviceId, change.pin.proof, change.pin.share);
+      } else if (change.lock !== undefined) this.db.prepare("DELETE FROM device_pins WHERE device_id = ?").run(deviceId);
       if (change.tokenHash) {
         try {
           this.db.prepare("UPDATE devices SET token_hash = ? WHERE id = ?").run(change.tokenHash, deviceId);
@@ -328,6 +335,42 @@ export class Accounts {
           throw fail("device_exists", 409, "That device token is already in use.", "Each device makes its own random token.");
         }
       }
+    });
+  }
+
+  // ── PIN locks ─────────────────────────────────────────────────────────────
+  //
+  // The device keeps its key sealed by a key made from your PIN and a share only this
+  // server holds. The server gives the share out only for a proof made from the right PIN,
+  // and counts wrong ones: three, and the share is gone. So a copy of the device's storage
+  // can't be tried against PINs on its own, and the server (which never has the device's
+  // storage) can't open anything with the share either.
+
+  /** Keeps a device's PIN check and the server's share of its key (made on the device, which then forgets it). */
+  private setPin(deviceId: string, proof: Buffer, share: Buffer) {
+    this.db
+      .prepare(
+        "INSERT INTO device_pins (device_id, proof_hash, share, tries, locked_at, updated_at) VALUES (?, ?, ?, 0, NULL, ?) ON CONFLICT(device_id) DO UPDATE SET proof_hash = excluded.proof_hash, share = excluded.share, tries = 0, locked_at = NULL, updated_at = excluded.updated_at",
+      )
+      .run(deviceId, sha256(proof), share, this.now());
+  }
+
+  /** The share, for the right PIN's proof; a wrong one counts, and the last allowed wrong one locks the PIN for good. */
+  openPin(deviceId: string, proof: Buffer): { share: Buffer } | { wrong: number; locked: boolean; accountId: string } | null {
+    return transaction(this.db, () => {
+      const row = this.db
+        .prepare("SELECT p.proof_hash, p.share, p.tries, p.locked_at, d.account_id FROM device_pins p JOIN devices d ON d.id = p.device_id WHERE p.device_id = ?")
+        .get(deviceId) as { proof_hash: Uint8Array; share: Uint8Array | null; tries: number; locked_at: number | null; account_id: string } | undefined;
+      if (!row) return null;
+      if (row.locked_at !== null || !row.share) return { wrong: row.tries, locked: true, accountId: row.account_id };
+      if (sameBytes(Buffer.from(row.proof_hash), sha256(proof))) {
+        this.db.prepare("UPDATE device_pins SET tries = 0 WHERE device_id = ?").run(deviceId);
+        return { share: Buffer.from(row.share) };
+      }
+      const tries = row.tries + 1;
+      const locked = tries >= PIN_TRIES;
+      this.db.prepare("UPDATE device_pins SET tries = ?, locked_at = ?, share = CASE WHEN ? THEN NULL ELSE share END WHERE device_id = ?").run(tries, locked ? this.now() : null, locked ? 1 : 0, deviceId);
+      return { wrong: tries, locked, accountId: row.account_id };
     });
   }
 

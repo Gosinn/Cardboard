@@ -28,10 +28,15 @@ export interface DeviceRecord {
  * nothing without the face, finger or PIN.
  */
 export interface DeviceLock {
-  kind: "passkey";
-  /** Which passkey to ask for (its credential id, base64url). */
+  /**
+   * "passkey": the key is made from a passkey's secret. "pin": from your PIN and a share the server
+   * gives out only for the right PIN (three wrong tries, and it's gone), so a copy of this device's
+   * storage can't be tried against PINs on its own.
+   */
+  kind: "passkey" | "pin";
+  /** Which passkey to ask for (its credential id, base64url; "" for a PIN). */
   credential: string;
-  /** What the passkey's PRF is asked to sign (base64url). */
+  /** What the passkey's PRF is asked to sign, or the PIN's salt (base64url). */
   salt: string;
   /** The device token, sealed by the passkey-made key (base64url). */
   token: string;
