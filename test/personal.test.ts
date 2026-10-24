@@ -24,6 +24,7 @@ import {
   sendText,
   strayParts,
   strongPassword,
+  subtitle,
   type FileValue,
   type Thing,
 } from "../src/client/personal.ts";
@@ -90,6 +91,10 @@ describe("your personal box", () => {
 
   it("refuses links that aren't web addresses, and empty things", async () => {
     await rejectsWith(saveThing(box, "link", { url: "javascript:alert(1)" }), "bad_link");
+    await rejectsWith(saveThing(box, "link", { url: "not a link at all" }), "bad_link");
+    await rejectsWith(saveThing(box, "link", { url: "soup" }), "bad_link");
+    const soup = await saveThing(box, "link", { url: "https://www.example.com/recipe/soup/" });
+    assert.equal(subtitle(soup), "example.com/recipe/soup", "links to the same site can be told apart");
     await rejectsWith(saveThing(box, "password", { title: "x", password: "" }), "empty_password");
     await rejectsWith(saveThing(box, "note", { title: " ", text: "" }), "empty_note");
     assert.equal(safeUrl("data:text/html,hi"), null);
@@ -318,9 +323,10 @@ describe("keeping each value once", () => {
     db.exec("UPDATE history SET value = (SELECT i.value FROM items i WHERE i.box_id = history.box_id AND i.idx = history.idx AND i.version = history.version) WHERE value IS NULL AND EXISTS (SELECT 1 FROM items i WHERE i.box_id = history.box_id AND i.idx = history.idx AND i.version = history.version)");
     const version = (db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version;
     // Back to just before the "each value once" migration (and the ones after it).
+    db.exec("DROP INDEX items_meta; DROP INDEX history_kept");
     db.exec("DROP TABLE pair_offers");
     db.exec("ALTER TABLE history DROP COLUMN temporary");
-    db.exec(`PRAGMA user_version = ${version - 3}`);
+    db.exec(`PRAGMA user_version = ${version - 5}`);
     db.close();
     db = openDb(file);
     try {
@@ -517,6 +523,8 @@ describe("friend boxes", () => {
     await t.me.stopFriendLink(box.name);
     await rejectsWith(openBox({ url: t.cb.url, tape: secretOf(last.link), onNotice: false }).get("friend/about"), "bad_tape");
     assert.equal((await t.me.friendBoxes())[box.id], null, "still a friend box, with no link");
+    const after = (await t.me.boxes()).find((b) => b.id === box.id)!;
+    assert.equal(after.denied24h, 0, "someone opening a stopped link isn't counted as a blocked attempt");
     t.cb.api.limiter.reset("127.0.0.1");
   });
 });
@@ -561,16 +569,67 @@ describe("big uploads that get cut off", () => {
     const box = openBox({ url: t.cb.url, tape, fetch: first.fetchFn, onNotice: false });
     const err = await addFile(box, new Blob([data]), { name: "film.mp4", keepPartsOnError: true, retryMs: 1 }).then(
       () => null,
-      (e: { stopped?: { id: string; sentBytes: number } }) => e,
+      (e: { stopped?: { id: string; sentBytes: number; parts: Record<number, string> } }) => e,
     );
     assert.ok(err?.stopped, "it says where it stopped");
     assert.equal(err.stopped.sentBytes, 8 * FILE_PART_BYTES);
     const again = flaky(new Set());
     const box2 = openBox({ url: t.cb.url, tape, fetch: again.fetchFn, onNotice: false });
-    const thing = await addFile(box2, new Blob([data]), { name: "film.mp4", continueId: err.stopped.id, keepPartsOnError: true });
+    const thing = await addFile(box2, new Blob([data]), { name: "film.mp4", continueId: err.stopped.id, continueParts: err.stopped.parts, keepPartsOnError: true });
     assert.equal(again.counter.batches, 2, "only the 12 missing parts went (two batches)");
     assert.ok(Buffer.from(await readFile(box2, thing)).equals(data));
     assert.equal(thing.value.sha256, createHash("sha256").update(Buffer.concat(Array.from({ length: 20 }, (_, n) => createHash("sha256").update(data.subarray(n * FILE_PART_BYTES, (n + 1) * FILE_PART_BYTES)).digest()))).digest("hex"));
+  });
+
+  it("re-sends the parts that changed when it carries on with a different file of the same name and size", async () => {
+    const { link } = await t.me.makeFriendBox({ write: true });
+    const tape = link.link.split("#friend=")[1]!;
+    const data = randomBytes(FILE_PART_BYTES * 20);
+    const first = flaky(new Set([2, 3, 4, 5, 6, 7, 8, 9]));
+    const err = await addFile(openBox({ url: t.cb.url, tape, fetch: first.fetchFn, onNotice: false }), new Blob([data]), { name: "a.mp4", keepPartsOnError: true, retryMs: 1 }).then(
+      () => null,
+      (e: { stopped?: { id: string; parts: Record<number, string> } }) => e,
+    );
+    const changed = Buffer.from(data);
+    changed[3 * FILE_PART_BYTES + 5] = changed[3 * FILE_PART_BYTES + 5]! ^ 0xff;
+    const box2 = openBox({ url: t.cb.url, tape, onNotice: false });
+    const thing = await addFile(box2, new Blob([changed]), { name: "a.mp4", continueId: err!.stopped!.id, continueParts: err!.stopped!.parts });
+    assert.ok(Buffer.from(await readFile(box2, thing)).equals(changed), "it reads back as the new file, not a mix");
+  });
+
+  it("carries on with a link that may only add (it can't list what's there)", async () => {
+    const { box: info, link } = await t.me.makeFriendBox({ see: false });
+    const tape = link.link.split("#friend=")[1]!.split("&")[0]!;
+    const data = randomBytes(FILE_PART_BYTES * 20);
+    const first = flaky(new Set([2, 3, 4, 5, 6, 7, 8, 9]));
+    const err = await addFile(openBox({ url: t.cb.url, tape, fetch: first.fetchFn, onNotice: false }), new Blob([data]), { name: "b.mp4", keepPartsOnError: true, retryMs: 1 }).then(
+      () => null,
+      (e: { stopped?: { id: string; parts: Record<number, string> } }) => e,
+    );
+    const again = flaky(new Set());
+    await addFile(openBox({ url: t.cb.url, tape, fetch: again.fetchFn, onNotice: false }), new Blob([data]), { name: "b.mp4", continueId: err!.stopped!.id, continueParts: err!.stopped!.parts });
+    assert.equal(again.counter.batches, 2, "only the missing parts went");
+    const mine = await t.me.open(info);
+    const { things } = await listThings(mine);
+    assert.ok(Buffer.from(await readFile(mine, things.find((x) => x.value.title === "b.mp4") as Thing<FileValue>)).equals(data));
+  });
+
+  it("keeps a file whose last reply got lost (the retry finds it already saved)", async () => {
+    const { box: info, link } = await t.me.makeFriendBox({ write: true });
+    let lost = false;
+    const fetchFn = (async (input: string | URL | Request, init?: RequestInit) => {
+      const res = await fetch(input, init);
+      if (String(input).endsWith("/v1/put") && !lost) {
+        lost = true;
+        throw new TypeError("network error");
+      }
+      return res;
+    }) as typeof fetch;
+    const box = openBox({ url: t.cb.url, tape: link.link.split("#friend=")[1]!, fetch: fetchFn, onNotice: false });
+    const data = randomBytes(FILE_PART_BYTES * 3);
+    const thing = await addFile(box, new Blob([data]), { name: "c.mp4", retryMs: 1 });
+    assert.ok(lost);
+    assert.ok(Buffer.from(await readFile(await t.me.open(info), thing)).equals(data), "its bytes are all still there");
   });
 
   it("removes what was sent when you stop it, and when nobody will carry on", async () => {

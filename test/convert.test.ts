@@ -30,14 +30,23 @@ describe("formats the converter writes and reads", () => {
       { name: "notes/a.txt", data: text("abc ".repeat(1000)) },
       { name: "ð.bin", data: Uint8Array.of(1, 2, 3) },
       { name: "notes/a.txt", data: text("second") },
+      { name: "notes/a.txt", data: text("third") },
     ];
     const back = await readZip(await makeZip(files));
     assert.deepEqual(
       back.map((e) => e.name),
-      ["notes/a.txt", "ð.bin", "notes/a (2).txt"],
+      ["notes/a.txt", "ð.bin", "notes/a (2).txt", "notes/a (3).txt"],
     );
     assert.deepEqual(back[0]!.data, files[0]!.data);
     await assert.rejects(readZip(text("not a zip")), /isn't a \.zip/);
+  });
+
+  it("stops unpacking a zip that grows past what it may (a zip bomb)", async () => {
+    const bomb = await makeZip([{ name: "zeros", data: new Uint8Array(4 * 1024 * 1024) }]);
+    assert.ok(bomb.length < 64 * 1024);
+    await assert.rejects(readZip(bomb, () => true, 1024 * 1024), /unpacks to over/);
+    assert.equal((await readZip(bomb, () => false, 1024 * 1024)).length, 0, "files it wasn't asked for aren't unpacked");
+    assert.equal((await readZip(bomb))[0]!.data.length, 4 * 1024 * 1024);
   });
 
   it("reads CSV the way spreadsheets write it, and writes it back the same", () => {
@@ -70,6 +79,15 @@ describe("formats the converter writes and reads", () => {
       ["Jón <&>", "42", "007"],
     ];
     assert.deepEqual(await xlsxToRows(await rowsToXlsx(rows)), rows);
+    // Excel leaves blank rows out, and writes empty styled rows as <row/>.
+    const sheet = '<worksheet><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>a</t></is></c><c r="B1"><v>1</v></c></row><row r="2" ht="20"/><row r="4"><c r="A4"><v>4</v></c></row></sheetData></worksheet>';
+    const book = await makeZip([{ name: "xl/worksheets/sheet1.xml", data: text(sheet) }]);
+    assert.deepEqual(await xlsxToRows(book), [
+      ["a", "1"],
+      ["", ""],
+      ["", ""],
+      ["4", ""],
+    ]);
   });
 
   it("reads the text of a Word document, not its settings", async () => {
@@ -88,6 +106,7 @@ describe("formats the converter writes and reads", () => {
 
   it("writes YAML that keeps strings like yes and numbers-as-text quoted", () => {
     assert.equal(toYaml({ a: 1, b: "yes", c: "007", d: [1, { e: "x: y" }], f: {} }), 'a: 1\nb: "yes"\nc: "007"\nd:\n  - 1\n  -\n    e: "x: y"\nf: {}');
+    assert.equal(toYaml(["- x", "@home", "-", "0x1F", ".inf", "plain words"]), '- "- x"\n- "@home"\n- "-"\n- "0x1F"\n- ".inf"\n- plain words');
   });
 
   it("writes a PDF whose cross-reference table points at its objects", () => {

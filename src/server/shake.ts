@@ -1,5 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
-import { readFileSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { join } from "node:path";
 import { CardboardError } from "../shared/errors.ts";
 import { ctx } from "../shared/contexts.ts";
 import { claimEmergency, joinDevice, requestEmergency, signUp, recoverWithKit, startPairing, unlock, viewEmergency, type Account } from "../client/account.ts";
@@ -368,12 +369,30 @@ export async function runShake(api: Api): Promise<ShakeReport> {
         rejects(() => guest.get("friend/about"), "write_only"),
       ]);
       const landed = (await (await me.open(box.name)).get<{ title: string }>("files/from-guest"))?.title === "x";
+      // Nor anything around the box: how much is in it, docks, what the box says about itself.
+      const blind = (await guest.whoami()).items === 0;
+      const noDocks = await rejects(() => guest.dock("shake").send({ hi: 1 }), "not_for_links");
+      const noProfile = await rejects(() => guest.introduce({ title: "shake" }), "not_for_links");
+      reads.push(blind, noDocks, noProfile);
       await me.stopFriendLink(box.name);
       await me.shredBox(box.name).catch(() => undefined);
       api.limiter.reset(PROBE_IP);
       return reads.every(Boolean) && landed
-        ? pass("What the link added reached the box; reading it back, listing the box and its title were all refused.")
+        ? pass("What the link added reached the box; reading it back, listing the box, its title, its size, docks and its profile were all refused.")
         : failed(`A collection link could read (${reads.join(", ")}), or couldn't add (${landed}).`);
+    });
+
+    await check("rewrite-quota", "Rewriting one item over and over can't fill the disk", async () => {
+      const name = `shake-rewrite-${randomBytes(4).toString("hex")}`;
+      await me.createBox(name, { quotaBytes: 2 * 1024 * 1024 });
+      const box = await me.open(name);
+      const big = new Uint8Array(700 * 1024);
+      let refused = false;
+      for (let i = 0; i < 6 && !refused; i++) refused = await rejects(() => box.put("x", big), "quota_exceeded");
+      await me.shredBox(name).catch(() => undefined);
+      return refused
+        ? pass("Earlier versions count toward the box's room: rewriting the same item stopped at its limit.")
+        : failed("Rewriting one item six times never hit the box's limit: kept versions take room nobody counts.");
     });
 
     await check("device-removed", "Removed devices are locked out", async () => {
@@ -666,6 +685,17 @@ export async function runShake(api: Api): Promise<ShakeReport> {
     return (mode & 0o077) === 0 ? pass("Only your user can open the data folder.") : warn(`Other users can open the data folder (mode ${mode.toString(8)}). Fix: chmod 700 "${info.dataDir}"`);
   });
 
+  await check("backups-private", "Backups don't carry the server key, and only you can read them", () => {
+    const places = [join(info.dataDir, "backups"), ...(info.backupTo ?? [])].filter((dir) => existsSync(dir));
+    const files = places.flatMap((dir) => readdirSync(dir).map((f) => ({ dir, f })));
+    const key = files.find(({ f }) => f === "server.key");
+    if (key) return failed(`A copy of server.key is in ${key.dir}. Move it somewhere apart from the backups: with both, someone could pretend to be your people at apps they sign into.`);
+    if (process.platform === "win32") return pass("No server key next to the backups.");
+    const open = files.filter(({ dir, f }) => /^cardboard-.*\.db$/.test(f) && (statSync(join(dir, f)).mode & 0o077) !== 0);
+    if (open.length) return warn(`${open.length} backup file${open.length === 1 ? " is" : "s are"} readable by other users. Fix: chmod 600 the cardboard-*.db files in ${open[0]!.dir}`);
+    return pass(files.length ? "No server key next to the backups, and only your user can read them." : "No backups yet.");
+  });
+
   await check("transport", "Traffic is protected", () => {
     if (info.tls) return pass("Cardboard is serving HTTPS.");
     if (info.publicUrl.startsWith("https://")) return pass("Cardboard sits behind HTTPS.");
@@ -674,7 +704,8 @@ export async function runShake(api: Api): Promise<ShakeReport> {
   });
 
   await check("tape-expiry", "Every tape expires on its own", () => {
-    const { n } = db.prepare("SELECT COUNT(*) AS n FROM tapes WHERE revoked_at IS NULL AND idle_ms IS NULL AND expires_at IS NULL").get() as { n: number };
+    // A friend box's link lasting until its owner stops it is what they chose.
+    const { n } = db.prepare("SELECT COUNT(*) AS n FROM tapes WHERE revoked_at IS NULL AND idle_ms IS NULL AND expires_at IS NULL AND kind != 'link'").get() as { n: number };
     return n === 0 ? pass("All active tapes switch themselves off eventually.") : warn(`${n} tape${n === 1 ? " never expires" : "s never expire"}. Their owners see it in their insights.`);
   });
 

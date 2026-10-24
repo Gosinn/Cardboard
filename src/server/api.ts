@@ -1,4 +1,4 @@
-import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statfsSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readdirSync, renameSync, rmSync, statfsSync, statSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { CardboardError, fail } from "../shared/errors.ts";
 import { parseDuration } from "../shared/duration.ts";
@@ -171,6 +171,8 @@ export class Api {
   readonly limiter = new FailureLimiter();
   /** New devices asking to pair, per address: 20 per 10 minutes. */
   readonly pairings = new FailureLimiter(20, 10 * 60 * 1000);
+  /** "Add a device" offers, per account: 10 per 10 minutes. */
+  readonly offersMade = new FailureLimiter(10, 10 * 60 * 1000);
   /** New devices looking for an open "Add a device", per address: one every 3 seconds or so, for 10 minutes. */
   readonly offerLooks = new FailureLimiter(250, 10 * 60 * 1000);
   /** New accounts, per address: 10 an hour (matters with open sign-up). */
@@ -639,6 +641,11 @@ export class Api {
         return { nonceA: view.nonceA ? b64(view.nonceA) : null, approved };
       },
 
+      "pair.confirm": (body, req) => {
+        this.countMisses(req, () => accounts.confirmOffer(requireBlob(body, "offer", 16, 16), requireString(body, "token", 100)));
+        return { ok: true };
+      },
+
       "pair.reveal": (body, req) => {
         const [publicKey, nonce] = [requireBlob(body, "publicKey", 65, 65), requireBlob(body, "nonce", 32, 32)];
         this.countMisses(req, () => accounts.revealOffer(requireBlob(body, "offer", 16, 16), requireString(body, "token", 100), publicKey, nonce));
@@ -932,6 +939,9 @@ export class Api {
 
       // Adding a device by matching numbers: the steps of the device you already have.
       "pair.offer": (a) => {
+        // An account opening offer after offer (to be the newest one new devices find) is slowed down.
+        if (this.offersMade.blocked(a.account.id, this.now())) throw slowDown();
+        this.offersMade.fail(a.account.id, this.now());
         const offer = accounts.openOffer(a.account.id);
         return { id: b64(offer.id), expiresAt: offer.expiresAt };
       },
@@ -951,9 +961,9 @@ export class Api {
       "pair.offer.approve": (a, body, req) => {
         const label = optBlob(body, "label", MAX_LABEL) ?? null;
         const envelope = requireBlob(body, "envelope", MAX_KEY_BLOB);
-        const device = this.countMisses(req, () => accounts.approveOffer(a.account.id, requireBlob(body, "id", 16, 16), envelope, label));
-        record(a, req, "device.add", { ref: label ? { sealed: label, ctx: ctx.deviceLabel } : null, note: device.kind });
-        return { device: { id: device.id, kind: device.kind } };
+        const { kind, added } = this.countMisses(req, () => accounts.approveOffer(a.account.id, requireBlob(body, "id", 16, 16), envelope, label));
+        record(a, req, "device.add", { ref: label ? { sealed: label, ctx: ctx.deviceLabel } : null, note: kind });
+        return { device: added ? { id: added.id, kind: added.kind } : null, waiting: !added };
       },
 
       "pair.offer.cancel": (a, body) => {
@@ -1525,6 +1535,7 @@ export class Api {
   private dockAccess(a: AppAuth, body: Body, want: "send" | "receive", req: ApiRequest): { dock: Dock; berth: Berth } {
     const { docks } = this.ctx;
     if (a.member) throw sharedNoDocks();
+    if (a.tape.kind === "link") throw fail("not_for_links", 403, "A friend box's link can't use docks.", "Docks are for apps; make the app its own tape.");
     const idx = requireIndex(body, "dock");
     const dock = docks.find(a.account.id, idx);
     const berth = dock ? docks.berth(dock.id, a.box.id) : undefined;
@@ -1555,11 +1566,13 @@ export class Api {
         box: { id: a.box.id, settings: a.box.settings, profile: b64(a.box.profile) },
         tape: tapeView(a.tape, "active"),
         bundle: b64(tapes.bundle(a.tape.id)),
-        ...vault.stats(a.box.id),
+        // A link that may only add doesn't get to know what's there, even how much.
+        ...(a.tape.read ? vault.stats(a.box.id) : { items: 0, bytes: 0 }),
       }),
 
       introduce: (a, body, req) => {
         requireWrite(a.tape);
+        if (a.tape.kind === "link") throw fail("not_for_links", 403, "A friend box's link can't change what the box says about itself.", "Only an app's own tape can.");
         // It's someone else's box: their app already introduced it.
         if (a.member) return { ok: true, skipped: "shared box" };
         vault.setProfile(a.box.id, requireBlob(body, "profile", MAX_PROFILE));
@@ -1683,23 +1696,35 @@ export class Api {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
     const stamp = new Date(this.now()).toISOString().replace(/[:.]/g, "-");
     const file = join(dir, `cardboard-${stamp}.db`);
-    db.prepare("VACUUM INTO ?").run(file);
+    // Written under another name, then renamed: stopped half way (Cardboard closed, the computer off), it never looks like a backup.
+    rmSync(`${file}.part`, { force: true });
+    db.prepare("VACUUM INTO ?").run(`${file}.part`);
+    chmodSync(`${file}.part`, 0o600);
+    renameSync(`${file}.part`, file);
     setMeta(db, "last_backup_at", String(this.now()));
+    for (const f of readdirSync(dir)) if (f.endsWith(".db.part")) rmSync(join(dir, f), { force: true });
     const old = readdirSync(dir)
       .filter((f) => /^cardboard-.*\.db$/.test(f))
       .sort()
       .slice(0, -keep);
     for (const f of old) rmSync(join(dir, f));
-    const places = (info.backupTo ?? []).map((place) => {
+    const places = this.copyToPlaces(file, info.backupTo ?? [], keep);
+    return { file, bytes: statSync(file).size, kept: keep, places };
+  }
+
+  /** Copies a backup to the other places, and remembers which didn't get it (to try again, with the same backup). */
+  private copyToPlaces(file: string, places: string[], keep: number): Array<{ ok: boolean; error?: string }> {
+    const results = places.map((place) => {
       try {
-        copyBackup(file, place, info.keyFile, keep);
-        return { ok: true };
+        copyBackup(file, place, keep);
+        return { place, ok: true };
       } catch (err) {
-        return { ok: false, error: `${place}: ${(err as Error).message}` };
+        return { place, ok: false, error: `${place}: ${(err as Error).message}` };
       }
     });
-    setMeta(db, "backup_places", JSON.stringify({ at: this.now(), ok: places.filter((p) => p.ok).length, failed: places.filter((p) => !p.ok).map((p) => p.error) }));
-    return { file, bytes: statSync(file).size, kept: keep, places };
+    const failed = results.filter((r) => !r.ok);
+    setMeta(this.ctx.db, "backup_places", JSON.stringify({ at: this.now(), ok: results.length - failed.length, failed: failed.map((r) => r.error), retry: failed.map((r) => r.place) }));
+    return results.map(({ ok, error }) => (error ? { ok, error } : { ok }));
   }
 
   /** How backups are doing, for the people here (no paths, nothing about anyone): when, and in how many places. */
@@ -1725,7 +1750,21 @@ export class Api {
     if ((this.now() - last < everyMs && !failing) || this.now() - tried < HOUR) return false;
     setMeta(this.ctx.db, "backup_tried_at", String(this.now()));
     try {
-      this.backup();
+      if (this.now() - last < everyMs) {
+        // Not due, but a place missed the last one: it gets that same backup (a new one each hour would push the older ones out).
+        const dir = join(this.ctx.info.dataDir, "backups");
+        const newest = readdirSync(dir).filter((f) => /^cardboard-.*\.db$/.test(f)).sort().at(-1);
+        const retry = (JSON.parse(getMeta(this.ctx.db, "backup_places") ?? "{}") as { retry?: string[] }).retry ?? this.ctx.info.backupTo ?? [];
+        const others = (this.ctx.info.backupTo ?? []).filter((p) => !retry.includes(p));
+        if (!newest) this.backup();
+        else {
+          const keep = statSync(this.ctx.info.dbFile).size > 1024 ** 3 ? 3 : KEEP_BACKUPS;
+          this.copyToPlaces(join(dir, newest), retry.filter((p) => this.ctx.info.backupTo?.includes(p)), keep);
+          // The places that already had it still count as fine.
+          const status = JSON.parse(getMeta(this.ctx.db, "backup_places") ?? "{}") as { ok: number };
+          setMeta(this.ctx.db, "backup_places", JSON.stringify({ ...status, ok: status.ok + others.length }));
+        }
+      } else this.backup();
     } catch (err) {
       // No room: try again in an hour, and say so in the host's log.
       this.ctx.audit.record({ accountId: null, actor: "system", action: "backup", outcome: "error", note: (err as Error).message });
@@ -1910,17 +1949,23 @@ function parseWhen(input: unknown, now: number): number {
 }
 
 /**
- * Copies a backup to another place (another drive, another computer), with the
- * server key it needs to be restored, keeping the newest `keep` there too.
- * Everything in it is sealed, so the place doesn't need to be trusted.
+ * Copies a backup to another place (another drive, another computer), keeping
+ * the newest `keep` there too. What people keep is sealed in it. The server key
+ * is deliberately not copied: next to the database it would let whoever finds
+ * the drive pretend to be people at apps they sign into with Cardboard.
  */
-function copyBackup(file: string, place: string, keyFile: string, keep: number) {
+function copyBackup(file: string, place: string, keep: number) {
   try {
     if (!existsSync(place)) mkdirSync(place, { recursive: true });
   } catch {
     throw new Error("it isn't there (is the drive plugged in, or the other computer on?)");
   }
   const size = statSync(file).size;
+  if (existsSync(join(place, basename(file)))) return; // already there (tried again after another place failed)
+  // Old copies make room first: a drive that holds exactly `keep` of them is full only of old ones.
+  const backups = () => readdirSync(place).filter((f) => /^cardboard-.*\.db$/.test(f)).sort();
+  for (const f of backups().slice(0, -Math.max(1, keep - 1))) rmSync(join(place, f));
+  for (const f of readdirSync(place)) if (f.endsWith(".db.part")) rmSync(join(place, f), { force: true });
   try {
     const fs = statfsSync(place);
     if (fs.bavail * fs.bsize - size < 256 * 1024 * 1024) throw new Error(`there isn't room (it needs ${formatBytes(size)})`);
@@ -1928,10 +1973,15 @@ function copyBackup(file: string, place: string, keyFile: string, keep: number) 
     if ((err as NodeJS.ErrnoException).code !== "ENOSYS") throw err;
   }
   // Copied under another name first, so a copy cut off half way never looks like a backup.
-  copyFileSync(file, join(place, `${basename(file)}.part`));
-  renameSync(join(place, `${basename(file)}.part`), join(place, basename(file)));
-  const key = join(place, "server.key");
-  if (!existsSync(key) || !readFileSync(key).equals(readFileSync(keyFile))) copyFileSync(keyFile, key);
+  const part = join(place, `${basename(file)}.part`);
+  try {
+    copyFileSync(file, part);
+    chmodSync(part, 0o600);
+    renameSync(part, join(place, basename(file)));
+  } catch (err) {
+    rmSync(part, { force: true });
+    throw err;
+  }
   const readme = join(place, "README.txt");
   if (!existsSync(readme)) {
     writeFileSync(
@@ -1945,8 +1995,14 @@ function copyBackup(file: string, place: string, keyFile: string, keep: number) 
         "To bring a Cardboard back from here, on a computer with Cardboard installed:",
         "  1. Stop Cardboard.",
         "  2. Copy the newest cardboard-<date>.db here to cardboard-data\\cardboard.db",
-        "     (in the Cardboard folder), and server.key to cardboard-data\\server.key.",
-        "  3. Start Cardboard. Everyone signs in as before, with their devices or recovery kits.",
+        "     (in the Cardboard folder). If you still have the old cardboard-data\\server.key,",
+        "     copy that in too (it isn't kept here, on purpose: see below).",
+        "  3. Start Cardboard. Everyone signs in as before, with their devices or recovery kits,",
+        "     and everything they kept is there. Without the old server.key, apps people signed",
+        "     into with Cardboard ask them to connect again.",
+        "",
+        "Keep server.key safe somewhere other than this drive: with it and these files together,",
+        "someone could pretend to be your people at those apps (never open what they keep).",
         "",
       ].join("\r\n"),
     );

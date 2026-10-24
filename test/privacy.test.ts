@@ -72,6 +72,44 @@ describe("taking the location out of photos and videos", () => {
     assert.equal(blankVideoLocation(moov), false);
   });
 
+  it("takes it out of a HEIC photo's Exif and XMP items, nothing else moved", async () => {
+    const box = (type: string, ...parts: Uint8Array[]) => {
+      const body = cat(...parts);
+      const out = cat(new Uint8Array(4), ascii(type), body);
+      new DataView(out.buffer).setUint32(0, out.length);
+      return out;
+    };
+    const u16 = (n: number) => Uint8Array.of(n >> 8, n & 0xff);
+    const u32 = (n: number) => Uint8Array.of(n >>> 24, (n >> 16) & 0xff, (n >> 8) & 0xff, n & 0xff);
+    const exifItem = cat(u32(6), ascii("Exif\0\0"), exif());
+    const xmpItem = ascii('<x:xmpmeta><rdf:Description drone-dji:GpsLatitude="64.1"/></x:xmpmeta>');
+    const infe = (id: number, type: string, extra = new Uint8Array()) => box("infe", Uint8Array.of(2, 0, 0, 0), u16(id), u16(0), ascii(type), ascii("\0"), extra);
+    const ftyp = box("ftyp", ascii("heic"), u32(0), ascii("mif1heic"));
+    const metaWith = (exifAt: number, xmpAt: number) =>
+      box(
+        "meta",
+        new Uint8Array(4),
+        box("hdlr", new Uint8Array(8), ascii("pict"), new Uint8Array(13)),
+        box("iinf", new Uint8Array(4), u16(2), infe(1, "Exif"), infe(2, "mime", ascii("application/rdf+xml\0"))),
+        box("iloc", new Uint8Array(4), Uint8Array.of(0x44, 0x00), u16(2), u16(1), u16(0), u16(1), u32(exifAt), u32(exifItem.length), u16(2), u16(0), u16(1), u32(xmpAt), u32(xmpItem.length)),
+      );
+    const metaSize = metaWith(0, 0).length;
+    const picture = ascii("the picture itself");
+    const mdatStart = ftyp.length + metaSize + 8;
+    const file = cat(ftyp, metaWith(mdatStart, mdatStart + exifItem.length), box("mdat", exifItem, xmpItem, picture));
+    const { blob, removed } = await withoutLocation(new Blob([file], { type: "image/heic" }));
+    assert.equal(removed, true);
+    const out = new Uint8Array(await blob.arrayBuffer());
+    assert.equal(out.length, file.length);
+    const text = Array.from(out, (b) => String.fromCharCode(b)).join("");
+    assert.ok(!text.includes("GpsLatitude"), "the XMP that says where is blanked");
+    const tiff = new DataView(out.buffer, mdatStart + 10);
+    assert.equal(tiff.getUint16(18, true), 6, "the orientation stays");
+    assert.equal(tiff.getUint16(40, true), 0, "the GPS IFD is empty");
+    assert.deepEqual(out.subarray(out.length - picture.length), picture);
+    assert.equal((await withoutLocation(blob)).removed, false);
+  });
+
   it("leaves files it doesn't know alone", async () => {
     const blob = new Blob([ascii("just some text")]);
     const { blob: out, removed } = await withoutLocation(blob);

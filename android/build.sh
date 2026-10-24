@@ -13,7 +13,7 @@ set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 cd "$here"
 version_name=$(node -p 'require("../package.json").version')
-version_code=${CARDBOARD_ANDROID_VERSION_CODE:-2}  # Raise with VERSION in MainActivity.java and ANDROID_APP_LATEST in public/app.js.
+version_code=${CARDBOARD_ANDROID_VERSION_CODE:-3}  # Raise with VERSION in MainActivity.java and ANDROID_APP_LATEST in public/app.js.
 maven=${MAVEN_MIRROR:-https://repo1.maven.org/maven2}
 tools=$here/.tools
 build=$here/build

@@ -122,6 +122,8 @@ interface OfferRow {
   nonce_n: Uint8Array | null;
   device_id: string | null;
   envelope: Uint8Array | null;
+  confirmed: number;
+  label: Uint8Array | null;
 }
 
 /** What the device that opened an offer sees of it, step by step. */
@@ -515,16 +517,36 @@ export class Accounts {
     this.db.prepare("UPDATE pair_offers SET public_key = ?, nonce_n = ? WHERE id = ?").run(publicKey, nonce, id);
   }
 
-  /** You said the numbers match. The new device becomes yours. */
-  approveOffer(accountId: string, id: Buffer, envelope: Buffer, label: Buffer | null): Device {
+  /**
+   * You said the numbers match on the device you have. The new device is added once it has said
+   * so too (confirmOffer), in whichever order: neither side alone can add a device to an account.
+   */
+  approveOffer(accountId: string, id: Buffer, envelope: Buffer, label: Buffer | null): { kind: DeviceKind; added: Device | null } {
     return transaction(this.db, () => {
       const row = this.offerRow(id);
       if (row.account_id !== accountId) throw noOffer();
-      if (row.public_key === null || row.device_id !== null) throw fail("offer_out_of_order", 409, "That device isn't ready to be added yet.", "Wait for the number to show on both devices.");
-      const device = this.addDevice(accountId, { tokenHash: Buffer.from(row.token_hash!), kind: row.kind as DeviceKind, envelope: null, label });
-      this.db.prepare("UPDATE pair_offers SET device_id = ?, envelope = ? WHERE id = ?").run(device.id, envelope, id);
-      return device;
+      if (row.public_key === null || row.envelope !== null) throw fail("offer_out_of_order", 409, "That device isn't ready to be added yet.", "Wait for the number to show on both devices.");
+      this.db.prepare("UPDATE pair_offers SET envelope = ?, label = ? WHERE id = ?").run(envelope, label, id);
+      return { kind: row.kind as DeviceKind, added: row.confirmed ? this.finishOffer(id) : null };
     });
+  }
+
+  /** The new device says the numbers match. */
+  confirmOffer(id: Buffer, token: string): void {
+    transaction(this.db, () => {
+      const row = this.joinerRow(id, token);
+      if (row.public_key === null) throw fail("offer_out_of_order", 409, "There's no number to agree to yet.", "Wait for the number to show.");
+      this.db.prepare("UPDATE pair_offers SET confirmed = 1 WHERE id = ?").run(id);
+      if (row.envelope !== null && row.device_id === null) this.finishOffer(id);
+    });
+  }
+
+  /** Both said yes: the new device becomes the account's. */
+  private finishOffer(id: Buffer): Device {
+    const row = this.db.prepare("SELECT * FROM pair_offers WHERE id = ?").get(id) as unknown as OfferRow;
+    const device = this.addDevice(row.account_id, { tokenHash: Buffer.from(row.token_hash!), kind: row.kind as DeviceKind, envelope: null, label: row.label ? Buffer.from(row.label) : null });
+    this.db.prepare("UPDATE pair_offers SET device_id = ? WHERE id = ?").run(device.id, id);
+    return device;
   }
 
   closeOffer(accountId: string, id: Buffer) {

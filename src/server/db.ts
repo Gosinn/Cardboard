@@ -366,6 +366,18 @@ const MIGRATIONS: string[] = [
     envelope    BLOB
   ) WITHOUT ROWID;
   `,
+  `
+  -- The new device says yes too (its numbers match), and the device you have may
+  -- say yes first: its sealed key and label wait here until both have.
+  ALTER TABLE pair_offers ADD COLUMN confirmed INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE pair_offers ADD COLUMN label BLOB;
+  `,
+  // Sizes, versions and dates are stored after the (up to 1 MB) value, so reading them meant reading every value:
+  // adding up a box's size read the whole box, on every write. These indexes hold them on their own.
+  `
+  CREATE INDEX items_meta ON items(box_id, idx, name, size, version, created_at, updated_at, expires_at);
+  CREATE INDEX history_kept ON history(box_id, (value IS NULL), size);
+  `,
 ];
 
 export function openDb(path: string): DB {

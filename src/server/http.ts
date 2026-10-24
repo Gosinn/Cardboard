@@ -160,6 +160,8 @@ export async function startServer(options: StartOptions = {}): Promise<RunningCa
   const api = new Api({ db, accounts, vault, tapes, audit, hub, docks, oauth, sharing, emergency, info });
   const oauthHandler = createOAuthHandler({ oauth, api, ip: (req) => clientIp(req, info.trustProxy) });
   const statics = loadStatics();
+  const loopbackOnly = ["127.0.0.1", "localhost", "::1"].includes(host);
+  const allowedHosts = new Set(["localhost", "127.0.0.1", "::1"]);
   const modules = new Map<string, Buffer | null>();
 
   const handler = (req: IncomingMessage, res: ServerResponse) => {
@@ -175,6 +177,14 @@ export async function startServer(options: StartOptions = {}): Promise<RunningCa
     res.setHeader("referrer-policy", "no-referrer");
     res.setHeader("x-frame-options", "DENY");
     const path = new URL(req.url ?? "/", "http://cardboard.local").pathname;
+    // Listening only on this computer: answer only to this computer's own names (and the public
+    // address a tunnel brings people in by), so a web page can't reach it by pointing its own
+    // name at 127.0.0.1 (DNS rebinding).
+    if (loopbackOnly && !allowedHosts.has(hostnameOf(header(req, "host")))) {
+      res.writeHead(421, { "content-type": "text/plain; charset=utf-8" });
+      res.end("Cardboard doesn't answer to that address.");
+      return;
+    }
     if (await oauthHandler(req, res, path)) return;
 
     if (req.method === "GET" || req.method === "HEAD") {
@@ -267,7 +277,11 @@ export async function startServer(options: StartOptions = {}): Promise<RunningCa
     }
     openStream(res, auth.cors);
     res.write(`event: ready\ndata: ${JSON.stringify({ box: auth.box.id })}\n\n`);
-    stream(res, `box:${auth.box.id}`, auth.box.id, auth.tape.id, (_change: Omit<Change, "boxId">) => true, "change");
+    // Small values come along; big ones (a file's parts) are fetched by whoever wants them, so a big
+    // upload isn't pushed whole down every live connection.
+    stream(res, `box:${auth.box.id}`, auth.box.id, auth.tape.id, (_change: Omit<Change, "boxId">) => true, "change", (c) =>
+      typeof c.value === "string" && c.value.length > 64 * 1024 ? { ...c, value: undefined, large: true } : c,
+    );
   }
 
   /** The same, for one of your own devices (the dashboard): what arrives from your other devices, live. */
@@ -318,7 +332,12 @@ export async function startServer(options: StartOptions = {}): Promise<RunningCa
       boxId,
       tapeId,
       accept,
-      send: (event) => res.write(`event: ${eventName}\ndata: ${JSON.stringify(shape(event))}\n\n`),
+      send: (event) => {
+        // A connection that can't keep up (a phone on a bad network) is closed rather than queued up in memory:
+        // the other end reconnects and catches up.
+        if (res.writableLength > 4 * 1024 * 1024) return res.destroy();
+        res.write(`event: ${eventName}\ndata: ${JSON.stringify(shape(event))}\n\n`);
+      },
       close: () => {
         clearInterval(ping);
         res.end();
@@ -344,6 +363,7 @@ export async function startServer(options: StartOptions = {}): Promise<RunningCa
   const displayHost = host.includes(":") ? `[${host}]` : host;
   const localUrl = `${options.tls ? "https" : "http"}://${displayHost === "0.0.0.0" ? "127.0.0.1" : displayHost}:${info.port}`;
   info.publicUrl = (options.publicUrl ?? process.env["CARDBOARD_PUBLIC_URL"] ?? localUrl).replace(/\/+$/, "");
+  allowedHosts.add(hostnameOf(new URL(info.publicUrl).host));
 
   // The very first start makes one invite, so whoever runs Cardboard can make their own account right away.
   // Until someone has made an account, every start shows a fresh invite (and the previous one stops
@@ -496,4 +516,11 @@ function readJson(req: IncomingMessage): Promise<unknown> {
     });
     req.on("error", reject);
   });
+}
+
+/** The name in a Host header, without its port (and without [ ] around an IPv6 address). */
+function hostnameOf(value: string | undefined): string {
+  const v = (value ?? "").trim().toLowerCase();
+  if (v.startsWith("[")) return v.slice(1, v.indexOf("]"));
+  return v.replace(/:\d+$/, "");
 }

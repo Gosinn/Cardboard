@@ -276,7 +276,7 @@ export class Vault {
       );
     }
     const now = this.now();
-    let existing = this.db.prepare("SELECT version, size, expires_at FROM items WHERE box_id = ? AND idx = ?").get(box.id, item.idx) as
+    let existing = this.db.prepare("SELECT version, size, expires_at FROM items INDEXED BY items_meta WHERE box_id = ? AND idx = ?").get(box.id, item.idx) as
       | { version: number; size: number; expires_at: number | null }
       | undefined;
     if (existing && isExpired(existing.expires_at, now)) {
@@ -294,7 +294,9 @@ export class Vault {
         "Read it again and retry.",
       );
     }
-    const used = this.stats(box.id).bytes - (existing?.size ?? 0);
+    // Versions kept in history count too: otherwise rewriting one item over and over would fill the disk for free.
+    // (What it replaces isn't subtracted: that moves into history, where it still takes room.)
+    const used = this.stats(box.id).bytes + this.historyBytes(box.id);
     if (used + size > box.settings.quotaBytes) {
       throw fail(
         "quota_exceeded",
@@ -313,7 +315,7 @@ export class Vault {
         `Free up space on that computer (Cardboard keeps ${formatBytes(MIN_FREE_DISK)} free), then try again.`,
       );
     }
-    const accountUsed = this.accountBytes(box.accountId) - (existing?.size ?? 0);
+    const accountUsed = this.accountBytes(box.accountId);
     if (accountUsed + size > accountQuota) {
       throw fail(
         "account_full",
@@ -490,10 +492,14 @@ export class Vault {
       );
     }
     return this.tx(() => {
-      const rows = this.withLiveValues(boxId, this.db.prepare("SELECT * FROM history WHERE box_id = ? ORDER BY idx, version").all(boxId) as unknown as HistoryRow[]);
-      const byIdx = new Map<string, HistoryRow[]>();
+      // Which version each item had then, from the index alone: values are read only for the items that change,
+      // so rewinding a box of big files doesn't load all of them at once.
+      const rows = this.db.prepare("SELECT idx, version, at FROM history INDEXED BY history_at WHERE box_id = ? ORDER BY idx, version").all(boxId) as Array<{ idx: Uint8Array; version: number; at: number }>;
+      const liveOf = this.db.prepare("SELECT version, name FROM items INDEXED BY items_meta WHERE box_id = ? AND idx = ?");
+      const versionOf = this.db.prepare("SELECT name, value FROM history WHERE box_id = ? AND idx = ? AND version = ?");
+      const byIdx = new Map<string, Array<{ idx: Uint8Array; version: number; at: number }>>();
       for (const row of rows) {
-        const key = b64(row.idx)!;
+        const key = b64(Buffer.from(row.idx))!;
         let list = byIdx.get(key);
         if (!list) byIdx.set(key, (list = []));
         list.push(row);
@@ -502,14 +508,17 @@ export class Vault {
       for (const list of byIdx.values()) {
         const idx = Buffer.from(list[0]!.idx);
         const target = list.filter((r) => r.at <= to).at(-1);
-        const live = this.get(boxId, idx);
-        if (!target || target.value === null) {
+        const live = liveOf.get(boxId, idx) as { version: number; name: Uint8Array } | undefined;
+        if (live && target && live.version === target.version) continue;
+        // Not the live version, so a missing value means it was deleted then.
+        const then = target ? (versionOf.get(boxId, idx, target.version) as { name: Uint8Array; value: Uint8Array | null } | undefined) : undefined;
+        if (!then || then.value === null) {
           if (live) {
-            this.writeVersion(boxId, { idx, name: live.name, value: null }, null, actor);
+            this.writeVersion(boxId, { idx, name: Buffer.from(live.name), value: null }, null, actor);
             changed++;
           }
-        } else if (!live || live.version !== target.version) {
-          this.store(box, { idx, name: Buffer.from(target.name), value: Buffer.from(target.value) }, { expiresAt: null, ifVersion: undefined, actor });
+        } else {
+          this.store(box, { idx, name: Buffer.from(then.name), value: Buffer.from(then.value) }, { expiresAt: null, ifVersion: undefined, actor });
           changed++;
         }
       }
@@ -524,10 +533,20 @@ export class Vault {
     return { items: row.n, bytes: row.b };
   }
 
+  /** What an account's things take up: what's there now, and the earlier versions kept so they can be brought back. */
   accountBytes(accountId: string): number {
     const row = this.db
       .prepare("SELECT COALESCE(SUM(i.size), 0) AS b FROM items i JOIN boxes b ON b.id = i.box_id WHERE b.account_id = ?")
       .get(accountId) as { b: number };
+    const kept = this.db
+      .prepare("SELECT COALESCE(SUM(h.size), 0) AS b FROM history h JOIN boxes b ON b.id = h.box_id WHERE b.account_id = ? AND (h.value IS NULL) = 0")
+      .get(accountId) as { b: number };
+    return row.b + kept.b;
+  }
+
+  /** The earlier versions a box keeps (their values; a deletion keeps none). */
+  historyBytes(boxId: string): number {
+    const row = this.db.prepare("SELECT COALESCE(SUM(size), 0) AS b FROM history WHERE box_id = ? AND (value IS NULL) = 0").get(boxId) as { b: number };
     return row.b;
   }
 

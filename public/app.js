@@ -9,6 +9,7 @@ import { toName } from "/lib/shared/names.ts";
 import { createPasskey, hasBuiltInPasskeys, passkeyBlocker, passkeySecret } from "/lib/client/passkey.ts";
 import {
   addFile,
+  FILE_DATA,
   fileChunks,
   FRIEND_ABOUT,
   KINDS,
@@ -42,6 +43,24 @@ const app = document.getElementById("app");
 // Everything imported fine: tell boot.js the dashboard is running.
 app.dataset.started = "1";
 const nav = document.getElementById("nav");
+
+/**
+ * Docks, apps, tapes and new boxes are for people who connect their own apps.
+ * They're out of the way until you have such a box, or turn them on under You.
+ */
+let builderAuto = false;
+function builderOn() {
+  try {
+    const chosen = localStorage.getItem("cardboard-builder");
+    if (chosen) return chosen === "on";
+  } catch {
+    // Then it goes by what you have.
+  }
+  return builderAuto;
+}
+function showBuilder() {
+  for (const a of nav.querySelectorAll(".builder")) a.hidden = !builderOn();
+}
 const modal = document.getElementById("modal");
 const ORIGIN = location.origin;
 
@@ -173,12 +192,9 @@ function sendButtons(link, title) {
   return h("div", { class: "row" }, copyButton(link, "Copy link"), send);
 }
 
-function fixLine(fix) {
-  return fix ? h("div", { class: "fix" }, h("code", {}, fix), copyButton(fix)) : null;
-}
-
+/** Something worth a look, with a button to where it's fixed (the command-line fix is for the command line). */
 function insightCard(i) {
-  return h("div", { class: `insight ${i.level}` }, h("div", { class: "title" }, i.title), h("div", { class: "detail" }, i.detail), fixLine(i.fix));
+  return h("div", { class: `insight ${i.level}` }, h("div", { class: "title" }, i.title), h("div", { class: "detail" }, i.detail), i.go ? h("div", { class: "fix" }, h("a", { class: "button secondary tiny", href: i.go.page }, i.go.label)) : null);
 }
 
 let onModalClose = null;
@@ -792,7 +808,8 @@ function inviteForm(invite) {
     "form",
     { class: "stack" },
     h("p", { class: "small" }, "Make an account. This browser gets your keys; you'll get a recovery kit to keep safe."),
-    h("label", { class: "field" }, "Invite link or code", code),
+    // From an invite link, it's already filled in: nothing to look at.
+    invite ? h("details", { class: "small" }, h("summary", { class: "muted" }, "Invite (from your link)"), h("label", { class: "field" }, "Invite link or code", code)) : h("label", { class: "field" }, "Invite link or code", code),
     h("label", { class: "field" }, "What to call this browser", name),
     h("button", { type: "submit" }, "Make my account"),
     status,
@@ -800,6 +817,8 @@ function inviteForm(invite) {
   onSubmit(form, status, async () => {
     const { account: opened, kit } = await signUp({ ...getInOptions(name.value.trim()), invite: cleanInvite(code.value) });
     account = opened;
+    // Made now, while this is the only device: then the first thing sent from anywhere arrives live everywhere.
+    await account.makePersonalBox().catch(() => {});
     history.replaceState(null, "", pendingConnect ? `#connect=${pendingConnect.id}` : "#/");
     showRecovery({ kit }, render);
   });
@@ -831,12 +850,25 @@ function pairPane() {
       try {
         const joining = await joinDevice(getInOptions(""));
         start.hidden = true;
-        fill(
-          status,
-          h("p", {}, "Your other device shows a number. If it's this one, press ", h("strong", {}, "Yes"), " there:"),
-          h("div", { class: "pair-number" }, joining.number),
-          h("p", { class: "muted small" }, "Waiting for your yes…"),
-        );
+        const said = await new Promise((resolve) => {
+          const yes = h("button", { type: "button" }, "Yes, it matches");
+          const no = h("button", { type: "button", class: "secondary" }, "No");
+          yes.addEventListener("click", () => resolve(true));
+          no.addEventListener("click", () => resolve(false));
+          fill(
+            status,
+            h("p", {}, "Does your other device show this same number?"),
+            h("div", { class: "pair-number" }, joining.number),
+            h("p", { class: "small" }, "Only say yes if it's ", h("strong", {}, "your"), " device, in front of you, showing exactly this. If it shows nothing, or another number, press No: someone else answered."),
+            h("div", { class: "row" }, yes, no),
+          );
+        });
+        if (!said) {
+          start.hidden = false;
+          return fill(status, h("p", {}, "Nothing was added. Press Add this device to try again, then Add a device on your other device."));
+        }
+        await joining.confirm();
+        fill(status, h("p", { class: "muted small" }, "Now press Yes on your other device too (if you haven't)…"));
         account = await joining.wait();
         render();
       } catch (err) {
@@ -879,9 +911,14 @@ function addDevice() {
       yes.addEventListener("click", () =>
         withBusy(yes, async () => {
           try {
-            await answered.approve();
-            offer = null; // Added: closing now mustn't cancel it.
-            fill(status, h("p", {}, h("span", { class: "chip ok" }, "Added"), " It's opening your Cardboard now."));
+            const added = await answered.approve();
+            offer = null; // Said yes: closing now mustn't cancel it.
+            fill(
+              status,
+              added.id
+                ? h("p", {}, h("span", { class: "chip ok" }, "Added"), " It's opening your Cardboard now.")
+                : h("p", {}, "Now press ", h("strong", {}, "Yes, it matches"), " on the new device too. It opens your Cardboard as soon as you do."),
+            );
             close.textContent = "Done";
             close.hidden = false;
             close.addEventListener("click", () => render());
@@ -992,14 +1029,23 @@ async function renderShelf() {
   const [boxes, me, docks] = await Promise.all([account.boxes(), account.me(), account.docks()]);
   const personal = await account.personalBox(me);
   if (personal) PERSONAL_HOME = personal.name;
-  const sending = await sendCard(me, personal);
+  const headLine = h("div", { class: "muted" }, `${bytes(me.quota.used)} of ${bytes(me.quota.limit)} used`);
+  const personalShown = h("div", { class: "slot" }, personalCard(personal));
+  /** After a send or an arrival: the personal box's card and the room used, as they are now. */
+  const refreshCounts = async () => {
+    const [fresh, now] = await Promise.all([account.boxes(), account.me()]);
+    headLine.textContent = `${bytes(now.quota.used)} of ${bytes(now.quota.limit)} used`;
+    const box = fresh.find((b) => b.id === personal?.id);
+    if (box) fill(personalShown, personalCard(box));
+  };
+  const sending = await sendCard(me, personal, () => refreshCounts().catch(() => {}));
   const searchInput = h("input", { type: "search", placeholder: "Find anything in any box…", "aria-label": "Search every box" });
   const results = h("div");
   const search = h("form", { class: "search" }, searchInput, h("button", { type: "submit", class: "secondary" }, "Search"));
   onSubmit(search, results, async () => {
     const q = searchInput.value.trim();
     if (q.length < 2) return results.replaceChildren();
-    const found = await account.search(q);
+    const [found, title] = await Promise.all([account.search(q), itemTitles()]);
     fill(
       results,
       h(
@@ -1014,7 +1060,11 @@ async function renderShelf() {
             h(
               "li",
               {},
-              h("a", { href: `#/box/${encodeURIComponent(r.box)}/${encodeURIComponent(r.key)}` }, h("strong", {}, r.box), " · ", h("span", { class: "mono" }, r.key)),
+              h(
+                "a",
+                { href: `#/box/${encodeURIComponent(r.box)}/${encodeURIComponent(r.key)}` },
+                title(r.box, r.key) ? [h("strong", {}, title(r.box, r.key)), h("span", { class: "muted" }, ` · in ${r.box === PERSONAL_HOME ? "your personal box" : r.box}`)] : [h("strong", {}, r.box), " · ", h("span", { class: "mono" }, r.key)],
+              ),
               r.snippet ? h("div", { class: "muted small mono" }, `…${r.snippet}…`) : null,
             ),
           ),
@@ -1028,7 +1078,11 @@ async function renderShelf() {
 
   const insightsBox = h("section", { class: "card" }, h("h2", {}, "Worth a look"), h("p", { class: "muted small" }, "Looking through your boxes…"));
   const friends = me.profile.friends ?? {};
-  const cards = boxes.filter((b) => b.id !== personal?.id && !(b.id in friends && !b.shared)).map((b) => {
+  const others = boxes.filter((b) => b.id !== personal?.id && !(b.id in friends && !b.shared));
+  // Boxes of your own for apps, or docks: you connect apps, so their pages are worth having.
+  builderAuto = others.some((b) => !b.shared) || docks.docks.length > 0;
+  showBuilder();
+  const cards = others.map((b) => {
     const summary = h("div", { class: "muted" }, "…");
     const chips = h("div", { class: "row" });
     account
@@ -1055,20 +1109,20 @@ async function renderShelf() {
     h(
       "div",
       { class: "page-head" },
-      h("div", {}, h("h1", {}, me.profile.name ? `${me.profile.name}'s shelf` : "Your shelf"), h("div", { class: "muted" }, `${plural(boxes.length, "box").replace("boxs", "boxes")} · ${bytes(me.quota.used)} of ${bytes(me.quota.limit)}`)),
+      h("div", {}, h("h1", {}, me.profile.name ? `${me.profile.name}'s shelf` : "Your shelf"), headLine),
       h("div", { class: "row" }, shakeChip, backupChip(me.server.backup), h("button", { type: "button", class: "secondary tiny", onclick: addDevice }, "Add a device")),
     ),
     emergencyAlerts(me),
     search,
     results,
     pendingCard(docks.pending),
+    sending,
+    personalShown,
     androidAppCard(),
     ON_ANDROID ? null : installCard(),
-    sending,
-    personalCard(personal),
     friendBoxesCard(boxes, friends),
     insightsBox,
-    h("div", { class: "grid" }, cards, newBoxCard()),
+    cards.length || builderOn() ? h("div", { class: "grid" }, cards, builderOn() ? newBoxCard() : null) : null,
   );
 
   const insights = (await account.insights({ boxes, me, docks })).filter((i) => !(i.fix || "").startsWith("cardboard dock approve"));
@@ -1085,6 +1139,18 @@ async function renderShelf() {
 
 /** The live connection to your personal box while the shelf is open. */
 let shelfWatch = null;
+
+/**
+ * Pages load in the background: one that was left before it finished must not leave its live
+ * connections open. Every page's watches are closed when the next page starts.
+ */
+const pageWatches = new Set();
+function keepWatch(watch) {
+  pageWatches.add(watch);
+  return watch;
+}
+let renderGen = 0;
+let renderedGen = 0;
 /** The first send re-draws the shelf (it made your personal box); this keeps its "Sent" on screen. */
 let sentJustNow = false;
 let arrivedUnseen = 0;
@@ -1103,7 +1169,7 @@ function androidAppLink(label) {
 }
 
 /** The newest Cardboard app for Android (VERSION in android/…/MainActivity.java). */
-const ANDROID_APP_LATEST = 2;
+const ANDROID_APP_LATEST = 3;
 const ANDROID_APP_VERSION = Number(navigator.userAgent.match(/CardboardAndroid\/(\d+)/)?.[1] ?? 0);
 
 /** Inside an older Cardboard app: the new one, saved to the phone's Downloads through the app. */
@@ -1166,13 +1232,14 @@ function thisDeviceName(me) {
 }
 
 /** The "Send to yourself" card: a box to type or paste into, files to attach, and what just arrived. */
-async function sendCard(me, personal) {
+async function sendCard(me, personal, onChange = () => {}) {
   const box = personal ? await account.open(personal) : null;
   const from = thisDeviceName(me);
+  let alone = me.devices.length < 2;
   const text = h("textarea", { rows: 2, class: "plain", placeholder: "Paste a link, a note, anything. Or drop a file.", "aria-label": "What to send" });
   const picker = h("input", { type: "file", multiple: true, hidden: true });
   const attached = h("div", { class: "row" });
-  const status = h("div", { class: "small" }, sentJustNow ? h("span", { class: "chip ok" }, "Sent. It's on your other devices now.") : null);
+  const status = h("div", { class: "small" }, sentJustNow ? sentChip(alone) : null);
   sentJustNow = false;
   const arrived = h("ul", { class: "list things arrived" });
   const send = h("button", { type: "submit" }, "Send to my devices");
@@ -1224,7 +1291,9 @@ async function sendCard(me, personal) {
     const first = !target;
     // The first send makes your personal box.
     target ??= await account.open(await account.makePersonalBox());
-    await sendNow(target, from, text.value, files, status);
+    // Asked again now: a device may have been added since this page was drawn.
+    alone = (await account.me().catch(() => me)).devices.length < 2;
+    await sendNow(target, from, text.value, files, status, alone);
     text.value = "";
     files = [];
     showFiles();
@@ -1242,14 +1311,27 @@ async function sendCard(me, personal) {
     fill(
       arrived,
       fresh.length ? h("li", { class: "muted small" }, "Just arrived") : null,
-      fresh.map((t) => arrivedRow(target, t, showArrived)),
+      fresh.map((t) => arrivedRow(target, t, showArrived, status)),
     );
+    onChange();
   }
 
   await showArrived();
   shelfWatch?.close();
   shelfWatch = null;
   listen();
+  // No personal box yet: another device may make it with the first thing it sends. Look now and then, so that arrives here too.
+  if (!target) {
+    const look = setInterval(async () => {
+      if (!form.isConnected) return clearInterval(look);
+      if (document.visibilityState !== "visible") return;
+      const made = await account.personalBox(await account.me()).catch(() => null);
+      if (made && form.isConnected) {
+        clearInterval(look);
+        render();
+      }
+    }, 5000);
+  }
   // Coming back to this tab: catch up, in case the live connection dropped while the phone slept.
   const catchUp = () => {
     if (!form.isConnected) return document.removeEventListener("visibilitychange", catchUp);
@@ -1263,7 +1345,7 @@ async function sendCard(me, personal) {
     if (!target) return;
     shelfWatch?.close();
     let timer = null;
-    shelfWatch = target.watch((change) => {
+    shelfWatch = keepWatch(target.watch((change) => {
       if (!/^(notes|links|files)\//.test(change.key)) return;
       clearTimeout(timer);
       timer = setTimeout(async () => {
@@ -1275,29 +1357,50 @@ async function sendCard(me, personal) {
           document.title = `(${arrivedUnseen}) Cardboard`;
         }
       }, 300);
-    }, { onError: () => {} });
+    }, { onError: () => {} }));
   }
 }
 
+/** What "sent" means: on your other devices, or (with none yet) in your personal box, waiting for them. */
+function sentChip(alone) {
+  if (!alone) return h("span", { class: "chip ok" }, "Sent. It's on your other devices now.");
+  return h(
+    "span",
+    { class: "row" },
+    h("span", { class: "chip ok" }, "Saved in your personal box."),
+    h("span", { class: "muted" }, "Add your phone (or another computer) and it's there too."),
+    h("button", { type: "button", class: "secondary tiny", onclick: addDevice }, "Add a device"),
+  );
+}
+
 /** Seals and sends text and files, saying how it's going in `status`. */
-async function sendNow(box, from, text, files, status) {
+async function sendNow(box, from, text, files, status, alone = false) {
   if (text.trim()) await sendText(box, text, from);
   for (const file of files) {
     const progress = h("span", {}, `Sealing ${file.name}…`);
     status.replaceChildren(progress);
     await sealFile(box, file, { sentFrom: from, onProgress: (f, done) => (progress.textContent = `Sealing ${file.name}… ${Math.round(f * 100)}% (${bytes(done)} of ${bytes(file.size)})`) });
   }
-  status.replaceChildren(h("span", { class: "chip ok" }, "Sent. It's on your other devices now."));
+  status.replaceChildren(sentChip(alone));
+  status.scrollIntoView?.({ block: "nearest", behavior: "smooth" });
 }
 
-/** One thing that just arrived: open, copy or play it, keep it, or clear it. */
-function arrivedRow(box, t, refresh) {
+/** One thing that just arrived: open, copy or play it, say "got it" (it stays in your personal box), or delete it (with Undo). */
+function arrivedRow(box, t, refresh, notice) {
   const v = t.value;
   const url = t.kind === "link" ? safeUrl(v.url) : null;
-  const keep = h("button", { type: "button", class: "secondary tiny" }, "Keep");
+  const keep = h("button", { type: "button", class: "secondary tiny", title: "Takes it off this list. It stays in your personal box." }, "Got it");
   keep.addEventListener("click", () => withBusy(keep, async () => (await keepThing(box, t), refresh())));
-  const clear = h("button", { type: "button", class: "secondary tiny", "aria-label": `Clear ${v.title}` }, "Clear");
-  clear.addEventListener("click", () => withBusy(clear, async () => (await removeThing(box, t), refresh())));
+  const clear = h("button", { type: "button", class: "secondary tiny", "aria-label": `Delete ${v.title}` }, "Delete");
+  clear.addEventListener("click", () =>
+    withBusy(clear, async () => {
+      await removeThing(box, t);
+      const undo = h("button", { type: "button", class: "secondary tiny" }, "Undo");
+      undo.addEventListener("click", () => withBusy(undo, async () => (await restoreThing(box, t), notice.replaceChildren(), refresh())));
+      notice.replaceChildren(h("span", { class: "row" }, h("span", {}, `Deleted “${v.title}”.`), undo));
+      await refresh();
+    }),
+  );
   return h(
     "li",
     { class: "thing" },
@@ -1332,20 +1435,26 @@ async function takePendingShare() {
     open.onsuccess = () => resolve(open.result);
     open.onerror = () => reject(open.error);
   });
-  try {
-    return await new Promise((resolve, reject) => {
-      const tx = db.transaction("pending", "readwrite");
-      const store = tx.objectStore("pending");
-      const get = store.get("share");
-      get.onsuccess = () => {
-        store.delete("share");
-        resolve(get.result ?? null);
-      };
+  const run = (mode, fn) =>
+    new Promise((resolve, reject) => {
+      const tx = db.transaction("pending", mode);
+      const req = fn(tx.objectStore("pending"));
+      tx.oncomplete = () => resolve(req.result);
       tx.onerror = () => reject(tx.error);
     });
-  } finally {
+  // Kept until it's sent (or you say not to): a send that fails can be tried again.
+  const share = await run("readonly", (store) => store.get("share")).catch((err) => (db.close(), Promise.reject(err)));
+  if (!share) {
     db.close();
+    return null;
   }
+  return {
+    ...share,
+    done: async () => {
+      await run("readwrite", (store) => store.delete("share")).catch(() => {});
+      db.close();
+    },
+  };
 }
 
 /** #/send: you shared something to Cardboard from another app. Seal it and send it to your devices. */
@@ -1364,10 +1473,31 @@ async function renderSend() {
   if (!shared || (!shared.text && !shared.files?.length)) {
     return fill(status, h("p", {}, location.hash.includes("failed") ? "Cardboard couldn't read what was shared. Try again?" : "There's nothing waiting to be sent."), h("a", { href: "#/" }, "Go to your shelf"));
   }
+  // Shown first, and sent only when you say so: a web page (or another app) can send things here
+  // too, and nothing should land in your Cardboard that you didn't mean to keep.
+  const files = shared.files ?? [];
+  const send = await new Promise((resolve) => {
+    const yes = h("button", { type: "button" }, "Send to my devices");
+    const no = h("button", { type: "button", class: "secondary" }, "Don't send");
+    yes.addEventListener("click", () => resolve(true));
+    no.addEventListener("click", () => resolve(false));
+    fill(
+      status,
+      h("p", {}, "This was shared to Cardboard. Send it to your devices?"),
+      shared.text ? h("div", { class: "note-text card-inset" }, shared.text.length > 600 ? `${shared.text.slice(0, 600)}…` : shared.text) : null,
+      files.length ? h("ul", { class: "list small" }, files.map((f) => h("li", {}, `📎 ${f.name} · ${bytes(f.size ?? 0)}`))) : null,
+      h("div", { class: "row" }, yes, no),
+    );
+  });
+  if (!send) {
+    await shared.done?.();
+    history.replaceState(null, "", "#/send");
+    return fill(status, h("p", {}, "Not sent. Nothing was kept."), h("a", { href: "#/" }, "Go to your shelf"));
+  }
   const me = await account.me();
   const box = await account.open(await account.makePersonalBox());
   try {
-    await sendNow(box, thisDeviceName(me), shared.text ?? "", shared.files ?? [], status);
+    await sendNow(box, thisDeviceName(me), shared.text ?? "", files, status);
     await shared.done?.();
     // Not #/ itself, or "Go to your shelf" (#/) would go nowhere.
     history.replaceState(null, "", "#/send");
@@ -1425,12 +1555,13 @@ async function sealFile(box, file, options = {}) {
   }
   const list = resumeList();
   const carryOn = list[key]?.id;
+  const carryParts = list[key]?.parts;
   const { stripLocation: _, ...rest } = options;
   try {
-    await addFile(box, source, { name: file.name, type: file.type, ...rest, continueId: carryOn, keepPartsOnError: true });
+    await addFile(box, source, { name: file.name, type: file.type, ...rest, continueId: carryOn, continueParts: carryParts, keepPartsOnError: true });
   } catch (err) {
     if (err.stopped) {
-      resumeSave({ ...resumeList(), [key]: { id: err.stopped.id, at: Date.now() } });
+      resumeSave({ ...resumeList(), [key]: { id: err.stopped.id, parts: err.stopped.parts, at: Date.now() } });
       err.hint = `${bytes(err.stopped.sentBytes)} of ${bytes(file.size)} got there and is kept. Add the same file again (here, on this device) and it carries on from there.`;
     }
     throw err;
@@ -1472,6 +1603,28 @@ async function renderConvert() {
   const status = h("div", { class: "stack" });
   const results = h("ul", { class: "list" });
   const options = {};
+  /** After a conversion, new files start a new one (not piled onto the last). */
+  let converted = false;
+  const startOver = h("button", { type: "button", class: "link small", hidden: true }, "Start over");
+  const take = (list) => {
+    if (converted) {
+      files = [];
+      target = null;
+      converted = false;
+      fill(status);
+      fill(results);
+    }
+    files = [...files, ...list];
+    draw();
+  };
+  startOver.addEventListener("click", () => {
+    files = [];
+    target = null;
+    converted = false;
+    fill(status);
+    fill(results);
+    draw();
+  });
 
   const field = (label, input) => h("label", { class: "field" }, label, input);
   const select = (key, choices, initial) => {
@@ -1532,13 +1685,14 @@ async function renderConvert() {
       list.map((t) => h("button", { type: "button", class: `secondary tiny ${t.id === target ? "active" : ""}`, onclick: () => ((target = t.id), draw(), drawOptions()) }, t.label)),
     );
     go.disabled = !target;
+    startOver.hidden = !files.length;
     if (!target) fill(optionsBox);
   }
 
   picker.addEventListener("change", () => {
-    files = [...files, ...picker.files];
+    const list = [...picker.files];
     picker.value = "";
-    draw();
+    take(list);
   });
 
   go.addEventListener("click", () =>
@@ -1550,6 +1704,7 @@ async function renderConvert() {
         const made = await conv.convert(target, usable, { ...options, onProgress: (f, words) => (progress.textContent = words ? `${words} ${Math.round(f * 100)}%` : "") });
         fill(status, h("span", { class: "chip ok" }, `Done: ${plural(made.length, "file")}, made on this device.`));
         fill(results, made.map(resultRow));
+        converted = true;
       } catch (err) {
         fill(status, errorBox(err));
       }
@@ -1599,7 +1754,7 @@ async function renderConvert() {
   const card = h(
     "section",
     { class: "card stack" },
-    h("div", { class: "row" }, h("button", { type: "button", onclick: () => picker.click() }, "Choose files"), picker, h("span", { class: "muted small drop-hint" }, "or drop them here")),
+    h("div", { class: "row" }, h("button", { type: "button", onclick: () => picker.click() }, "Choose files"), picker, h("span", { class: "muted small drop-hint" }, "or drop them here"), startOver),
     chosen,
     targets,
     optionsBox,
@@ -1611,8 +1766,7 @@ async function renderConvert() {
   card.addEventListener("drop", (e) => {
     if (!e.dataTransfer?.files.length) return;
     e.preventDefault();
-    files = [...files, ...e.dataTransfer.files];
-    draw();
+    take([...e.dataTransfer.files]);
   });
   fill(
     app,
@@ -1705,7 +1859,16 @@ function friendBoxesCard(boxes, friends) {
       ? h(
           "ul",
           { class: "list" },
-          mine.map((b) => h("li", { class: "row spread" }, h("a", { href: `#/box/${encodeURIComponent(b.name)}` }, h("strong", {}, `🎁 ${b.name}`)), h("span", { class: "muted small" }, `${bytes(b.bytes)} · ${linkState(friends[b.id])}`))),
+          mine.map((b) => {
+            // Listed by the name people with the link see (sealed in the box), not the box's own name.
+            const title = h("strong", {}, `🎁 ${b.name}`);
+            account
+              .open(b)
+              .then((box) => box.get(FRIEND_ABOUT))
+              .then((about) => about?.title && (title.textContent = `🎁 ${about.title}`))
+              .catch(() => {});
+            return h("li", { class: "row spread" }, h("a", { href: `#/box/${encodeURIComponent(b.name)}` }, title), h("span", { class: "muted small" }, `${bytes(b.bytes)} · ${linkState(friends[b.id])}`));
+          }),
         )
       : null,
     h("div", { class: "row" }, make),
@@ -1742,7 +1905,7 @@ function linkChoices(current = null) {
   const how = h("select", {}, LINK_DURATIONS.map(([value, label]) => h("option", { value, selected: value === "7d" }, label)));
   return {
     fields: [
-      h("fieldset", { class: "stack small plain-fieldset" }, h("legend", {}, "People with the link can"), kinds.map((k) => h("label", { class: "row" }, k.input, k.label))),
+      h("fieldset", { class: "stack small plain-fieldset" }, h("legend", {}, "People with the link can"), kinds.map((k) => h("label", { class: "choice" }, k.input, h("span", {}, k.label)))),
       h("label", { class: "field" }, "The link works for", how),
     ],
     value: () => {
@@ -1865,7 +2028,21 @@ async function renderFriendView(pending) {
   } catch {
     link = { secret: pending };
   }
-  const box = openBox({ url: ORIGIN, tape: link.secret, onNotice: false });
+  let box;
+  try {
+    box = openBox({ url: ORIGIN, tape: String(link.secret ?? ""), onNotice: false });
+  } catch {
+    // Chat apps sometimes cut long links short, or break them over two lines.
+    return fill(
+      app,
+      h(
+        "section",
+        { class: "card stack login" },
+        h("h1", {}, "This link is incomplete"),
+        h("p", {}, "Part of it is missing, so it can't open anything. Ask whoever sent it to send it again, or copy the whole link (it's long) and paste it into your browser."),
+      ),
+    );
+  }
   let who;
   let about;
   const added = [];
@@ -1965,7 +2142,7 @@ async function renderFriendView(pending) {
         h("h1", {}, `🎁 ${about?.title || "A friend box"}`),
         canSee
           ? h("div", { class: "muted" }, about?.from ? `From ${about.from}. ` : "Someone sent you this. ", "Sealed end to end: only people with this link can see inside, not even the server it's kept on.")
-          : h("div", { class: "muted" }, about?.from ? `${about.from} is collecting files here. ` : "Someone is collecting files here. ", "Add yours: they're sealed on this device first, and only they can see what's in the box (not the other people adding, and not the server)."),
+          : h("div", { class: "muted" }, about?.from ? `${about.from} is collecting files here. ` : "Someone is collecting files here. ", "Add yours: they're sealed on this device first. This link can only add, so you (and the other people adding) can't look in; only they can."),
         expiresAt ? h("div", { class: "muted small" }, `The link works until ${new Date(expiresAt).toLocaleString()}.`) : null,
       ),
     ),
@@ -1993,14 +2170,14 @@ async function renderFriendView(pending) {
   if (!canSee) return;
   // Live: something added (by the sender, or another friend) shows up straight away.
   let timer = null;
-  friendWatch = box.watch(
+  friendWatch = keepWatch(box.watch(
     (change) => {
       if (!/^(notes|links|files)\//.test(change.key)) return;
       clearTimeout(timer);
       timer = setTimeout(() => load().catch(() => {}), 300);
     },
-    { onError: () => {} },
-  );
+    { onError: () => {}, values: false },
+  ));
 }
 
 function guestNameField() {
@@ -2208,7 +2385,15 @@ async function play(where, entry, fetchBytes) {
     }
     fill(where, h("p", { class: "muted small" }, "Opening…"));
     try {
-      player.src = URL.createObjectURL(new Blob([await fetchBytes()], { type: entry.info.type }));
+      const url = URL.createObjectURL(new Blob([await fetchBytes()], { type: entry.info.type }));
+      player.src = url;
+      // Up to 200 MB held by the page: let go of it once the player is gone (the window closed, another page).
+      const gone = new MutationObserver(() => {
+        if (player.isConnected) return;
+        URL.revokeObjectURL(url);
+        gone.disconnect();
+      });
+      gone.observe(document.body, { childList: true, subtree: true });
       player.onerror = () => fill(where, h("p", { class: "muted small" }, "This browser can't play this kind of file. Download it, then play it."));
       fill(where, player);
     } catch (err) {
@@ -2222,6 +2407,31 @@ async function play(where, entry, fetchBytes) {
 }
 
 const ICON = { note: "📝", password: "🔑", link: "🔗", file: "📎" };
+/** A file's type in words ("Word document"), not its MIME type. */
+function kindOfFile(type = "") {
+  const named = {
+    "application/pdf": "PDF",
+    "application/zip": "ZIP archive",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "Word document",
+    "application/msword": "Word document",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "Excel workbook",
+    "application/vnd.ms-excel": "Excel workbook",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": "PowerPoint",
+    "application/json": "JSON",
+    "text/plain": "text",
+    "text/csv": "spreadsheet (CSV)",
+    "text/markdown": "Markdown",
+    "application/vnd.android.package-archive": "Android app",
+  }[type];
+  if (named) return named;
+  const [group, sub = ""] = type.split("/");
+  const plain = sub.replace(/^x-/, "").split(/[.+;]/)[0].toUpperCase();
+  if (group === "image") return `${plain} picture`;
+  if (group === "video") return `${plain} video`;
+  if (group === "audio") return `${plain} sound`;
+  return "";
+}
+
 const iconOf = (t) => (t.kind !== "file" ? ICON[t.kind] : /^video\//.test(t.value.type) ? "🎬" : /^audio\//.test(t.value.type) ? "🎵" : /^image\//.test(t.value.type) ? "🖼️" : ICON.file);
 const NEW_LABEL = { note: "Note", password: "Password", link: "Link", file: "File" };
 
@@ -2341,14 +2551,21 @@ async function renderPersonal(info, me, openKey, friend = null) {
     const warn = (e) => e.preventDefault();
     addEventListener("beforeunload", warn);
     const awake = await navigator.wakeLock?.request("screen").catch(() => null);
+    // Several files: one line at the end says how all of them went, so no message is lost on the way.
+    const added = [];
+    const skipped = [];
+    let placesRemoved = 0;
+    let stopped = false;
     try {
       for (const file of chosen) {
         if (file.size > MAX_FILE_BYTES) {
-          say(h("span", {}, `${file.name} is ${bytes(file.size)}: a file can be at most ${bytes(MAX_FILE_BYTES)}.`));
+          skipped.push(`${file.name} is ${bytes(file.size)}: a file can be at most ${bytes(MAX_FILE_BYTES)}.`);
+          say(h("span", {}, skipped.at(-1)));
           continue;
         }
         if (file.size + 1024 * 1024 > room) {
-          say(h("span", {}, `There isn't room for ${file.name} (${bytes(file.size)}): ${bytes(Math.max(0, room))} left. Delete things you don't need (and free their space), or ask whoever runs your Cardboard for more room.`));
+          skipped.push(`There isn't room for ${file.name} (${bytes(file.size)}): ${bytes(Math.max(0, room))} left. Delete things you don't need (and free their space), or ask whoever runs your Cardboard for more room.`);
+          say(h("span", {}, skipped.at(-1)));
           continue;
         }
         const progress = h("span", {}, `Sealing ${file.name}…`);
@@ -2359,11 +2576,19 @@ async function renderPersonal(info, me, openKey, friend = null) {
             onProgress: (f, done) => (progress.textContent = `Sealing ${file.name}… ${Math.round(f * 100)}% (${bytes(done)} of ${bytes(file.size)})`),
           });
           room -= file.size;
+          added.push(file.name);
+          if (/taken out/.test(note)) placesRemoved++;
           say(h("span", {}, `Added ${file.name}. Sealed here before it left this device.${note}`));
         } catch (err) {
           say(err.name === "AbortError" ? h("span", {}, `Stopped. Nothing of ${file.name} was kept.`) : errorBox(err));
+          stopped = true;
           break;
         }
+      }
+      if (chosen.length > 1 && !stopped) {
+        const words = [`Added ${plural(added.length, "file")}, sealed here before they left this device.`];
+        if (placesRemoved) words.push(`Where ${placesRemoved === 1 ? "1 photo or video was" : `${placesRemoved} photos and videos were`} taken was taken out first.`);
+        say(h("div", { class: "stack" }, h("span", {}, words.join(" ")), skipped.map((t) => h("span", { class: "muted small" }, t))));
       }
     } finally {
       removeEventListener("beforeunload", warn);
@@ -2477,7 +2702,7 @@ async function renderPersonal(info, me, openKey, friend = null) {
         }),
       );
       body.push(
-        h("div", { class: "muted small" }, `${v.name} · ${bytes(v.size)}${v.type ? ` · ${v.type}` : ""}`),
+        h("div", { class: "muted small" }, `${v.name} · ${bytes(v.size)}${kindOfFile(v.type) ? ` · ${kindOfFile(v.type)}` : ""}`),
         preview,
         h("div", { class: "row" }, save, send, convertIt, progress),
         h("label", { class: "field" }, "Notes", fields.notes),
@@ -2666,7 +2891,7 @@ async function renderPersonal(info, me, openKey, friend = null) {
   });
   find.addEventListener("input", draw);
 
-  const log = await account.log({ box: info.name, limit: 30 });
+  const log = await account.log({ box: info.name, limit: 30, title: await itemTitles() });
   const page = h(
     "div",
     { class: "personal" },
@@ -2708,14 +2933,14 @@ async function renderPersonal(info, me, openKey, friend = null) {
   document.addEventListener("visibilitychange", refresh);
   // Live: what another device (or, in a friend box, a friend) adds shows up straight away.
   let changed = null;
-  shelfWatch = box.watch(
+  shelfWatch = keepWatch(box.watch(
     (change) => {
       if (!/^(notes|passwords|links|files)\//.test(change.key)) return;
       clearTimeout(changed);
       changed = setTimeout(() => modal.hidden && load().catch(() => {}), 300);
     },
     { onError: () => {} },
-  );
+  ));
 
   fill(app, page);
   await load();
@@ -2890,8 +3115,9 @@ async function browser(info, openKey) {
 
   async function load() {
     try {
-      all ??= await box.list();
-      const items = all.filter((it) => it.key.startsWith(prefix.value));
+      all ??= await box.list("", { limit: Infinity });
+      // A file's parts (file-data/…) are thousands of keys: shown only when asked for by name.
+      const items = all.filter((it) => it.key.startsWith(prefix.value) && (prefix.value.startsWith(FILE_DATA) || !it.key.startsWith(FILE_DATA)));
       fill(
         list,
         items.length === 0 ? h("p", { class: "muted small" }, "Nothing here.") : null,
@@ -3892,8 +4118,27 @@ async function renderConnect(id) {
 
 // ── Activity, Security, You ─────────────────────────────────────────────────
 
+/** Names for the personal box's (and friend boxes') things, for the log and search: "Gate code", not notes/0mv…. */
+async function itemTitles() {
+  const me = await account.me();
+  const ids = new Set([me.profile.personal, ...Object.keys(me.profile.friends ?? {})].filter(Boolean));
+  const titles = new Map();
+  await Promise.all(
+    (await account.boxes())
+      .filter((b) => ids.has(b.id) && !b.shared)
+      .map(async (b) => {
+        const { things } = await listThings(await account.open(b));
+        for (const t of things) titles.set(`${b.name}\n${t.key}`, t.value.title);
+      }),
+  ).catch(() => {});
+  return (box, key) => {
+    const part = /^file-data\/([^/]+)\//.exec(key);
+    return titles.get(`${box}\n${part ? `files/${part[1]}` : key}`) ?? null;
+  };
+}
+
 async function renderActivity() {
-  const boxes = await account.boxes();
+  const [boxes, title] = await Promise.all([account.boxes(), itemTitles()]);
   const select = h("select", { "aria-label": "Box" }, h("option", { value: "" }, "All boxes"), boxes.map((b) => h("option", { value: b.name }, b.name)));
   const list = h("div");
   const more = h("button", { type: "button", class: "secondary" }, "Load older");
@@ -3903,7 +4148,7 @@ async function renderActivity() {
       before = undefined;
       list.replaceChildren();
     }
-    const entries = await account.log({ box: select.value || undefined, limit: 100, before });
+    const entries = await account.log({ box: select.value || undefined, limit: 100, before, title });
     list.append(logLines(entries));
     before = entries.length ? entries[entries.length - 1].id : before;
     more.hidden = entries.length < 100;
@@ -4035,7 +4280,7 @@ async function renderYou() {
   const add = h(
     "form",
     { class: "stack" },
-    h("p", { class: "small" }, "On the new device, open this Cardboard (or run ", h("code", {}, `cardboard pair ${ORIGIN}`), ") and choose “Use a device I have”. Type the code it shows:"),
+    h("p", { class: "small" }, "On the new device, open this Cardboard and choose “Or use a pairing code” (or run ", h("code", {}, `cardboard pair ${ORIGIN}`), "). Type the code it shows:"),
     h("div", { class: "two" }, h("label", { class: "field" }, "Pairing code", code), h("label", { class: "field" }, "Call it", deviceName)),
     h("button", { type: "submit" }, "Approve this device"),
     addStatus,
@@ -4050,6 +4295,15 @@ async function renderYou() {
   const friendsCount = h("select", {}, [2, 3, 4, 5].map((n) => h("option", { value: n, selected: n === 3 }, `${n} friends`)));
   const friendsNeed = h("select", {}, [2, 3, 4].map((n) => h("option", { value: n, selected: n === 2 }, `any ${n} of them`)));
   const recStatus = h("div");
+  // Your plan picked again means new codes (a lost kit), which retires the old ones: say so on the button.
+  const usePlan = h("button", { type: "submit" }, "Use this plan");
+  const planButton = () => {
+    const same = choice.find((c) => c.input.checked)?.id === me.recovery && me.recoveryReady;
+    usePlan.textContent = same ? "Make new codes (the old ones stop working)" : "Use this plan";
+    usePlan.className = same ? "secondary" : "";
+  };
+  for (const c of choice) c.input.addEventListener("change", planButton);
+  planButton();
   const recovery = h(
     "form",
     { class: "stack" },
@@ -4057,8 +4311,7 @@ async function renderYou() {
       h("label", { class: `plan ${me.recovery === c.id ? "current" : ""}` }, c.input, h("div", {}, h("strong", {}, c.title), c.badge ? h("span", { class: "chip ok" }, c.badge) : null, me.recovery === c.id ? h("span", { class: "chip" }, "your plan") : null, h("div", { class: "muted small" }, c.detail))),
     ),
     h("div", { class: "row small" }, "For trusted friends:", friendsCount, friendsNeed),
-    h("button", { type: "submit" }, "Use this plan"),
-    h("p", { class: "muted small" }, "Picking a plan again makes fresh codes; the old kit or pieces stop working."),
+    usePlan,
     recStatus,
   );
   onSubmit(recovery, recStatus, async () => {
@@ -4087,7 +4340,7 @@ async function renderYou() {
     profileStatus.replaceChildren(h("span", { class: "chip ok" }, "Saved"));
   });
 
-  const confirmDelete = h("input", { placeholder: "delete", "aria-label": 'Type "delete" to confirm' });
+  const confirmDelete = h("input", { placeholder: "delete" });
   const deleteBtn = h("button", { type: "button", class: "danger" }, "Delete my account");
   const deleteStatus = h("div");
   deleteBtn.addEventListener("click", () =>
@@ -4101,7 +4354,7 @@ async function renderYou() {
   );
 
   fill(app, 
-    h("div", { class: "page-head" }, h("div", {}, h("h1", {}, "You"), h("div", { class: "muted small mono" }, me.id))),
+    h("div", { class: "page-head" }, h("h1", {}, "You")),
     emergencyAlerts(me),
     h(
       "div",
@@ -4125,11 +4378,32 @@ async function renderYou() {
         {},
         h("section", { class: "card stack" }, h("h2", {}, "If you lose every device"), h("p", { class: "small" }, "Pick how you'd get back in. Cardboard can't reset anything for you: that's what keeps everyone else out."), recovery),
         privacyCard(me),
+        builderCard(),
         await emergencyCard(),
         await inviteCard(me),
-        h("section", { class: "card stack danger-zone" }, h("h2", {}, "Delete account"), h("p", { class: "small" }, "Everything goes: boxes, history, tapes, docks, connected apps, devices."), h("div", { class: "row" }, confirmDelete, deleteBtn), deleteStatus),
+        h("section", { class: "card stack danger-zone" }, h("h2", {}, "Delete account"), h("p", { class: "small" }, "Everything goes: boxes, history, tapes, docks, connected apps, devices."), h("label", { class: "field" }, "Type delete to confirm", confirmDelete), h("div", { class: "row" }, deleteBtn), deleteStatus),
       ),
     ),
+  );
+}
+
+/** You → For app builders: docks, apps and boxes for your own apps, shown or not (on this device). */
+function builderCard() {
+  const on = h("input", { type: "checkbox", checked: builderOn() });
+  on.addEventListener("change", () => {
+    try {
+      localStorage.setItem("cardboard-builder", on.checked ? "on" : "off");
+    } catch {
+      // Private browsing: it lasts until the page reloads.
+      builderAuto = on.checked;
+    }
+    showBuilder();
+  });
+  return h(
+    "section",
+    { class: "card stack" },
+    h("h2", {}, "For app builders"),
+    h("label", { class: "choice small" }, on, h("span", {}, "Show Docks, Apps and “New box” (for connecting apps you make or run yourself)")),
   );
 }
 
@@ -4153,7 +4427,7 @@ function privacyCard(me) {
     "section",
     { class: "card stack" },
     h("h2", {}, "Privacy"),
-    h("label", { class: "row small" }, strip, "Take where photos and videos were taken out of them, on this device, before they're sealed"),
+    h("label", { class: "choice small" }, strip, h("span", {}, "Take where photos and videos were taken out of them, on this device, before they're sealed")),
     h("p", { class: "muted small" }, "Phones write the place (GPS) into every photo and video. This takes only that out: the picture, the date and which way up it is stay. Files that friends add to your friend boxes always lose it."),
     status,
   );
@@ -4221,6 +4495,9 @@ function takeEmergencyAndPairFromUrl() {
 }
 
 async function render() {
+  const gen = ++renderGen;
+  for (const watch of pageWatches) watch.close();
+  pageWatches.clear();
   closeModal(false);
   takeConnectFromUrl();
   takeShareFromUrl();
@@ -4252,6 +4529,7 @@ async function render() {
   if (pendingShare) return renderJoin(pendingShare);
   if (pendingPair) return renderApprovePair(pendingPair);
   nav.hidden = false;
+  showBuilder();
   shelfWatch?.close();
   shelfWatch = null;
   const [, rawPage, arg, key] = location.hash.split("/");
@@ -4267,6 +4545,9 @@ async function render() {
     else if (page === "send") await renderSend();
     else if (page === "convert") await renderConvert();
     else await renderShelf();
+    if (gen === renderGen) renderedGen = gen;
+    // Left before it finished, and it finished after the page you went to: draw that one again (this one drew over it).
+    else if (renderedGen === renderGen) return render();
   } catch (err) {
     if (err.code === "bad_device") {
       await browserStore.clear();

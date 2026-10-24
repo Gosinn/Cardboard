@@ -894,6 +894,18 @@ svg.qr,
   overflow-wrap: anywhere;
 }
 
+/* A radio button or checkbox with a label that wraps beside it, not under it. */
+label.choice {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+label.choice input {
+  flex: none;
+  margin-top: 3px;
+}
+
 .plain-fieldset {
   border: 0;
   padding: 0;
@@ -908,4 +920,45 @@ svg.qr,
 ul.dupes {
   border-bottom: 1px dashed var(--line, #e2d3bd);
   padding-bottom: 8px;
+}
+
+.card-inset {
+  background: var(--card-2);
+  border-radius: 8px;
+  padding: 8px 12px;
+  max-height: 12rem;
+  overflow: auto;
+}
+
+/* ── Phones: buttons big enough for a thumb, one row of tabs ─── */
+
+@media (pointer: coarse) {
+  button.tiny,
+  .button.tiny {
+    min-height: 40px;
+    padding: 8px 12px;
+  }
+  nav a,
+  nav .link {
+    padding: 10px 10px;
+  }
+}
+
+@media (max-width: 560px) {
+  /* Signing out is under You → Devices ("Sign out here"), not one stray tap from You. */
+  #signout {
+    display: none;
+  }
+  nav {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+}
+
+/* The kind of file picked to convert to: filled in, so it's plain which one. */
+.convert-targets button.active {
+  background: var(--accent);
+  color: var(--accent-ink);
+  border-color: var(--accent);
 }

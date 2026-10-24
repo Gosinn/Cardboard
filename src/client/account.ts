@@ -376,6 +376,7 @@ export async function signUp(options: GetInOptions & { invite?: string }): Promi
 /** Accepts an invite code or a whole invite link. */
 export function cleanInvite(invite: string): string {
   const match = /cbi_[A-Za-z0-9_-]{43}/.exec(invite);
+  if (!match && /cbi_|invite=/.test(invite)) throw new CardboardError("bad_invite", 0, "That invite is incomplete: part of it is missing.", "Ask whoever sent it to send it again, or copy the whole link (it's long).");
   if (!match) throw new CardboardError("bad_invite", 0, "That doesn't look like a Cardboard invite.", "It starts with cbi_, or is a link with #invite= in it.");
   return match[0];
 }
@@ -547,7 +548,9 @@ function pause(ms: number, signal?: AbortSignal): Promise<void> {
 export interface JoiningDevice {
   /** Show this; the device you already have shows it too. */
   number: string;
-  /** Resolves once you say yes on the other device. */
+  /** Says yes on this device: the numbers match. Nothing is added until both devices have. */
+  confirm(): Promise<void>;
+  /** Resolves once both devices have said yes. */
   wait(options?: { signal?: AbortSignal; everyMs?: number }): Promise<Account>;
 }
 
@@ -560,20 +563,28 @@ export async function joinDevice(options: GetInOptions & { signal?: AbortSignal;
   const rpc = new Rpc(options.url, null, options.fetch);
   const every = options.everyMs ?? 3000;
   const until = Date.now() + (options.lookForMs ?? 5 * 60_000);
+  const pair = await keyPair();
+  const nonceN = random(32);
+  const token = newDeviceToken();
+  const commitment = await pairCommitment(pair.publicKey, nonceN);
   let offer: string | undefined;
   for (;;) {
-    offer = (await rpc.call<{ offers: string[] }>("pair.find", {})).offers[0];
+    // On a shared Cardboard someone else may be adding a device too: an offer another device answered first is skipped.
+    for (const id of (await rpc.call<{ offers: string[] }>("pair.find", {})).offers) {
+      try {
+        await rpc.call("pair.join", { offer: id, commitment: toB64u(commitment), tokenHash: toB64u(await sha256(token)), kind: options.kind });
+        offer = id;
+        break;
+      } catch (err) {
+        if ((err as { code?: string }).code !== "offer_taken") throw err;
+      }
+    }
     if (offer) break;
     if (Date.now() > until) {
       throw new CardboardError("no_such_offer", 404, "Nobody pressed Add a device in the last 5 minutes.", "On a device where you're signed in, press Add a device, then try again here.");
     }
     await pause(every, options.signal);
   }
-  const pair = await keyPair();
-  const nonceN = random(32);
-  const token = newDeviceToken();
-  const commitment = await pairCommitment(pair.publicKey, nonceN);
-  await rpc.call("pair.join", { offer, commitment: toB64u(commitment), tokenHash: toB64u(await sha256(token)), kind: options.kind });
   let nonceA: string | null = null;
   while (!nonceA) {
     await pause(Math.min(every, 1000), options.signal);
@@ -582,6 +593,9 @@ export async function joinDevice(options: GetInOptions & { signal?: AbortSignal;
   await rpc.call("pair.reveal", { offer, token, publicKey: toB64u(pair.publicKey), nonce: toB64u(nonceN) });
   return {
     number: await pairNumber(commitment, pair.publicKey, nonceN, fromB64u(nonceA)),
+    async confirm() {
+      await rpc.call("pair.confirm", { offer, token });
+    },
     async wait({ signal, everyMs = 1500 } = {}) {
       for (;;) {
         const { approved } = await rpc.call<{ approved: { accountId: string; deviceId: string; envelope: string } | null }>("pair.joined", { offer, token });
@@ -600,7 +614,8 @@ export interface DeviceOffer {
   kind: DeviceKind;
   /** Say yes only if the new device shows this same number. */
   number: string;
-  approve(label?: string): Promise<{ id: string; kind: DeviceKind }>;
+  /** Says yes on this device. The new device is added once it has said yes too: `id` is null until then. */
+  approve(label?: string): Promise<{ id: string | null; kind: DeviceKind }>;
   cancel(): Promise<void>;
 }
 
@@ -836,7 +851,10 @@ export class Account {
     const write = options.write ?? !see;
     if (!see && !write) throw fail("bad_request", 400, "A link that can neither see nor add would do nothing.", "Let them see what's in it, or add to it, or both.");
     const old = me.profile.friends?.[box.id];
-    if (old) await this.revokeTape(old.tape).catch(() => undefined);
+    // Stopping the old link has to work (or it already did): never leave a link working out of sight.
+    if (old) await this.revokeTape(old.tape).catch((err) => {
+      if ((err as { code?: string }).code !== "no_such_tape") throw err;
+    });
     const about = (await (await this.open(box)).get<{ title?: string }>(FRIEND_ABOUT).catch(() => null)) ?? {};
     const title = (options.title ?? about.title ?? "").trim().slice(0, 200) || "Friend box";
     await (await this.open(box)).put(FRIEND_ABOUT, { title, from: (me.profile.name ?? "").slice(0, 100) });
@@ -935,12 +953,12 @@ export class Account {
         number: await pairNumber(commitment, publicKey, nonceN, nonceA),
         approve: async (label?: string) => {
           const envelope = await sealTo(publicKey, this.keys.root, ctx.accountKey("pairing"));
-          const res = await this.rpc.call<{ device: { id: string; kind: DeviceKind } }>("pair.offer.approve", {
+          const res = await this.rpc.call<{ device: { id: string; kind: DeviceKind } | null }>("pair.offer.approve", {
             id,
             envelope: toB64u(envelope),
             label: label ? await this.sealMeta(label, ctx.deviceLabel) : undefined,
           });
-          return res.device;
+          return res.device ?? { id: null, kind: state.kind ?? "other" };
         },
         cancel,
       };
@@ -1483,7 +1501,8 @@ export class Account {
   }
 
   /** The activity log, opened and in plain English. */
-  async log(options: { box?: string; limit?: number; before?: number } = {}): Promise<LogLine[]> {
+  /** What happened, in sentences. `title` names an item better than its key (the personal box's "Gate code", not notes/0mv…), when it can. */
+  async log(options: { box?: string; limit?: number; before?: number; title?: (box: string, key: string) => string | null | undefined } = {}): Promise<LogLine[]> {
     const boxId = options.box ? (await this.box(options.box)).id : undefined;
     const res = await this.rpc.call<{
       entries: Array<{ id: number; at: number; box: string | null; dock: string | null; actor: string; action: string; outcome: Outcome; count: number | null; note: string | null; ref: { sealed: string; ctx: string } | null; detail: string | null }>;
@@ -1524,13 +1543,15 @@ export class Account {
     return Promise.all(
       res.entries.map(async (e) => {
         const box = e.box ? (boxes.get(e.box) ?? null) : null;
+        let what = e.ref ? await this.openRef(e.ref, boxes) : null;
+        if (what && box && e.ref?.ctx.startsWith("item-name|") && options.title) what = options.title(box.name, what) ?? what;
         const opened: OpenedEntry = {
           action: e.action,
           outcome: e.outcome,
           count: e.count,
           note: e.note,
           who: await who(e.actor),
-          what: e.ref ? await this.openRef(e.ref, boxes) : null,
+          what,
           box: box?.name ?? null,
           dock: e.dock ? (dockNames.get(e.dock) ?? null) : null,
           detail: e.detail ? await this.openDetail(e.detail, box) : null,

@@ -119,11 +119,13 @@ For the video Discord won't take, or the folder you'd otherwise put in a shared 
 
 ## Small things that matter
 
-- **Location stays home.** Phones write where every photo and video was taken into the file. Cardboard takes just that out, on your device, before it's sealed: the picture, the date and which way up it is stay. (You → Privacy turns it off for your own uploads.)
+- **Location stays home.** Phones write where every photo and video was taken into the file (JPEG, PNG, WebP, iPhone HEIC, AVIF, MP4/MOV). Cardboard takes just that out, on your device, before it's sealed: the picture, the date and which way up it is stay. (You → Privacy turns it off for your own uploads.)
 - **Big uploads survive a bad connection.** A dropped connection is tried again; if it stays down, what got there is kept, and adding the same file again carries on from where it stopped.
 - **Find duplicates** in your personal box and friend boxes: the same content under any name, by its fingerprint. The oldest stays; the copies go (and can be undone).
 - **Backups somewhere else.** Everything lives on the computer Cardboard runs on; a copy on another drive (a USB stick, an SSD) is what brings it back if that computer dies. Cardboard.exe asks where once (Start menu → *Cardboard backups* to change it), copies every day, retries every hour when the drive isn't plugged in, and your shelf says how backups are doing. The copies are sealed like everything else, so any drive will do. (`--backup-to <folder>` when you run it another way.)
 - **Cardboard.exe keeps itself up to date** while it runs: it looks for a new version every hour and restarts on it in a few seconds.
+- **Only what you use is on screen.** Docks, Apps, tapes and new boxes are for connecting apps you make or run; they show up once you have such a box, or when you turn on *You → For app builders*.
+- **Things say what they are.** The activity log and search name your notes, links and files by their titles, and "Worth a look" has a button to where each thing is fixed (the command-line fixes are in `cardboard insights`).
 
 ## Convert
 
@@ -337,7 +339,7 @@ cardboard reset-host                    new host token (on the server)
 | `query({ prefix, where, sort, limit, offset })` | `where` supports equality, dot paths, array contains, `$gt $gte $lt $lte $ne $in $nin $exists $contains $startsWith $or $and $not`; runs in the SDK |
 | `history(key)` / `undo(key, { to })` | versions, newest first; undo again to redo |
 | `batch([...])` | several writes that all happen or none do |
-| `watch(prefix, onChange)` | live changes; reconnects by itself |
+| `watch(prefix, onChange, { values })` | live changes; reconnects by itself. Big values (a file's parts) aren't pushed down the connection: they're fetched for you, or skipped with `values: false` |
 | `collection(name)` | `add`, `get`, `set`, `update`, `remove`, `find`, `findOne`, `count`, `all`, `watch` with time-ordered ids |
 | `dock(name)` | `send(body, { to })`, `reply(parcel, body)`, `receive({ ack })`, `ack(parcel)`, `status()`, `on(handler, { onWaiting, onRefused })` |
 | `introduce({ title, description, url, version })` | tell Cardboard who this app is (sealed) |
@@ -370,7 +372,7 @@ cardboard host invite --note "for Siggi"      # an invite link, one use, 7 days
 
 - **Invites by default.** `--open-signup` lets anyone in (they still can't see each other's data, but they use your disk). Each account gets 10 GB unless you set `cardboard host quota <account> 50GB` (or `--account-quota` for everyone).
 - **HTTPS, always, beyond localhost.** Data is sealed either way, but tokens and the dashboard's own code aren't. Use Caddy (`reverse_proxy 127.0.0.1:8787`, then `--trust-proxy`), Tailscale, or `--tls-cert/--tls-key`.
-- **Backups:** `--backup-every 1d` (on in the Docker setup) or `cardboard host backup` writes a snapshot to `<data>/backups/` (keeps the newest 10, or 3 once the database is over 1 GB, and skips a backup that wouldn't fit on the disk). It holds only sealed data, so it's safe on any cloud drive. Keep `server.key` with it: it protects the server's own secrets (sign-in signing key, private IDs, dock pseudonyms). Lose it and apps see everyone as a new person; nobody loses data.
+- **Backups:** `--backup-every 1d` (on in the Docker setup) or `cardboard host backup` writes a snapshot to `<data>/backups/` (keeps the newest 10, or 3 once the database is over 1 GB, and skips a backup that wouldn't fit on the disk). What people keep is sealed in it, so it can't be opened without their devices. `--backup-to <folder>` also copies each one to another drive. Keep `server.key` safe *separately* (not next to the backups): it protects the server's own secrets (sign-in signing key, private IDs, dock pseudonyms), and with both, someone could pretend to be your people at apps. Lose it and apps see everyone as a new person; nobody loses data.
 - **What you can see:** `cardboard host accounts` lists every account's boxes, devices, storage and last-seen time. That's all there is.
 - **Phones:** tell people to add Cardboard to their home screen (Safari: Share → Add to Home Screen). It gets an app icon, and Safari never clears its storage, which is where that phone's key lives.
 

@@ -149,9 +149,10 @@ func findFolder() string {
 			return strings.TrimSpace(string(saved))
 		}
 	}
+	// Only folders inside your own user folder: anyone on this computer can make C:\Cardboard (or one on a USB drive) and put their own code in it.
 	home := os.Getenv("USERPROFILE")
 	for _, dir := range []string{
-		filepath.Join(home, "Cardboard"), `D:\Cardboard`, `C:\Cardboard`,
+		filepath.Join(home, "Cardboard"),
 		filepath.Join(home, "Documents", "Cardboard"), filepath.Join(home, "Desktop", "Cardboard"), filepath.Join(home, "Downloads", "Cardboard"),
 	} {
 		if isCardboard(dir) {
@@ -192,6 +193,9 @@ func keepRunning(dir, node string) {
 	git, _ := exec.LookPath("git")
 	_, repoErr := os.Stat(filepath.Join(dir, ".git"))
 	canUpdate := git != "" && repoErr == nil
+	// The version last restarted for: if pulling it didn't work (files changed by hand), Cardboard
+	// isn't restarted for it again every hour, only when a newer one comes.
+	tried := ""
 	for {
 		if answering() {
 			// Something else (start-cardboard.cmd?) is running it. Look again in a minute.
@@ -233,7 +237,11 @@ func keepRunning(dir, node string) {
 					break running
 				}
 			case <-hourly.C:
-				if canUpdate && newer(dir, git) {
+				if !canUpdate {
+					continue
+				}
+				if up := newer(dir, git); up != "" && up != tried {
+					tried = up
 					updating = true
 					_ = cmd.Process.Kill()
 					<-stopped
@@ -251,11 +259,14 @@ func keepRunning(dir, node string) {
 
 // newer says whether the Cardboard folder is behind the version on GitHub, in a way a pull can
 // simply move forward to.
-func newer(dir, git string) bool {
+func newer(dir, git string) string {
 	run(dir, 2*time.Minute, git, "fetch", "--quiet")
 	head := output(dir, git, "rev-parse", "HEAD")
 	upstream := output(dir, git, "rev-parse", "@{u}")
-	return head != "" && upstream != "" && head != upstream && quiet(dir, git, "merge-base", "--is-ancestor", "HEAD", "@{u}")
+	if head != "" && upstream != "" && head != upstream && quiet(dir, git, "merge-base", "--is-ancestor", "HEAD", "@{u}") {
+		return upstream
+	}
+	return ""
 }
 
 func hidden(dir, name string, args ...string) *exec.Cmd {
@@ -467,8 +478,9 @@ func saveSettings(s Settings) {
 		return
 	}
 	_ = os.MkdirAll(filepath.Dir(settingsFile()), 0o700)
-	if data, err := json.MarshalIndent(s, "", "  "); err == nil {
-		_ = os.WriteFile(settingsFile(), data, 0o600)
+	// Written whole under another name, then renamed: the once-a-minute check never reads half a file.
+	if data, err := json.MarshalIndent(s, "", "  "); err == nil && os.WriteFile(settingsFile()+".new", data, 0o600) == nil {
+		_ = os.Rename(settingsFile()+".new", settingsFile())
 	}
 }
 
@@ -478,7 +490,7 @@ func chooseBackups(dir string, again bool) {
 	s := loadSettings()
 	s.AskedBackup = true
 	saveSettings(s)
-	question := "Keep a backup of Cardboard somewhere else?\n\nEverything you keep in Cardboard is on this computer only. If it breaks or is lost, a copy on another drive (a USB stick, or an SSD like a T7) brings it all back. Everything in it is sealed, so any drive is safe to use.\n\nChoose where next. (You can change it later: Start menu → Cardboard backups.)"
+	question := "Keep a backup of Cardboard somewhere else?\n\nEverything you keep in Cardboard is on this computer only. If it breaks or is lost, a copy on another drive (a USB stick, or an SSD like a T7) brings it all back. What you keep is sealed in it: it can't be opened without your devices.\n\nChoose where next. (You can change it later: Start menu → Cardboard backups.)"
 	if again && s.BackupTo != "" {
 		question = "Cardboard keeps a backup copy in:\n\n" + s.BackupTo + "\n\nChoose another place? (No keeps it as it is.)"
 	}

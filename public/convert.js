@@ -161,7 +161,7 @@ export async function convert(target, files, options = {}) {
       const pages = [];
       for (let i = 0; i < files.length; i++) {
         progress(i / files.length, `Adding ${files[i].name}…`);
-        const canvas = await drawn(files[i], options.maxSide ?? 2400, true);
+        const canvas = await drawn(files[i], "maxSide" in options ? options.maxSide : 2400, true);
         pages.push({ jpeg: new Uint8Array(await (await canvasBlob(canvas, "image/jpeg", options.quality ?? 0.88)).arrayBuffer()), width: canvas.width, height: canvas.height });
       }
       progress(1, "");

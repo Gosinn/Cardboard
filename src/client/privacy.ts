@@ -5,9 +5,9 @@
  *
  * Only the location goes: everything else (which way up the photo is, the
  * date, the camera) stays, and the picture or video itself isn't touched. JPEG,
- * PNG and WebP photos (EXIF GPS, and XMP), and MP4/MOV videos (Apple's and
- * Android's location tags). Big videos are never read whole: only the part
- * that holds the tags.
+ * PNG, WebP, HEIC/HEIF and AVIF photos (EXIF GPS, and XMP), and MP4/MOV videos
+ * (Apple's and Android's location tags). Big files are never read whole: only
+ * the parts that hold the tags.
  */
 import { crc32, join } from "./formats.ts";
 
@@ -56,7 +56,7 @@ export async function withoutLocation<T extends Source>(file: T): Promise<{ blob
     if (is(0xff, 0xd8, 0xff)) return await jpeg(file);
     if (is(0x89, 0x50, 0x4e, 0x47)) return await png(file);
     if (is(0x52, 0x49, 0x46, 0x46) && latin1(head.subarray(8, 12)) === "WEBP") return await webp(file);
-    if (latin1(head.subarray(4, 8)) === "ftyp") return await mp4(file);
+    if (latin1(head.subarray(4, 8)) === "ftyp") return await isoBoxes(file);
   } catch {
     // A file this can't make sense of goes as it is, rather than not at all.
   }
@@ -104,8 +104,8 @@ export function blankGps(tiff: Uint8Array): boolean {
   return false;
 }
 
-/** XMP that says where (exif:GPSLatitude and the like). */
-const xmpHasLocation = (text: string) => /GPS(Latitude|Longitude|Altitude|Position)|Iptc4xmpExt:LocationShown|photoshop:City/.test(text);
+/** XMP that says where (exif:GPSLatitude, DJI's drone-dji:GpsLatitude and the like). */
+const xmpHasLocation = (text: string) => /GPS(Latitude|Longitude|Altitude|Position)|Iptc4xmpExt:LocationShown|photoshop:City/i.test(text);
 
 // ── JPEG ─────────────────────────────────────────────────────────────────────
 
@@ -193,13 +193,13 @@ async function webp<T extends Source>(file: T) {
   return removed ? { blob: assemble(file, [bytes]), removed } : { blob: file, removed };
 }
 
-// ── MP4 and MOV ──────────────────────────────────────────────────────────────
+// ── MP4, MOV, HEIC/HEIF and AVIF ─────────────────────────────────────────────
 
 /** Where a video was filmed, as Apple and others write it: "+64.1466-021.9426+012.000/". */
 const ISO6709 = /[+-]\d{1,3}\.\d+[+-]\d{1,3}\.\d+(?:[+-]\d+(?:\.\d+)?)?(?:CRS[^/]{0,40})?\//g;
 
-async function mp4<T extends Source>(file: T) {
-  // Find the moov box (the one with the tags) without reading the film itself.
+/** Videos keep their tags in a moov box; HEIC and AVIF photos list theirs (Exif, XMP) as items in a meta box. Found without reading the film or picture itself. */
+async function isoBoxes<T extends Source>(file: T) {
   let at = 0;
   while (at + 8 <= file.size) {
     const header = new DataView((await bytesOf(file, at, at + 16)).buffer);
@@ -217,9 +217,130 @@ async function mp4<T extends Source>(file: T) {
       if (!blankVideoLocation(moov)) return { blob: file, removed: false };
       return { blob: assemble(file, [[0, at], moov, [at + size, file.size]]), removed: true };
     }
+    if (type === "meta") {
+      if (size > 16 * 1024 * 1024) break;
+      return await heif(file, at, await bytesOf(file, at, at + size), headerSize);
+    }
     at += size;
   }
   return { blob: file, removed: false };
+}
+
+/** The boxes inside a box's bytes: [type, where its contents start, where it ends]. */
+function* children(bytes: Uint8Array, start: number, end: number): Generator<[string, number, number]> {
+  const v = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  for (let at = start; at + 8 <= end; ) {
+    let size = v.getUint32(at);
+    let headerSize = 8;
+    if (size === 1 && at + 16 <= end) {
+      size = Number(v.getBigUint64(at + 8));
+      headerSize = 16;
+    } else if (size === 0) size = end - at;
+    if (size < headerSize || at + size > end) return;
+    yield [latin1(bytes.subarray(at + 4, at + 8)), at + headerSize, at + size];
+    at += size;
+  }
+}
+
+/** A HEIC/HEIF/AVIF photo: the Exif item's GPS blanked and XMP that says where blanked with spaces, in place, so nothing moves. */
+async function heif<T extends Source>(file: T, metaAt: number, meta: Uint8Array, headerSize: number) {
+  const v = new DataView(meta.buffer, meta.byteOffset, meta.byteLength);
+  const tagged = new Map<number, "exif" | "xmp">();
+  type Extent = { inMeta: boolean; offset: number; length: number };
+  const extents = new Map<number, Extent[]>();
+  let idat = -1;
+  // meta is a full box: four bytes of version and flags before its children.
+  for (const [type, start, end] of children(meta, headerSize + 4, meta.length)) {
+    if (type === "idat") idat = start;
+    if (type === "iinf") {
+      const version = meta[start]!;
+      for (const [entry, at, stop] of children(meta, start + 4 + (version === 0 ? 2 : 4), end)) {
+        if (entry !== "infe" || meta[at]! < 2) continue;
+        const wide = meta[at]! >= 3;
+        const id = wide ? v.getUint32(at + 4) : v.getUint16(at + 4);
+        const typeAt = at + 4 + (wide ? 4 : 2) + 2;
+        const itemType = latin1(meta.subarray(typeAt, typeAt + 4));
+        if (itemType === "Exif") tagged.set(id, "exif");
+        else if (itemType === "mime" && /rdf\+xml|xmp/i.test(latin1(meta.subarray(typeAt + 4, stop)))) tagged.set(id, "xmp");
+      }
+    }
+    if (type === "iloc") {
+      const version = meta[start]!;
+      let p = start + 4;
+      const sizes = (meta[p]! << 8) | meta[p + 1]!;
+      const [offsetSize, lengthSize, baseSize, indexSize] = [sizes >> 12, (sizes >> 8) & 15, (sizes >> 4) & 15, version > 0 ? sizes & 15 : 0];
+      p += 2;
+      const read = (n: number) => {
+        const value = n === 8 ? Number(v.getBigUint64(p)) : n === 4 ? v.getUint32(p) : n === 2 ? v.getUint16(p) : 0;
+        p += n;
+        return value;
+      };
+      const count = read(version < 2 ? 2 : 4);
+      for (let i = 0; i < count && p < end; i++) {
+        const id = read(version < 2 ? 2 : 4);
+        const method = version > 0 ? read(2) & 15 : 0;
+        read(2); // data reference index
+        const base = read(baseSize);
+        const n = read(2);
+        const list: Extent[] = [];
+        for (let j = 0; j < n; j++) {
+          read(indexSize);
+          const offset = base + read(offsetSize);
+          list.push({ inMeta: method === 1, offset, length: read(lengthSize) });
+        }
+        // Method 0 is a place in the file, 1 is a place in the idat box; 2 (made from other items) has nothing to blank.
+        if (method < 2) extents.set(id, list);
+      }
+    }
+  }
+  const changed: Array<{ at: number; bytes: Uint8Array }> = [];
+  let inMetaChanged = false;
+  let removed = false;
+  for (const [id, kind] of tagged) {
+    const list = extents.get(id);
+    if (!list?.length || list.some((e) => e.length <= 0 || e.length > 16 * 1024 * 1024)) continue;
+    const parts = await Promise.all(list.map((e) => (e.inMeta ? (idat < 0 ? undefined : meta.subarray(idat + e.offset, idat + e.offset + e.length)) : bytesOf(file, e.offset, e.offset + e.length))));
+    if (parts.some((part, i) => !part || part.length !== list[i]!.length)) continue;
+    const data = join(parts as Uint8Array[]);
+    let hit = false;
+    if (kind === "exif" && data.length > 4) {
+      // Exif items start with where the TIFF header is, after these four bytes.
+      const skip = new DataView(data.buffer, data.byteOffset).getUint32(0);
+      let tiff = data.subarray(4 + skip);
+      if (!(latin1(tiff.subarray(0, 2)) === "II" || latin1(tiff.subarray(0, 2)) === "MM")) {
+        const exif = latin1(data.subarray(0, 64)).indexOf("Exif\0\0");
+        tiff = exif < 0 ? new Uint8Array() : data.subarray(exif + 6);
+      }
+      hit = blankGps(tiff);
+    } else if (kind === "xmp" && xmpHasLocation(latin1(data))) {
+      data.fill(0x20);
+      hit = true;
+    }
+    if (!hit) continue;
+    removed = true;
+    let from = 0;
+    list.forEach((e, i) => {
+      const bytes = data.subarray(from, from + e.length);
+      from += e.length;
+      if (e.inMeta) {
+        parts[i]!.set(bytes);
+        inMetaChanged = true;
+      } else changed.push({ at: e.offset, bytes });
+    });
+  }
+  if (!removed) return { blob: file, removed: false };
+  if (inMetaChanged) changed.push({ at: metaAt, bytes: meta });
+  changed.sort((a, b) => a.at - b.at);
+  const pieces: Piece[] = [];
+  let at = 0;
+  for (const c of changed) {
+    if (c.at < at) continue; // overlapping items: the first one wins
+    if (c.at > at) pieces.push([at, c.at]);
+    pieces.push(c.bytes);
+    at = c.at + c.bytes.length;
+  }
+  if (at < file.size) pieces.push([at, file.size]);
+  return { blob: assemble(file, pieces), removed: true };
 }
 
 /** Blanks location tags in a video's moov box (in place): the place becomes 0,0, nothing moves. */

@@ -106,6 +106,11 @@ export interface Watcher {
 
 export interface WatchOptions {
   onReady?: () => void;
+  /**
+   * Whether each change comes with its value (default true). Big values (over 48 KB sealed) aren't
+   * sent live: they're fetched for you. Pass false if you only need to know what changed.
+   */
+  values?: boolean;
   /** Connection problems are retried automatically; this hears about them. */
   onError?: (error: Error) => void;
 }
@@ -319,6 +324,8 @@ export class Box {
   /** Looks for secrets before anything is sealed, and refuses them if the box says so. */
   private check(o: Opened, key: string, value: unknown): { findings: Finding[]; notices: string[] } {
     if (value instanceof Uint8Array) return { findings: [], notices: [] };
+    // Your own device saving a password in your own box (the personal box's passwords) means to: that's not an app leaking one.
+    if (this.source.kind === "owned" && key.startsWith("passwords/")) return { findings: [], notices: [] };
     const findings = scan(value);
     if (o.settings?.secrets === "block") {
       const secret = findings.find((f) => SECRET_KINDS.has(f.kind));
@@ -570,12 +577,18 @@ export class Box {
         // Opening is async; a queue keeps changes in the order they happened.
         queue = queue.then(async () => {
           const o = await this.ready();
-          const raw = JSON.parse(data) as { type: "put" | "delete"; idx: string; name: string | null; value?: string; version: number | null; at: number; reason?: "expired" | "purged" };
+          const raw = JSON.parse(data) as { type: "put" | "delete"; idx: string; name: string | null; value?: string; large?: boolean; version: number | null; at: number; reason?: "expired" | "purged" };
           if (!raw.name) return;
           const key = await openText(o.keys.seal, fromB64u(raw.name), ctx.itemName(o.boxId, raw.idx));
           if (!key.startsWith(prefix)) return;
           const change: Change<T> = { type: raw.type, key, version: raw.version, at: raw.at };
-          if (raw.value) change.value = (await this.openValue(o, raw.idx, raw.value)) as T;
+          if (options?.values !== false) {
+            if (raw.value) change.value = (await this.openValue(o, raw.idx, raw.value)) as T;
+            else if (raw.large && raw.type === "put") {
+              const item = await this.getItem<T>(key).catch(() => null);
+              if (item && item.version === raw.version) change.value = item.value;
+            }
+          }
           if (raw.reason) change.reason = raw.reason;
           onChange(change);
         }).catch((err) => (options?.onError ? options.onError(err as Error) : console.warn(`[cardboard] watch: ${(err as Error).message}`)));

@@ -83,13 +83,36 @@ describe("accounts, devices and recovery", () => {
     assert.match(joining.number, /^\d{3} \d{3}$/);
     assert.equal(offer.number, joining.number, "both devices show the same number");
     assert.equal(offer.kind, "cli");
-    const [tablet] = await Promise.all([joining.wait({ everyMs: 50 }), offer.approve("Tablet")]);
+    const [tablet] = await Promise.all([joining.wait({ everyMs: 50 }), offer.approve("Tablet"), joining.confirm()]);
     assert.equal(tablet.id, t.me.id);
     await tablet.createBox("from-tablet");
     assert.ok((await t.me.boxes()).some((b) => b.name === "from-tablet"));
     assert.ok((await t.me.me()).devices.some((d) => d.name === "Tablet"));
     const left = t.cb.api.ctx.db.prepare("SELECT COUNT(*) AS n FROM pair_offers").get() as { n: number };
     assert.equal(left.n, 0, "the offer is gone once used");
+  });
+
+  it("adds nothing until the new device says yes too, so nobody can pull a new device into their account", async () => {
+    // Mallory has an account on the same server and opens an offer; the victim's new device answers it.
+    const { account: mallory } = await t.newAccount();
+    const offering = mallory.offerDevice({ everyMs: 50 });
+    const victim = await joinDevice({ ...device(), everyMs: 50 });
+    const offer = await offering;
+    // Mallory says yes without seeing the victim's screen. The victim's numbers don't match their own laptop's, so they don't.
+    const approved = await offer.approve("Not yours");
+    assert.equal(approved.id, null, "approved on one side only: nothing added");
+    const waiting = victim.wait({ everyMs: 50, signal: AbortSignal.timeout(400) });
+    await rejectsWith(waiting, "cancelled");
+    assert.equal((await mallory.me()).devices.length, 1, "Mallory's account didn't get a device");
+    // And either order works when both do say yes.
+    const second = mallory.offerDevice({ everyMs: 50 });
+    const joining = await joinDevice({ ...device(), everyMs: 50 });
+    const answered = await second;
+    await joining.confirm();
+    const [added] = await Promise.all([joining.wait({ everyMs: 50 }), answered.approve()]);
+    assert.equal(added.id, mallory.id);
+    t.cb.api.limiter.reset("127.0.0.1");
+    t.cb.api.pairings.reset("127.0.0.1");
   });
 
   it("catches a key swapped by the server, and lets only the first device answer", async () => {

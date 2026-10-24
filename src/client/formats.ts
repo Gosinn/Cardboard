@@ -27,10 +27,27 @@ export function crc32(data: Uint8Array, crc = 0): number {
   return ~c >>> 0;
 }
 
-async function through(data: Uint8Array, stream: CompressionStream | DecompressionStream): Promise<Uint8Array> {
-  const out = new Response(new Blob([data]).stream().pipeThrough(stream));
-  return new Uint8Array(await out.arrayBuffer());
+async function through(data: Uint8Array, stream: CompressionStream | DecompressionStream, limit = Infinity): Promise<Uint8Array> {
+  if (limit === Infinity) return new Uint8Array(await new Response(new Blob([data]).stream().pipeThrough(stream)).arrayBuffer());
+  // Unpacking stops as soon as it's past the limit: a tiny file can unpack to gigabytes (a "zip bomb").
+  const reader = new Blob([data]).stream().pipeThrough(stream).getReader();
+  const parts: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) return join(parts);
+    total += value.length;
+    if (total > limit) {
+      await reader.cancel();
+      throw tooBig();
+    }
+    parts.push(value);
+  }
 }
+
+/** What a .zip may unpack to here, in all: more than a phone can hold in memory at once. */
+export const ZIP_LIMIT = 1024 * 1024 * 1024;
+const tooBig = () => fail("zip_too_big", 413, "That .zip unpacks to over 1 GB, more than this can open at once.", "Open it on a computer, or zip fewer files together.");
 
 // ── ZIP ──────────────────────────────────────────────────────────────────────
 
@@ -46,10 +63,12 @@ export async function makeZip(entries: ZipEntry[], now = new Date()): Promise<Ui
   let offset = 0;
   const time = (now.getHours() << 11) | (now.getMinutes() << 5) | (now.getSeconds() >> 1);
   const date = ((Math.max(1980, now.getFullYear()) - 1980) << 9) | ((now.getMonth() + 1) << 5) | now.getDate();
+  if (entries.length >= 0xffff) throw fail("too_many", 413, "That's more than a .zip can hold without ZIP64 (65,534 files).", "Make a few smaller zips.");
   const seen = new Set<string>();
   for (const entry of entries) {
-    let name = entry.name.replace(/\\/g, "/").replace(/^\/+/, "") || "file";
-    for (let i = 2; seen.has(name); i++) name = name.replace(/(\.[^./]*)?$/, (ext) => ` (${i})${ext}`);
+    const wanted = entry.name.replace(/\\/g, "/").replace(/^\/+/, "") || "file";
+    let name = wanted;
+    for (let i = 2; seen.has(name); i++) name = wanted.replace(/(\.[^./]*)?$/, (ext) => ` (${i})${ext}`);
     seen.add(name);
     const nameBytes = encoder.encode(name);
     const crc = crc32(entry.data);
@@ -102,8 +121,8 @@ export async function makeZip(entries: ZipEntry[], now = new Date()): Promise<Ui
   return join([...parts, ...central, end]);
 }
 
-/** What's in a .zip: names and their contents (folders left out). */
-export async function readZip(zip: Uint8Array): Promise<ZipEntry[]> {
+/** What's in a .zip: names and their contents (folders left out), or only the files `want` picks. */
+export async function readZip(zip: Uint8Array, want: (name: string) => boolean = () => true, limit = ZIP_LIMIT): Promise<ZipEntry[]> {
   const view = new DataView(zip.buffer, zip.byteOffset, zip.byteLength);
   let end = -1;
   for (let i = zip.length - 22; i >= Math.max(0, zip.length - 22 - 65535); i--) {
@@ -128,13 +147,18 @@ export async function readZip(zip: Uint8Array): Promise<ZipEntry[]> {
     const local = view.getUint32(at + 42, true);
     const name = new TextDecoder(flags & 0x0800 ? "utf-8" : "latin1").decode(zip.subarray(at + 46, at + 46 + nameLength));
     at += 46 + nameLength + extra + comment;
-    if (name.endsWith("/")) continue;
+    if (name.endsWith("/") || !want(name)) continue;
     if (flags & 1) throw fail("zip_locked", 400, `${name} in that .zip has a password.`, "Open it on a computer with its password.");
     const start = local + 30 + view.getUint16(local + 26, true) + view.getUint16(local + 28, true);
     const packed = zip.subarray(start, start + size);
-    if (method === 0) out.push({ name, data: packed.slice() });
-    else if (method === 8) out.push({ name, data: await through(packed, new DecompressionStream("deflate-raw")) });
-    else throw fail("bad_zip", 400, `${name} in that .zip is packed a way this can't open (method ${method}).`, "Open it on a computer.");
+    if (method === 0) {
+      if ((limit -= packed.length) < 0) throw tooBig();
+      out.push({ name, data: packed.slice() });
+    } else if (method === 8) {
+      const data = await through(packed, new DecompressionStream("deflate-raw"), limit);
+      limit -= data.length;
+      out.push({ name, data });
+    } else throw fail("bad_zip", 400, `${name} in that .zip is packed a way this can't open (method ${method}).`, "Open it on a computer.");
   }
   return out;
 }
@@ -284,7 +308,7 @@ function unxml(v: string): string {
 
 /** The first sheet of an Excel workbook (.xlsx), as a table. */
 export async function xlsxToRows(file: Uint8Array): Promise<Rows> {
-  const entries = new Map((await readZip(file)).map((e) => [e.name, decoder.decode(e.data)]));
+  const entries = new Map((await readZip(file, (name) => (name.startsWith("xl/") && name.endsWith(".xml")) || name.endsWith(".rels"), 256 * 1024 * 1024)).map((e) => [e.name, decoder.decode(e.data)]));
   const rels = entries.get("xl/_rels/workbook.xml.rels") ?? "";
   const workbook = entries.get("xl/workbook.xml") ?? "";
   const firstId = /<sheet\b[^>]*\br:id="([^"]+)"/.exec(workbook)?.[1];
@@ -297,7 +321,8 @@ export async function xlsxToRows(file: Uint8Array): Promise<Rows> {
     shared.push(unxml((si.match(/<t[^>]*>[\s\S]*?<\/t>/g) ?? []).map((t) => t.replace(/<[^>]+>/g, "")).join("")));
   }
   const rows: Rows = [];
-  for (const row of sheet.match(/<row\b[\s\S]*?<\/row>|<row\b[^>]*\/>/g) ?? []) {
+  // An empty row (<row r="2"/>) first, or it would swallow the row after it.
+  for (const row of sheet.match(/<row\b[^>]*\/>|<row\b[^>]*[^/]>[\s\S]*?<\/row>/g) ?? []) {
     const y = Number(/\br="(\d+)"/.exec(row)?.[1] ?? rows.length + 1) - 1;
     const cells: string[] = [];
     for (const c of row.match(/<c\b[^>]*\/>|<c\b[\s\S]*?<\/c>/g) ?? []) {
@@ -314,7 +339,9 @@ export async function xlsxToRows(file: Uint8Array): Promise<Rows> {
     }
     rows[y] = Array.from(cells, (v) => v ?? "");
   }
-  const width = Math.max(0, ...rows.map((r) => r?.length ?? 0));
+  // Excel leaves blank rows out, so `rows` has gaps (which map and spread would skip, or turn into NaN).
+  let width = 0;
+  for (let y = 0; y < rows.length; y++) width = Math.max(width, rows[y]?.length ?? 0);
   return Array.from(rows, (r) => Array.from({ length: width }, (_, i) => r?.[i] ?? ""));
 }
 
@@ -335,7 +362,7 @@ export function rowsToMarkdown(rows: Rows): string {
 
 /** The text of a Word document (.docx): paragraphs, tabs and line breaks. */
 export async function docxToText(file: Uint8Array): Promise<string> {
-  const doc = (await readZip(file)).find((e) => e.name === "word/document.xml");
+  const doc = (await readZip(file, (name) => name === "word/document.xml", 256 * 1024 * 1024))[0];
   if (!doc) throw fail("bad_docx", 400, "That isn't a Word document (.docx).", "Old .doc files need saving as .docx first.");
   const body = decoder.decode(doc.data);
   return (body.match(/<w:p\b[\s\S]*?<\/w:p>|<w:p\b[^>]*\/>/g) ?? [])
@@ -422,7 +449,8 @@ export function toYaml(value: unknown, indent = ""): string {
     if (v === null || v === undefined) return "null";
     if (typeof v === "number" || typeof v === "boolean") return String(v);
     const s = String(v);
-    return /^[\w./@-][\w ./@:-]*$/.test(s) && !/^(true|false|null|yes|no|on|off|~|-?\d[\d.e+-]*)$/i.test(s) && !/:\s|\s$/.test(s) ? s : JSON.stringify(s);
+    // Plain only when it starts with a letter (not -, @, a digit or a dot: lists, reserved, numbers, .inf) and can't be read as anything else.
+    return /^[A-Za-z_][\w ./@:-]*$/.test(s) && !/^(true|false|null|yes|no|on|off|y|n)$/i.test(s) && !/:\s|\s$|:$/.test(s) ? s : JSON.stringify(s);
   };
   if (Array.isArray(value)) {
     if (!value.length) return "[]";

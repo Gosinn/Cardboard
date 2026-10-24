@@ -88,7 +88,7 @@ export function hostInsights(input: HostInsightInput): Insight[] {
       level: "tip",
       title: input.lastBackupAt === null ? "You haven't made a backup yet" : "No backup in over a week",
       detail:
-        "Backups hold only sealed data, so they're safe on any cloud drive. Keep a copy of server.key with them: without it, apps would see everyone as a new person.",
+        "Backups hold only sealed data: what people keep can't be opened without their devices. Keep server.key safe somewhere else (not with the backups): with the two together, someone could pretend to be your people at apps they sign into with Cardboard.",
       fix: "cardboard host backup",
     });
   }

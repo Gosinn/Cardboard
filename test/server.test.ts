@@ -421,6 +421,51 @@ describe("accounts and the host", () => {
   });
 });
 
+describe("limits that keep one link or app from spoiling it for everyone", () => {
+  let t: TestServer;
+  before(async () => {
+    t = await startTestServer({ shake: false });
+  });
+  after(() => t.stop());
+
+  it("counts the versions a box keeps, so rewriting one item can't fill the disk", async () => {
+    const { box } = await t.newBox("rewrites");
+    await t.me.setBoxSettings("rewrites", { quotaBytes: 3 * 1024 * 1024 });
+    const big = new Uint8Array(900 * 1024);
+    await box.put("x", big);
+    await box.put("x", big);
+    await box.put("x", big);
+    await rejectsWith(box.put("x", big), "quota_exceeded");
+    assert.ok((await t.me.me()).quota.used >= 3 * 900 * 1024, "and they show in what you use");
+  });
+
+  it("keeps a friend link to its box: no docks, no rewriting what the box says, and a collection link learns nothing", async () => {
+    const { link } = await t.me.makeFriendBox({ see: false });
+    const guest = open({ url: t.cb.url, tape: link.link.split("#friend=")[1]!.split("&")[0]!, onNotice: false });
+    const who = await guest.whoami();
+    assert.deepEqual([who.items, who.bytes], [0, 0]);
+    await rejectsWith(guest.dock("anything").send({ hi: 1 }), "not_for_links");
+    await rejectsWith(guest.introduce({ title: "Totally your bank" }), "not_for_links");
+    t.cb.api.limiter.reset("127.0.0.1");
+  });
+
+  it("answers only to its own names when it listens on this computer alone", async () => {
+    const { request } = await import("node:http");
+    const status = (host: string) =>
+      new Promise<number>((resolve, reject) => {
+        const req = request(`${t.cb.url}/v1/hello`, { method: "POST", headers: { host, "content-type": "application/json" } }, (res) => {
+          res.resume();
+          resolve(res.statusCode ?? 0);
+        });
+        req.on("error", reject);
+        req.end("{}");
+      });
+    assert.equal(await status("evil.example"), 421, "a page that pointed its own name here (DNS rebinding) gets nothing");
+    assert.equal(await status("localhost:8787"), 200);
+    assert.equal(await status(new URL(t.cb.url).host), 200);
+  });
+});
+
 describe("backups in other places", () => {
   it("copies each backup to another drive with the key to restore it, and tells people it's working", async () => {
     const elsewhere = mkdtempSync(join(tmpdir(), "cardboard-elsewhere-"));
@@ -432,8 +477,10 @@ describe("backups in other places", () => {
       assert.equal(t.cb.api.backupIfDue(DAY), true, "a second place turns on daily backups, and the first is made straight away");
       const files = (await import("node:fs")).readdirSync(join(elsewhere, "copies"));
       assert.ok(files.some((f) => /^cardboard-.*\.db$/.test(f)), files.join(","));
-      assert.ok(files.includes("server.key") && files.includes("README.txt"));
-      assert.ok(readFileSync(join(elsewhere, "copies", "server.key")).equals(readFileSync(t.cb.paths.keyFile)));
+      assert.ok(files.includes("README.txt"));
+      assert.ok(!files.includes("server.key"), "the server key isn't left next to the backups");
+      const mode = statSync(join(elsewhere, "copies", files.find((f) => f.endsWith(".db"))!)).mode & 0o777;
+      assert.equal(mode, 0o600, "the copies are readable by their owner only");
       assert.ok(!files.some((f) => f.endsWith(".part")));
       const copy = new DatabaseSync(join(elsewhere, "copies", files.find((f) => f.endsWith(".db"))!));
       assert.ok((copy.prepare("SELECT COUNT(*) AS n FROM accounts").get() as { n: number }).n >= 1, "the copy is a working database");
@@ -453,6 +500,18 @@ describe("backups in other places", () => {
       assert.equal(t2.cb.api.backupIfDue(DAY), true, "but again within the hour");
       const log = (await t2.host("host.log")).body.entries.filter((e: any) => e.action === "backup");
       assert.equal(log[0].outcome, "error");
+      for (let i = 0; i < 5; i++) {
+        t2.clock.advance(HOUR + 1000);
+        t2.cb.api.backupIfDue(DAY);
+      }
+      const local = (await import("node:fs")).readdirSync(join(t2.cb.paths.dataDir, "backups")).filter((f: string) => f.endsWith(".db"));
+      assert.equal(local.length, 1, "trying the missing place again doesn't make (and push out) a new backup each hour");
+      // The drive is back: it gets the backup it missed.
+      rmSync(join(elsewhere, "a-file"));
+      t2.clock.advance(HOUR + 1000);
+      t2.cb.api.backupIfDue(DAY);
+      assert.equal((await t2.me.me()).server.backup?.failing, 0);
+      assert.deepEqual((await import("node:fs")).readdirSync(missing).filter((f: string) => f.endsWith(".db")), local);
     } finally {
       await t2.stop();
       rmSync(elsewhere, { recursive: true, force: true });

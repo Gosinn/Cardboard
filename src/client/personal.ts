@@ -128,6 +128,26 @@ export function safeUrl(text: unknown): string | null {
   }
 }
 
+/** A web address someone typed, if it looks like one: no spaces, and a real host name (example.com, not "soup"). */
+function webAddress(text: string): string | null {
+  const url = /\s/.test(text.trim()) ? null : safeUrl(text);
+  if (!url) return null;
+  const host = new URL(url).hostname;
+  return host.includes(".") || host === "localhost" || host.startsWith("[") ? url : null;
+}
+
+/** Where a link goes, short: "example.com/recipe/soup". */
+function placeOf(url: string): string {
+  try {
+    const u = new URL(url);
+    const path = decodeURIComponent(u.pathname).replace(/\/$/, "");
+    const place = `${u.hostname.replace(/^www\./, "")}${path}`;
+    return place.length > 60 ? `${place.slice(0, 59)}…` : place;
+  } catch {
+    return hostOf(url);
+  }
+}
+
 function hostOf(url: string): string {
   try {
     return new URL(url).hostname.replace(/^www\./, "");
@@ -143,8 +163,8 @@ export function cleanValue(kind: ThingKind, input: Record<string, unknown>): Not
   const v = Object.fromEntries(FIELDS[kind].map((f) => [f, text(input[f])])) as Record<string, string>;
   for (const f of ["title", "username", "url"]) if (f in v) v[f] = v[f]!.trim().slice(0, 500);
   if (kind === "link" || (kind === "password" && v.url)) {
-    const url = safeUrl(v.url);
-    if (!url) throw fail("bad_link", 400, `"${v.url}" isn't a web address.`, "Use an address like example.com or https://example.com.");
+    const url = webAddress(v.url ?? "");
+    if (!url) throw fail("bad_link", 400, `That doesn't look like a web address: "${(v.url ?? "").slice(0, 60)}".`, "Use an address like example.com or https://example.com/page.");
     v.url = url;
   }
   if (!v.title) {
@@ -208,7 +228,7 @@ export async function sendText(box: Box, text: string, from: string): Promise<Th
   const trimmed = text.trim();
   if (!trimmed) throw fail("nothing_to_send", 400, "There's nothing to send.", "Type or paste something first, or pick a file.");
   // A lone web address becomes a link you can open; anything else, a note you can copy.
-  const url = /^\S+$/.test(trimmed) && /^(https?:\/\/|www\.)/i.test(trimmed) ? safeUrl(trimmed) : null;
+  const url = /^\S+$/.test(trimmed) && /^(https?:\/\/|www\.)/i.test(trimmed) ? webAddress(trimmed) : null;
   const kind = url ? "link" : "note";
   const value = { ...cleanValue(kind, url ? { url } : { text: trimmed }), inbox: true, from: from.slice(0, 100) };
   const key = thingKey(kind, sortableId(Date.now()));
@@ -243,7 +263,14 @@ export async function removeThing(box: Box, thing: Thing): Promise<void> {
 }
 
 export async function restoreThing(box: Box, thing: Thing): Promise<void> {
-  for (const key of keysOf(thing).slice(1)) await box.undo(key);
+  // A big file has thousands of parts: a few at a time, not one after another. The thing itself last, once its bytes are back.
+  const parts = keysOf(thing).slice(1);
+  let next = 0;
+  await Promise.all(
+    Array.from({ length: Math.min(8, parts.length) }, async () => {
+      while (next < parts.length) await box.undo(parts[next++]!);
+    }),
+  );
   await box.undo(thing.key);
 }
 
@@ -279,6 +306,8 @@ export interface UploadStopped {
   id: string;
   /** How much of it the box already has. */
   sentBytes: number;
+  /** What each part sent was (a short fingerprint by part number): pass it back as `continueParts`, so a part only counts as sent if the file still has the same bytes there. */
+  parts: Record<number, string>;
 }
 
 /**
@@ -302,6 +331,8 @@ export async function addFile(
     signal?: AbortSignal;
     onProgress?: (fraction: number, bytes: number) => void;
     continueId?: string;
+    /** From the upload that stopped (its `stopped.parts`): parts are only skipped if they're still the same. */
+    continueParts?: Record<number, string>;
     keepPartsOnError?: boolean;
     /** How long to wait before the first try again (then three times longer each time). */
     retryMs?: number;
@@ -315,28 +346,48 @@ export async function addFile(
   const id = options.continueId && /^[\w-]{8,40}$/.test(options.continueId) ? options.continueId : sortableId(Date.now());
   const parts = Math.max(1, Math.ceil(size / FILE_PART_BYTES));
   const hashes = new Uint8Array(parts * 32);
-  // Carrying on: the parts the box already has (from the same file, cut off before) aren't sent again.
+  // Carrying on: the parts the box already has (from the same file, cut off before) aren't sent again,
+  // as long as this file still has the same bytes there (a different file with the same name and size has not).
+  const before = options.continueId ? (options.continueParts ?? {}) : {};
   const have = new Set<number>();
   if (options.continueId) {
-    for (const key of await patiently(() => box.keys(`${FILE_DATA}${id}/`), options.signal, options.retryMs)) {
-      const n = Number(key.slice(`${FILE_DATA}${id}/`.length));
-      if (Number.isInteger(n) && n < parts) have.add(n);
+    try {
+      for (const key of await patiently(() => box.keys(`${FILE_DATA}${id}/`), options.signal, options.retryMs)) {
+        const n = Number(key.slice(`${FILE_DATA}${id}/`.length));
+        if (Number.isInteger(n) && n < parts && before[n]) have.add(n);
+      }
+    } catch (err) {
+      // A link that may only add can't list what's there: what this device sent is what it has.
+      if ((err as { code?: string }).code !== "write_only") throw err;
+      for (const n of Object.keys(before).map(Number)) if (Number.isInteger(n) && n < parts) have.add(n);
     }
   }
+  const fingerprints: Record<number, string> = {};
   const sent: string[] = [...have].map((n) => filePartKey(id, n));
-  let done = have.size;
+  let done = 0;
+  let entryWritten = false;
   try {
     for (let first = 0; first < parts; first += PARTS_PER_REQUEST) {
       options.signal?.throwIfAborted();
       const ops: Array<{ op: "put"; key: string; value: Uint8Array }> = [];
+      const batchPrints: Record<number, string> = {};
       for (let n = first; n < Math.min(parts, first + PARTS_PER_REQUEST); n++) {
         const bytes = new Uint8Array(await file.slice(n * FILE_PART_BYTES, (n + 1) * FILE_PART_BYTES).arrayBuffer());
-        hashes.set(await sha256(bytes), n * 32);
-        if (!have.has(n)) ops.push({ op: "put" as const, key: filePartKey(id, n), value: bytes });
+        const hash = await sha256(bytes);
+        hashes.set(hash, n * 32);
+        const print = hex(hash.subarray(0, 8));
+        if (have.has(n) && before[n] === print) {
+          fingerprints[n] = print;
+          done++;
+        } else {
+          batchPrints[n] = print;
+          ops.push({ op: "put" as const, key: filePartKey(id, n), value: bytes });
+        }
       }
       if (ops.length) {
         await patiently(() => box.batch(ops), options.signal, options.retryMs);
         sent.push(...ops.map((o) => o.key));
+        Object.assign(fingerprints, batchPrints);
         done += ops.length;
       }
       options.onProgress?.(done / parts, Math.min(size, done * FILE_PART_BYTES));
@@ -355,17 +406,28 @@ export async function addFile(
       ...(options.sentFrom !== undefined ? { inbox: true as const, from: options.sentFrom.slice(0, 100) } : {}),
     };
     const key = thingKey("file", id);
-    await patiently(() => box.put(key, value, { ifVersion: 0 }), options.signal, options.retryMs);
-    // A link that may only add (a collection box) can't read it back: what it wrote is what's there.
-    const item = await box.getItem(key).catch((err) => {
-      if ((err as { code?: string }).code === "write_only") return null;
-      throw err;
-    });
-    if (!item) return { kind: "file", id, key, value, version: 1, createdAt: Date.now(), updatedAt: Date.now() };
-    return toThing(item)! as Thing<FileValue>;
+    try {
+      await patiently(() => box.put(key, value, { ifVersion: 0 }), options.signal, options.retryMs);
+    } catch (err) {
+      if ((err as { code?: string }).code !== "already_exists") throw err;
+      // Already there: written by the try whose reply got lost, or by this same file added twice at once.
+      // Either way its parts are in use now, so they stay, whatever happens next.
+      entryWritten = true;
+      const there = await box.getItem<FileValue>(key).catch((e) => {
+        if ((e as { code?: string }).code === "write_only") return null;
+        throw e;
+      });
+      if (there && (there.value?.sha256 !== value.sha256 || there.value?.size !== size)) {
+        throw fail("file_conflict", 409, `Another file is already saved as ${name} here.`, "Add it again.");
+      }
+    }
+    // What it wrote is what's there (written only if new), so there's no need to read it back: a link that may only add (a collection box) couldn't.
+    const now = Date.now();
+    return toThing({ key, value, version: 1, size: 0, createdAt: now, updatedAt: now, expiresAt: null })! as Thing<FileValue>;
   } catch (err) {
+    if (entryWritten) throw err;
     if (options.keepPartsOnError && !options.signal?.aborted && passing(err)) {
-      (err as { stopped?: UploadStopped }).stopped = { id, sentBytes: Math.min(size, done * FILE_PART_BYTES) };
+      (err as { stopped?: UploadStopped }).stopped = { id, sentBytes: Math.min(size, done * FILE_PART_BYTES), parts: fingerprints };
       throw err;
     }
     for (let i = 0; i < sent.length; i += 200) {
@@ -460,7 +522,7 @@ export async function readFile(box: Box, file: Thing<FileValue>, onProgress?: (f
 
 /**
  * Parts left behind by an upload that never finished (the page was closed
- * part way): parts with no file listing them, untouched for 6 hours, so an
+ * part way): parts with no file listing them, untouched for 2 days, so an
  * upload still running on another device is left alone.
  */
 export async function strayParts(box: Box, things: Thing[], now = Date.now(), keep: Iterable<string> = []): Promise<string[]> {
@@ -507,7 +569,7 @@ export function subtitle(thing: Thing): string {
     case "password":
       return [v.username, v.url ? hostOf(v.url) : ""].filter(Boolean).join(" · ");
     case "link":
-      return hostOf(v.url ?? "");
+      return placeOf(v.url ?? "");
     case "file": {
       const file = thing.value as FileValue;
       return [file.name !== file.title ? file.name : "", formatBytes(file.size)].filter(Boolean).join(" · ");

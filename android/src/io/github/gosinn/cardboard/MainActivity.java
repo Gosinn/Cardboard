@@ -68,7 +68,7 @@ import org.json.JSONObject;
  * talks to the page only through a message port it hands to your Cardboard's address alone.
  */
 public class MainActivity extends Activity {
-  static final String VERSION = "2";
+  static final String VERSION = "3";
   static final int PICK_FILES = 1;
   /** The most the page reads or writes in one message, in bytes (it travels as base64). */
   static final int PIECE_MAX = 1 << 20;
@@ -118,7 +118,11 @@ public class MainActivity extends Activity {
       return insets.consumeSystemWindowInsets();
     });
     setContentView(root);
-    boolean sharing = take(getIntent());
+    // A share is taken once: not again when Android remakes this screen, or reopens the app from Recents
+    // with the intent it first came with (that would send it all a second time).
+    boolean fresh = state == null && (getIntent().getFlags() & Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY) == 0;
+    boolean sharing = fresh && take(getIntent());
+    setIntent(new Intent(Intent.ACTION_MAIN));
     if (origin == null) ask(null);
     else open(sharing ? sendPath() : "/");
   }
@@ -126,8 +130,9 @@ public class MainActivity extends Activity {
   @Override
   protected void onNewIntent(Intent intent) {
     super.onNewIntent(intent);
-    setIntent(intent);
-    if (take(intent) && origin != null) open(sendPath());
+    boolean sharing = take(intent);
+    setIntent(new Intent(Intent.ACTION_MAIN));
+    if (sharing && origin != null) open(sendPath());
   }
 
   /** The dashboard's "Send to yourself" page; a fresh path each time, so the page sees the change. */

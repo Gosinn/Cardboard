@@ -141,7 +141,9 @@ export class Audit {
 
   /** Denied entries for a box since `since`, optionally only (or never) for one action. */
   deniedSince(boxId: string, since: number, filter: { action?: string; excludeAction?: string } = {}): number {
-    let sql = "SELECT COUNT(*) AS n FROM log WHERE box_id = ? AND at >= ? AND outcome = 'denied'";
+    // Someone opening a friend box's link after it was stopped or ran out is expected, not an attack: it's in the log, but not counted.
+    let sql =
+      "SELECT COUNT(*) AS n FROM log WHERE box_id = ? AND at >= ? AND outcome = 'denied' AND NOT (action = 'auth' AND actor IN (SELECT 'tape:' || id FROM tapes WHERE box_id = log.box_id AND kind = 'link'))";
     const params: Array<string | number> = [boxId, since];
     if (filter.action) {
       sql += " AND action = ?";
