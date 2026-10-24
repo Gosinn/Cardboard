@@ -132,6 +132,8 @@ whoever runs the server can't read what's in it.
                       --account-quota 50GB  (room each person gets; default 10 GB. One person: cardboard host quota)
                       --invites host      (only the host makes invites; default: everyone can invite friends)
                       --tunnel tailscale|cloudflare   (online from this computer; sets the address and HTTPS)
+                      --self-update   (from a git checkout: every hour, bring in a newer version and stop, so whatever
+                                       started it starts it again on it: start-cardboard.cmd, a service)
   The same as environment variables: CARDBOARD_TUNNEL, CARDBOARD_PORT, CARDBOARD_HOST, CARDBOARD_DATA, CARDBOARD_PUBLIC_URL,
                       CARDBOARD_TRUST_PROXY=1, CARDBOARD_OPEN_SIGNUP=1, CARDBOARD_BACKUP_EVERY=1d, CARDBOARD_BACKUP_TO=D:\\Backups, CARDBOARD_INVITES=host,
                       CARDBOARD_ACCOUNT_QUOTA=50GB
@@ -279,6 +281,7 @@ async function main() {
       "account-quota": { type: "string" },
       invites: { type: "string" },
       tunnel: { type: "string" },
+      "self-update": { type: "boolean" },
       url: { type: "string" },
       dir: { type: "string" },
       force: { type: "boolean" },
@@ -393,6 +396,14 @@ async function main() {
         process.exit(0);
       };
       process.on("SIGINT", stop);
+      if (values["self-update"]) {
+        // Started by something that starts it again (start-cardboard.cmd, a service): a new version stops it, and it's back on the new one.
+        const { selfUpdate } = await import("./node/selfupdate.ts");
+        selfUpdate(resolve(import.meta.dirname, ".."), (version) => {
+          console.log(`\n  ${bold("A new version of Cardboard")} (${version}) is in: starting again on it…`);
+          void stop();
+        }, { say: (line) => console.log(dim(`  ${line}`)) });
+      }
       process.on("SIGTERM", stop);
       // Closing the window (Windows and Mac/Linux terminals alike).
       process.on("SIGHUP", stop);
