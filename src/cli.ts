@@ -35,6 +35,7 @@ whoever runs the server can't read what's in it.
     cardboard start --tunnel tailscale   …and put it online from this computer, free, at a fixed https:// address
     cardboard start --tunnel cloudflare  …or at a throwaway address, with no account at all
     cardboard doctor                  Why isn't my address working? (safe to paste for help)
+    cardboard move-data <folder>      Move Cardboard's storage to another folder or drive (stop Cardboard first)
     cardboard autostart [on|off]      Windows: start Cardboard by itself when you sign in, and don't sleep while plugged in
     cardboard signup [invite-link]    Make your account on this computer (prints your recovery kit)
     cardboard connect <app>           Connect the app in this folder: makes a box + tape, writes .env
@@ -328,6 +329,12 @@ async function main() {
     case "start": {
       const { startServer } = await import("./server/index.ts");
       if ((values["tls-cert"] && !values["tls-key"]) || (!values["tls-cert"] && values["tls-key"])) die("HTTPS needs both --tls-cert and --tls-key.");
+      // Its data somewhere it was moved to (another drive): if that's not there (unplugged), it waits, rather than start an empty Cardboard.
+      if (process.env["CARDBOARD_DATA_MUST_EXIST"] === "1") {
+        const { resolvePaths } = await import("./server/setup.ts");
+        const { dbFile, dataDir } = resolvePaths({ dataDir: values.data });
+        if (!existsSync(dbFile)) die(`Cardboard's data isn't at ${dataDir} (is that drive plugged in?).`, "Plug it in: Cardboard starts again by itself.");
+      }
       const tunnelKind = values.tunnel ?? process.env["CARDBOARD_TUNNEL"];
       let tunnel: Tunnel | null = null;
       if (tunnelKind) {
@@ -461,6 +468,23 @@ async function main() {
     }
 
     // Everything needed to say why the address doesn't work. Nothing secret, so it's safe to paste for help.
+    case "move-data": {
+      // Cardboard's storage to another folder or drive (Cardboard stopped). Cardboard.exe does this from Start menu → Cardboard storage.
+      const to = args[0];
+      if (!to) die("Where to? cardboard move-data <folder>", "For example: cardboard move-data X:\\");
+      const { resolvePaths } = await import("./server/setup.ts");
+      const from = resolvePaths({ dataDir: values.data }).dataDir;
+      const port = Number(values.port ?? process.env["CARDBOARD_PORT"] ?? 8787);
+      const running = await fetch(`http://127.0.0.1:${port}/v1/hello`, { method: "POST", body: "{}", headers: { "content-type": "application/json" } }).then(() => true, () => false);
+      if (running) die("Cardboard is running: stop it first, so nothing changes while it moves.", "Cardboard.exe does this for you: Start menu → Cardboard storage.");
+      const { moveData } = await import("./node/movedata.ts");
+      const { target, bytes } = moveData(from, to);
+      console.log(`✓ Moved ${formatBytes(bytes)} to ${target}`);
+      console.log(dim(`  Start Cardboard with --data "${target}" (or CARDBOARD_DATA). The old copy is still at ${from}: delete it once Cardboard runs from the new place.`));
+      console.log(`MOVED ${target}`);
+      return;
+    }
+
     case "autostart": {
       // Windows: a small launcher in your Startup folder runs start-cardboard.cmd, minimized, when you sign in.
       const appData = process.env["APPDATA"];

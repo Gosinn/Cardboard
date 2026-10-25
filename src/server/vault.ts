@@ -312,7 +312,7 @@ export class Vault {
         "disk_full",
         507,
         "The computer Cardboard runs on is nearly out of space, so it isn't taking new data.",
-        `Free up space on that computer (Cardboard keeps ${formatBytes(MIN_FREE_DISK)} free), then try again.`,
+        `Whoever runs it: free up space on that computer (Cardboard keeps ${formatBytes(MIN_FREE_DISK)} free), or move Cardboard's storage to a bigger drive (Windows: Start menu → Cardboard storage), then try again.`,
       );
     }
     const accountUsed = this.accountBytes(box.accountId);

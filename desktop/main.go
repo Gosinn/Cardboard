@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -51,7 +52,8 @@ func main() {
 	}
 	dir := filepath.Dir(exe)
 	args := os.Args[1:]
-	if escapeParentJob(exe, args) {
+	// Moving the storage runs where it was started (it starts Cardboard again itself, which then leaves the job).
+	if !has(args, "--storage") && escapeParentJob(exe, args) {
 		return
 	}
 	background := has(args, "--background")
@@ -86,6 +88,10 @@ func main() {
 	if err != nil {
 		fail("Cardboard needs Node.js, and it isn't on this computer (or Windows can't find it).\n\nInstall Node.js LTS from nodejs.org, then open Cardboard again.")
 	}
+	if has(args, "--storage") {
+		moveStorage(filepath.Join(dir, "Cardboard.exe"), dir, node, args)
+		return
+	}
 
 	// One copy keeps Cardboard running; any other copy only opens the window.
 	name, _ := syscall.UTF16PtrFromString("Local\\CardboardDesktop")
@@ -102,6 +108,7 @@ func main() {
 	if !background {
 		firstRun(filepath.Join(dir, "Cardboard.exe"), dir, has(args, "--on-desktop"))
 		backupsShortcut(filepath.Join(dir, "Cardboard.exe"), dir)
+		storageShortcut(filepath.Join(dir, "Cardboard.exe"), dir)
 		if !loadSettings().AskedBackup {
 			chooseBackups(dir, false)
 		}
@@ -234,14 +241,25 @@ func keepRunning(dir, node string) {
 			time.Sleep(time.Minute)
 			continue
 		}
+		settings := loadSettings()
+		if settings.DataDir != "" {
+			if _, err := os.Stat(filepath.Join(settings.DataDir, "cardboard.db")); err != nil {
+				// Its drive isn't plugged in (or not there yet): wait for it, rather than start an empty Cardboard.
+				time.Sleep(30 * time.Second)
+				continue
+			}
+		}
 		if canUpdate {
 			update(dir, git)
 		}
 		cmd := hidden(dir, node, "src/cli.ts", "start", "--tunnel", "tailscale")
-		settings := loadSettings()
 		cmd.Env = os.Environ()
 		if settings.BackupTo != "" {
 			cmd.Env = append(cmd.Env, "CARDBOARD_BACKUP_TO="+settings.BackupTo)
+		}
+		if settings.DataDir != "" {
+			// Moved to another drive: if it's unplugged, Cardboard stops (and is tried again) rather than start empty.
+			cmd.Env = append(cmd.Env, "CARDBOARD_DATA="+settings.DataDir, "CARDBOARD_DATA_MUST_EXIST=1")
 		}
 		if cmd.Start() != nil {
 			time.Sleep(15 * time.Second)
@@ -261,8 +279,8 @@ func keepRunning(dir, node string) {
 			case <-stopped:
 				break running
 			case <-minutely.C:
-				// Where backups go changed (Start menu → Cardboard backups): start again with it.
-				if loadSettings().BackupTo != settings.BackupTo {
+				// Where backups go changed (Start menu → Cardboard backups), or where it keeps everything: start again with it.
+				if now := loadSettings(); now.BackupTo != settings.BackupTo || now.DataDir != settings.DataDir {
 					updating = true
 					_ = cmd.Process.Kill()
 					<-stopped
@@ -491,6 +509,7 @@ func regString(root syscall.Handle, path, name string) string {
 type Settings struct {
 	BackupTo    string `json:"backupTo,omitempty"`
 	AskedBackup bool   `json:"askedBackup,omitempty"`
+	DataDir     string `json:"dataDir,omitempty"` // Where Cardboard keeps everything, once moved (Start menu → Cardboard storage).
 }
 
 func settingsFile() string {
@@ -557,6 +576,156 @@ func backupsShortcut(exe, dir string) {
 		return
 	}
 	shortcutNamed(exe, dir, "Programs", "--backups", "Cardboard backups")
+}
+
+// ── Storage on another drive ─────────────────────────────────────────────────
+
+// storageShortcut puts "Cardboard storage" in the Start menu, to move where Cardboard keeps everything.
+func storageShortcut(exe, dir string) {
+	if _, err := os.Stat(filepath.Join(os.Getenv("APPDATA"), "Microsoft", "Windows", "Start Menu", "Programs", "Cardboard storage.lnk")); err == nil {
+		return
+	}
+	shortcutNamed(exe, dir, "Programs", "--storage", "Cardboard storage")
+}
+
+// dataDir is where Cardboard keeps everything now.
+func dataDir(dir string) string {
+	if d := loadSettings().DataDir; d != "" {
+		return d
+	}
+	return filepath.Join(dir, "cardboard-data")
+}
+
+// moveStorage moves everything Cardboard keeps (one sealed database, its key and backups) to another
+// drive: it stops Cardboard, has Cardboard copy and check it (cardboard move-data), starts Cardboard
+// again from there, then offers to delete the old copy. `--storage X:\` does it without asking
+// (add --delete-old to delete the old copy once Cardboard runs from the new place); what happened
+// goes in %LOCALAPPDATA%\Cardboard\storage.txt.
+func moveStorage(exe, dir, node string, args []string) {
+	picked := ""
+	for i, a := range args {
+		if a == "--storage" && i+1 < len(args) && !strings.HasPrefix(args[i+1], "--") {
+			picked = args[i+1]
+		}
+	}
+	asking := picked == ""
+	old := dataDir(dir)
+	say := func(text string, flags uintptr) uintptr {
+		if local := os.Getenv("LOCALAPPDATA"); local != "" {
+			_ = os.MkdirAll(filepath.Join(local, "Cardboard"), 0o700)
+			_ = os.WriteFile(filepath.Join(local, "Cardboard", "storage.txt"), []byte(time.Now().Format(time.RFC3339)+"\r\n"+strings.ReplaceAll(text, "\n", "\r\n")+"\r\n"), 0o600)
+		}
+		if !asking {
+			return idYes
+		}
+		return message("Cardboard storage", text, flags)
+	}
+	if asking {
+		question := "Cardboard keeps everything people put in it here:\n\n" + old + "\n\nMove it to another drive with more room? Cardboard is offline while it copies (a few minutes for a few GB), then starts again from there. Nothing is lost: the old copy stays until you say to delete it."
+		if message("Cardboard storage", question, mbYesNo|mbIconInformation) != idYes {
+			return
+		}
+		for {
+			picked = pickFolder("Where should Cardboard keep everything? (Pick a drive with room, like X:)")
+			if picked == "" {
+				return
+			}
+			if strings.EqualFold(filepath.VolumeName(picked), filepath.VolumeName(old)) {
+				if message("Cardboard storage", "That's the same drive it's on now, so it wouldn't make any room.\n\nChoose another drive?", mbYesNo|mbIconWarning) == idYes {
+					continue
+				}
+				return
+			}
+			break
+		}
+	}
+
+	stopCardboard(dir)
+	cmd := hidden(dir, node, "src/cli.ts", "move-data", picked)
+	cmd.Env = append(os.Environ(), "CARDBOARD_DATA="+old)
+	out, _ := cmd.CombinedOutput()
+	target := ""
+	for _, line := range strings.Split(string(out), "\n") {
+		if strings.HasPrefix(line, "MOVED ") {
+			target = strings.TrimSpace(strings.TrimPrefix(line, "MOVED "))
+		}
+	}
+	if target == "" {
+		startCardboard(exe, dir)
+		say("Nothing was moved, and Cardboard is starting again where it was.\n\n"+plain(string(out)), mbOK|mbIconWarning)
+		return
+	}
+	s := loadSettings()
+	s.DataDir = target
+	saveSettings(s)
+	startCardboard(exe, dir)
+	deadline := time.Now().Add(3 * time.Minute)
+	for !answering() && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Second)
+	}
+	if !answering() {
+		say("Everything was copied to:\n\n"+target+"\n\nbut Cardboard hasn't started from there yet. The old copy is still at "+old+", untouched.", mbOK|mbIconWarning)
+		return
+	}
+	done := "Done. Cardboard now keeps everything in:\n\n" + target + "\n\nand it's running from there."
+	if strings.EqualFold(filepath.Clean(old), filepath.Clean(target)) {
+		say(done, mbOK|mbIconInformation)
+		return
+	}
+	remove := has(args, "--delete-old")
+	if asking {
+		remove = say(done+"\n\nDelete the old copy at "+old+" to free up that space? (No keeps it.)", mbYesNo|mbIconInformation) == idYes
+	}
+	if remove && os.RemoveAll(old) == nil {
+		say(done+"\n\nThe old copy at "+old+" is deleted.", mbOK|mbIconInformation)
+	} else if !asking {
+		say(done+"\n\nThe old copy is still at "+old+".", mbOK|mbIconInformation)
+	}
+}
+
+// plain is what Cardboard printed, without the terminal's colours.
+func plain(text string) string {
+	var b strings.Builder
+	for i := 0; i < len(text); i++ {
+		if text[i] == 0x1b {
+			for i < len(text) && text[i] != 'm' {
+				i++
+			}
+			continue
+		}
+		b.WriteByte(text[i])
+	}
+	return strings.TrimSpace(b.String())
+}
+
+// stopCardboard stops every other Cardboard.exe (with what it started) and any Cardboard started some
+// other way (start-cardboard.cmd), and waits until nothing answers.
+func stopCardboard(dir string) {
+	script := `Get-CimInstance Win32_Process | Where-Object {
+  ($_.Name -like 'Cardboard.exe*' -and $_.ProcessId -ne [int]$env:CB_SELF) -or
+  ($_.Name -eq 'node.exe' -and $_.CommandLine -like '*cli.ts*start*')
+} | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`
+	for try := 0; try < 3; try++ {
+		cmd := hidden(dir, "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "-")
+		cmd.Stdin = strings.NewReader(script)
+		cmd.Env = append(os.Environ(), "CB_SELF="+strconv.Itoa(os.Getpid()))
+		_ = cmd.Run()
+		deadline := time.Now().Add(20 * time.Second)
+		for answering() && time.Now().Before(deadline) {
+			time.Sleep(time.Second)
+		}
+		if !answering() {
+			break
+		}
+	}
+	time.Sleep(2 * time.Second) // Windows lets go of the database file.
+}
+
+// startCardboard starts the Cardboard.exe that keeps Cardboard running, in the background.
+func startCardboard(exe, dir string) {
+	cmd := exec.Command(exe, "--background")
+	cmd.Dir = dir
+	_ = cmd.Start()
 }
 
 // firstRun puts Cardboard on the desktop and in the Start menu, once, and asks about starting with Windows.
