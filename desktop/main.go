@@ -51,6 +51,9 @@ func main() {
 	}
 	dir := filepath.Dir(exe)
 	args := os.Args[1:]
+	if escapeParentJob(exe, args) {
+		return
+	}
 	background := has(args, "--background")
 
 	if !isCardboard(dir) {
@@ -107,6 +110,35 @@ func main() {
 	if keeper {
 		select {} // Keep Cardboard running until Windows signs out (or Task Manager ends "Cardboard").
 	}
+}
+
+// escapeParentJob: started from inside another program's job (a terminal, an assistant's session), Cardboard
+// would be stopped when that program closes, and its address would answer "502 Bad Gateway". So it starts
+// itself again outside it: breaking away from the job if it allows that, or else through Windows' shell.
+func escapeParentJob(exe string, args []string) bool {
+	if has(args, "--free") {
+		return false
+	}
+	var inJob int32
+	self, _ := syscall.GetCurrentProcess()
+	if ok, _, _ := kernel32.NewProc("IsProcessInJob").Call(uintptr(self), 0, uintptr(unsafe.Pointer(&inJob))); ok == 0 || inJob == 0 {
+		return false
+	}
+	cmd := exec.Command(exe, append(append([]string{}, args...), "--free")...)
+	cmd.Dir = filepath.Dir(exe)
+	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: breakawayFromJob}
+	if cmd.Start() == nil {
+		return true
+	}
+	// The job doesn't let anything leave it. Explorer starts it instead (once a minute at most, so a
+	// computer where everything runs in a job doesn't go round and round).
+	marker := filepath.Join(os.Getenv("LOCALAPPDATA"), "Cardboard", "escaped")
+	if info, err := os.Stat(marker); err == nil && time.Since(info.ModTime()) < time.Minute {
+		return false
+	}
+	_ = os.MkdirAll(filepath.Dir(marker), 0o700)
+	_ = os.WriteFile(marker, nil, 0o600)
+	return exec.Command("explorer.exe", exe).Start() == nil
 }
 
 func has(args []string, flag string) bool {
