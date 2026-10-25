@@ -19,6 +19,7 @@ A personal, end-to-end encrypted backend: each app gets a box, opened with a tap
 - `Dockerfile`, `compose.yaml`, `railway.json`, `deploy/` (container entrypoint that drops root, Caddyfile, systemd unit), `docs/DEPLOY.md`: running it for real. `docs/APPS.md`: connecting a website with Sign in with Cardboard.
 
 ## Rules
+- Light is right. Every feature earns its weight: no monthly bills, no new outside code, no data kept twice, nothing kept forever that nobody needs. If it can't run on an old laptop in a cardboard box, it doesn't ship.
 - Zero runtime dependencies. Node built-ins and WebCrypto only.
 - The server must never be able to open anything a person stored. Anything a person wrote (values, key names, box/dock names, labels, profiles) reaches the server sealed by a key it doesn't have. If a feature needs content, it runs on the device or in the SDK.
 - Every seal uses a context from `src/shared/contexts.ts` that binds it to where it lives (box id, item index…). Never change an existing context.

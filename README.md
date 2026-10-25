@@ -6,6 +6,8 @@ The everyday things should be easy: **send a link, a note or a photo to yourself
 
 Every app you build gets its own **box**. Apps open their box with a **tape**. Everything is sealed on your devices and inside your apps before it leaves them, so the Cardboard server only ever stores bytes it can't open: not your data, not your key names, not even your box names. Cardboard still remembers every version, tells you in plain English who touched what, and attacks itself to prove the locks hold.
 
+**Light is right.** Cardboard is light, like its name: no monthly bills, no outside code, no data kept twice, nothing kept forever that nobody needs. It runs on an old laptop in a cardboard box.
+
 It's one small Node server with **zero runtime dependencies** and a single SQLite file, so it runs on a laptop, a Raspberry Pi, or a $5 VPS, for you alone or for your family and friends: each person has their own keys, a **personal box** for notes, passwords, links and files that opens on every device they sign in on, can lock their phone's copy with **Face ID**, can **share a box** with someone else (a family shopping list, a shared trip) without the server ever seeing inside, and can leave **emergency access** for someone they trust.
 
 ```ts
