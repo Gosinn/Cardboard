@@ -2949,7 +2949,7 @@ function nameField(label, example) {
 function newBoxCard() {
   const name = nameField("Box name", builderOn() ? "e.g. Photos, or LORE" : "e.g. Photos");
   const status = h("div");
-  const forApp = h("button", { type: "submit", class: "secondary", value: "app" }, "Make box + tape (for an app)");
+  const forApp = h("button", { type: "submit", class: "secondary", value: "app", title: "A tape is the key an app uses to get into this box (and only this one)." }, "Make box + tape (a key for an app)");
   const form = h(
     "form",
     { class: "boxcard new stack" },
@@ -2982,8 +2982,9 @@ async function renderBox(name, openKey) {
   // Only a box an app keeps its own data in opens as an app's box (#/box/<name>/~app shows that view for any box).
   if (openKey === "~things") return renderPersonal(box, me, undefined, null, true);
   if (openKey !== "~app") {
-    // An app's box: it has a tape, or data that isn't notes, links and files. (Its own notes/… keys don't make it yours.)
-    const forApp = box.tapes.some((t) => t.state === "active" && t.kind !== "link") || (await listThings(await account.open(box))).other > 0;
+    // An app's box: an app has used its tape, or it holds data that isn't notes, links and files. (A tape nothing has
+    // ever used doesn't make it an app's: boxes made with "Make box + tape" are often just boxes.)
+    const forApp = box.tapes.some((t) => t.state === "active" && t.kind !== "link" && t.lastUsedAt) || (await listThings(await account.open(box))).other > 0;
     if (!forApp) return renderPersonal(box, me, openKey, null, true);
   }
   if (openKey === "~app") openKey = undefined;
@@ -2998,7 +2999,7 @@ async function renderBox(name, openKey) {
       h("h1", { class: "mono" }, box.name),
       h("div", { class: "muted" }, `${plural(box.items, "item")} · ${bytes(box.bytes)} · made ${ago(box.createdAt)}`),
       peopleChip(box),
-      h("a", { href: `#/box/${encodeURIComponent(box.name)}/~things`, class: "small" }, "Keep notes, links and files in it too →"),
+      h("div", { class: "row" }, h("a", { href: `#/box/${encodeURIComponent(box.name)}/~things`, class: "button" }, "+ Add files, notes and links")),
     ),
   );
 
@@ -3945,7 +3946,14 @@ async function tapesSection(box) {
     showSecret(`New tape for ${box.name}`, secret, box.name, (await account.blast(tape, await account.box(box.name))).summary, render);
   });
 
-  return h("section", { class: "card stack" }, h("h2", {}, "Tapes"), h("ul", { class: "list" }, tapes), h("details", {}, h("summary", {}, "Make a new tape"), form));
+  return h(
+    "section",
+    { class: "card stack" },
+    h("h2", {}, "Tapes: keys for apps"),
+    h("p", { class: "small muted" }, "A tape is the key you give an app (a website, a script, an AI assistant) so it can use this box, and only this box. You don't need one yourself: your devices open everything with your PIN. Revoke a tape and that app is locked out at once."),
+    h("ul", { class: "list" }, tapes),
+    h("details", {}, h("summary", {}, "Make a new tape"), form),
+  );
 }
 
 function logLines(entries) {
