@@ -662,7 +662,7 @@ function renderPinLock(note) {
   nav.hidden = true;
   const logo = document.querySelector(".brand svg").cloneNode(true);
   const status = h("div", { class: "stack" });
-  const pin = h("input", { type: "password", inputmode: "numeric", pattern: "[0-9]*", maxlength: PIN_LENGTH, autocomplete: "off", class: "pin-input", "aria-label": "Your PIN" });
+  const pin = h("input", { type: "password", inputmode: "numeric", autocomplete: "off", class: "pin-input", "aria-label": "Your PIN" });
   const form = h("form", { class: "stack" }, pin, status);
   let busy = false;
   const go = async () => {
@@ -832,17 +832,26 @@ async function guardCard() {
     shown.textContent = hidden ? (me.profile.pin ?? "").replace(/(\d{3})(\d{3})/, "$1 $2") : "••• •••";
     show.textContent = hidden ? "Hide" : "Show";
   });
-  const current = h("input", { type: "password", inputmode: "numeric", pattern: "[0-9]*", maxlength: PIN_LENGTH, autocomplete: "off", placeholder: "your PIN now" });
-  const next = h("input", { type: "password", inputmode: "numeric", pattern: "[0-9]*", maxlength: PIN_LENGTH, autocomplete: "off", placeholder: `${PIN_LENGTH} digits` });
+  // Digits only, kept as they're typed or pasted ("123 456" too): no browser format check with its puzzling message.
+  const pinField = (placeholder) => {
+    const field = h("input", { type: "password", inputmode: "numeric", autocomplete: "new-password", placeholder });
+    field.addEventListener("input", () => (field.value = field.value.replace(/\D/g, "").slice(0, PIN_LENGTH)));
+    return field;
+  };
+  const current = pinField("your PIN now");
+  const next = pinField(`${PIN_LENGTH} new digits`);
   const changeStatus = h("div");
   const change = h(
     "form",
-    { class: "stack" },
+    { class: "stack", novalidate: true },
     h("div", { class: "two" }, h("label", { class: "field" }, "Your PIN now", current), h("label", { class: "field" }, "New PIN", next)),
     h("button", { type: "submit", class: "secondary" }, "Change my PIN"),
     changeStatus,
   );
   onSubmit(change, changeStatus, async () => {
+    if (current.value.length !== PIN_LENGTH) throw new Error(`Type the PIN you open Cardboard with now (${PIN_LENGTH} digits) in the first box.`);
+    if (next.value.length !== PIN_LENGTH) throw new Error(`Type your new PIN (${PIN_LENGTH} digits) in the second box.`);
+    if (next.value === current.value) throw new Error("That's the PIN you have now: pick different digits for the new one.");
     await account.changePin(current.value, next.value);
     current.value = next.value = "";
     changeStatus.replaceChildren(h("span", { class: "chip ok" }, "Changed. Your other devices take the new one after they're next opened."));
