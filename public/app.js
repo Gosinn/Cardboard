@@ -1420,10 +1420,17 @@ async function renderShelf() {
   );
 
   const insights = (await account.insights({ boxes, me, docks })).filter((i) => !(i.fix || "").startsWith("cardboard dock approve"));
-  fill(
-    insightsBox,
-    insights.length ? [h("h2", {}, "Worth a look"), insights.map(insightCard)] : [h("h2", {}, "All good"), h("p", { class: "muted" }, "Nothing needs fixing right now.")],
+  if (!insights.length) return fill(insightsBox, h("h2", {}, "All good"), h("p", { class: "muted" }, "Nothing needs fixing right now."));
+  // Folds away, and stays folded on this device until there's something new in it.
+  const folded = Number(recall("cardboard-worth-a-look-folded") ?? -1);
+  const worth = h(
+    "details",
+    { class: "fold", open: !(folded >= insights.length) },
+    h("summary", {}, h("h2", {}, "Worth a look ", h("span", { class: "chip" }, String(insights.length)))),
+    insights.map(insightCard),
   );
+  worth.addEventListener("toggle", () => remember("cardboard-worth-a-look-folded", worth.open ? null : String(insights.length)));
+  fill(insightsBox, worth);
 }
 
 // ── Send to yourself ─────────────────────────────────────────────────────────

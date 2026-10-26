@@ -1022,3 +1022,11 @@ ul.dupes {
 .waiting-bar .link {
   color: inherit;
 }
+
+/* A card that folds away: its heading is the handle. */
+details.fold > summary { list-style: none; cursor: pointer; display: flex; align-items: center; gap: 0.5rem; }
+details.fold > summary::-webkit-details-marker { display: none; }
+details.fold > summary::before { content: "▸"; color: var(--muted); }
+details.fold[open] > summary::before { transform: rotate(90deg); }
+details.fold > summary h2 { margin: 0; }
+details.fold[open] > summary { margin-bottom: 0.75rem; }
