@@ -3211,8 +3211,26 @@ async function renderPersonal(info, me, openKey, friend = null, plain = false) {
         t.kind === "password" && t.value.username ? copyButton(t.value.username, "Copy name") : null,
         t.kind === "password" ? copyButton(t.value.password, "Copy password") : null,
         t.kind === "link" && url ? h("a", { class: "button secondary tiny", href: url, target: "_blank", rel: "noopener noreferrer" }, "Open") : null,
+        deleteButton(t),
       ),
     );
+  }
+
+  /** Deleting straight from the list, without opening it first (Undo stays right there). */
+  function deleteButton(t) {
+    const del = h("button", { type: "button", class: "secondary tiny", title: "Delete", "aria-label": `Delete ${t.value.title}` }, "🗑");
+    del.addEventListener("click", () =>
+      withBusy(del, async () => {
+        if (!confirm(`Delete “${t.value.title}”? You can undo it straight after.`)) return;
+        try {
+          await removeThing(box, t);
+          await removed(t);
+        } catch (err) {
+          say(errorBox(err));
+        }
+      }),
+    );
+    return del;
   }
 
   function keepButton(t) {
