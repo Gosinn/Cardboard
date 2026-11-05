@@ -9,6 +9,7 @@ import { toName } from "/lib/shared/names.ts";
 import { createPasskey, hasBuiltInPasskeys, passkeyBlocker, passkeySecret } from "/lib/client/passkey.ts";
 import { androidVersion, cantRun, isAppFileName, itemStream, partsFor, readAppFile, zipItems } from "/lib/client/apk.ts";
 import { repairFile } from "/lib/client/repair.ts";
+import { zipFolder } from "/lib/client/formats.ts";
 import {
   addFile,
   FILE_DATA,
@@ -2531,6 +2532,70 @@ const LINK_DURATIONS = [
   ["", "until I stop it"],
 ];
 
+// ── Folders ──────────────────────────────────────────────────────────────────
+//
+// A folder goes in as one .zip, made on this device (browsers hand over a folder's files, not the folder).
+
+/** Whether this browser can pick a whole folder. */
+const CAN_PICK_FOLDERS = "webkitdirectory" in HTMLInputElement.prototype && !matchMedia("(pointer: coarse)").matches;
+
+/** A "+ Folder" button and its hidden picker; `take` gets the folder as one .zip. */
+function folderButton(take, tell) {
+  if (!CAN_PICK_FOLDERS) return [];
+  const picker = h("input", { type: "file", hidden: true, webkitdirectory: true });
+  picker.addEventListener("change", async () => {
+    const chosen = [...picker.files];
+    picker.value = "";
+    if (!chosen.length) return;
+    const top = chosen[0].webkitRelativePath.split("/")[0] || "Folder";
+    try {
+      take([await zipped(top, chosen.map((file) => ({ path: file.webkitRelativePath || file.name, file })), tell)]);
+    } catch (err) {
+      tell(errorBox(err));
+    }
+  });
+  return [h("button", { type: "button", onclick: () => picker.click() }, "+ Folder"), picker];
+}
+
+async function zipped(name, files, tell) {
+  tell(h("span", {}, `Zipping ${name} (${plural(files.length, "file")}) on this device…`));
+  return zipFolder(files, name);
+}
+
+/**
+ * What was dropped: files as they are, and each folder as one .zip. Call it straight from the drop
+ * event: the browser empties what was dropped once the event is over.
+ */
+function droppedFiles(dataTransfer, tell) {
+  const entries = [...(dataTransfer.items ?? [])].map((item) => (item.kind === "file" ? item.webkitGetAsEntry?.() : null));
+  const plainFiles = [...dataTransfer.files];
+  if (!entries.some((e) => e?.isDirectory)) return Promise.resolve(plainFiles);
+  return (async () => {
+    const out = [];
+    for (const [i, entry] of entries.entries()) {
+      if (entry?.isDirectory) out.push(await zipped(entry.name, await folderFiles(entry, entry.name), tell));
+      else if (entry) out.push(await new Promise((ok, no) => entry.file(ok, no)));
+      else if (plainFiles[i]) out.push(plainFiles[i]);
+    }
+    return out;
+  })();
+}
+
+/** Every file in a dropped folder, with its path inside it. */
+async function folderFiles(dir, path) {
+  const reader = dir.createReader();
+  const out = [];
+  for (;;) {
+    const batch = await new Promise((ok, no) => reader.readEntries(ok, no));
+    if (!batch.length) return out;
+    for (const entry of batch) {
+      const at = `${path}/${entry.name}`;
+      if (entry.isDirectory) out.push(...(await folderFiles(entry, at)));
+      else out.push({ path: at, file: await new Promise((ok, no) => entry.file(ok, no)) });
+    }
+  }
+}
+
 /** On the shelf: your friend boxes, and the button that makes one. */
 function friendBoxesCard(boxes, friends) {
   const mine = boxes.filter((b) => b.id in friends && !b.shared);
@@ -2838,7 +2903,7 @@ async function renderFriendView(pending) {
       list,
       notice,
       canAdd ? guestNameField() : null,
-      canAdd ? h("div", { class: "row" }, h("button", { type: "button", onclick: () => picker.click() }, "+ Add files"), picker, h("span", { class: "muted small drop-hint" }, "or drop them here")) : null,
+      canAdd ? h("div", { class: "row" }, h("button", { type: "button", onclick: () => picker.click() }, "+ Add files"), picker, folderButton(upload, (m) => fill(notice, h("div", { class: "insight tip" }, m))), h("span", { class: "muted small drop-hint" }, "or drop them here")) : null,
       canAdd ? h("p", { class: "muted small" }, "Where photos and videos were taken is taken out of them first.") : null,
     ),
     h("p", { class: "muted small" }, "This is Cardboard: a private, end-to-end encrypted place for your things. Want your own? Ask whoever sent you this for an invite."),
@@ -2848,7 +2913,7 @@ async function renderFriendView(pending) {
     page.addEventListener("drop", (e) => {
       if (!e.dataTransfer?.files.length) return;
       e.preventDefault();
-      upload([...e.dataTransfer.files]);
+      droppedFiles(e.dataTransfer, (m) => fill(notice, h("div", { class: "insight tip" }, m))).then(upload, (err) => fill(notice, errorBox(err)));
     });
   }
   fill(app, page);
@@ -3536,6 +3601,7 @@ async function renderPersonal(info, me, openKey, friend = null, plain = false) {
     // No passwords in a friend box: everyone with the link would see them.
     (friend ? ["note", "link"] : ["note", "password", "link"]).map((k) => h("button", { type: "button", onclick: () => editThing(k) }, `+ ${NEW_LABEL[k]}`)),
     h("button", { type: "button", onclick: () => files.click() }, friend ? "+ Files" : "+ File"),
+    folderButton(upload, (m) => say(m)),
     h("button", { type: "button", class: "secondary", onclick: () => duplicates() }, "Find duplicates"),
     files,
   );
@@ -3649,7 +3715,7 @@ async function renderPersonal(info, me, openKey, friend = null, plain = false) {
       ),
     ),
     friend ? friendLinkCard(info, friend.link) : me.device.lock || plain ? null : h("p", { class: "insight tip small" }, "Tip: ", h("a", { href: "#/you" }, "lock this browser with Face ID"), " so nobody who picks up this device can open your personal box."),
-    h("section", { class: "card stack" }, add, find, tabs, notice, list, h("p", { class: "muted small drop-hint" }, "You can also drop files here.")),
+    h("section", { class: "card stack" }, add, find, tabs, notice, list, h("p", { class: "muted small drop-hint" }, "You can also drop files and folders here.")),
     h(
       "details",
       { class: "card" },
@@ -3663,7 +3729,7 @@ async function renderPersonal(info, me, openKey, friend = null, plain = false) {
   page.addEventListener("drop", (e) => {
     if (!e.dataTransfer?.files.length) return;
     e.preventDefault();
-    upload([...e.dataTransfer.files]);
+    droppedFiles(e.dataTransfer, (m) => say(m)).then(upload, (err) => say(errorBox(err)));
   });
   // Back on this tab after using another device: show what changed there.
   const refresh = () => {

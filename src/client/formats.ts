@@ -126,6 +126,84 @@ export async function makeZip(entries: ZipEntry[], now = new Date()): Promise<Ui
   return join([...parts, ...central, end]);
 }
 
+export interface FolderFile {
+  /** Where it is inside the folder, with / between folders ("bin/app"). */
+  path: string;
+  file: Blob;
+}
+
+/** Already squeezed: zipping them again only costs time. */
+const PACKED = /\.(zip|apk|apkm|apks|xapk|jar|gz|tgz|xz|bz2|zst|7z|rar|appimage|jpe?g|png|gif|webp|heic|avif|mp4|mov|mkv|webm|mp3|m4a|ogg|opus|flac|pdf|docx|xlsx|pptx)$/i;
+
+async function readAll(stream: ReadableStream<Uint8Array>, each: (chunk: Uint8Array) => void): Promise<void> {
+  const reader = stream.getReader();
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) return;
+    each(value);
+  }
+}
+
+/**
+ * A folder as one .zip, made on the device without holding the folder in memory: each file is read
+ * once (to check it, and squeeze it when that helps), and the zip refers to the files' own bytes.
+ */
+export async function zipFolder(files: FolderFile[], name: string, now = new Date()): Promise<File> {
+  if (files.length >= 0xffff) throw fail("too_many", 413, `${name} has more than 65,534 files, more than a .zip can hold here.`, "Zip it on the computer first, then add the .zip.");
+  const time = (now.getHours() << 11) | (now.getMinutes() << 5) | (now.getSeconds() >> 1);
+  const date = ((Math.max(1980, now.getFullYear()) - 1980) << 9) | ((now.getMonth() + 1) << 5) | now.getDate();
+  const parts: Array<Blob | Uint8Array> = [];
+  const central: Uint8Array[] = [];
+  let offset = 0;
+  const header = (sig: number, size: number, method: number, crc: number, packed: number, raw: number, nameBytes: Uint8Array) => {
+    const out = new Uint8Array(size + nameBytes.length);
+    const v = new DataView(out.buffer);
+    const at = sig === 0x02014b50 ? 2 : 0; // the central directory has "made by" first
+    v.setUint32(0, sig, true);
+    if (at) v.setUint16(4, 20, true);
+    v.setUint16(4 + at, 20, true);
+    v.setUint16(6 + at, 0x0800, true); // UTF-8 names
+    v.setUint16(8 + at, method, true);
+    v.setUint16(10 + at, time, true);
+    v.setUint16(12 + at, date, true);
+    v.setUint32(14 + at, crc, true);
+    v.setUint32(18 + at, packed, true);
+    v.setUint32(22 + at, raw, true);
+    v.setUint16(26 + at, nameBytes.length, true);
+    out.set(nameBytes, size);
+    return out;
+  };
+  for (const entry of files) {
+    const nameBytes = encoder.encode(entry.path.replace(/\\/g, "/").replace(/^\/+/, "") || "file");
+    let crc = 0;
+    let packed: Blob = entry.file;
+    if (entry.file.size > 64 && !PACKED.test(entry.path)) {
+      const [check, squeeze] = entry.file.stream().tee();
+      const [, smaller] = await Promise.all([readAll(check, (chunk) => (crc = crc32(chunk, crc))), new Response(squeeze.pipeThrough(new CompressionStream("deflate-raw"))).blob()]);
+      if (smaller.size < entry.file.size) packed = smaller;
+    } else {
+      await readAll(entry.file.stream(), (chunk) => (crc = crc32(chunk, crc)));
+    }
+    const method = packed === entry.file ? 0 : 8;
+    if (offset + packed.size > 0xffffffff - 1024 * 1024) throw fail("too_big", 413, `${name} comes to over 4 GB, more than a .zip can hold here.`, "Add it in a few smaller folders.");
+    const local = header(0x04034b50, 30, method, crc, packed.size, entry.file.size, nameBytes);
+    const head = header(0x02014b50, 46, method, crc, packed.size, entry.file.size, nameBytes);
+    new DataView(head.buffer).setUint32(42, offset, true);
+    parts.push(local, packed);
+    central.push(head);
+    offset += local.length + packed.size;
+  }
+  const centralSize = central.reduce((n, c) => n + c.length, 0);
+  const end = new Uint8Array(22);
+  const ev = new DataView(end.buffer);
+  ev.setUint32(0, 0x06054b50, true);
+  ev.setUint16(8, files.length, true);
+  ev.setUint16(10, files.length, true);
+  ev.setUint32(12, centralSize, true);
+  ev.setUint32(16, offset, true);
+  return new File([...parts, ...central, end], name.endsWith(".zip") ? name : `${name}.zip`, { type: "application/zip", lastModified: now.getTime() });
+}
+
 /** What's in a .zip: names and their contents (folders left out), or only the files `want` picks. */
 export async function readZip(zip: Uint8Array, want: (name: string) => boolean = () => true, limit = ZIP_LIMIT): Promise<ZipEntry[]> {
   const view = new DataView(zip.buffer, zip.byteOffset, zip.byteLength);
