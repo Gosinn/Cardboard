@@ -1492,7 +1492,7 @@ async function renderShelf() {
     guardNote ? pinNotice(guardNote) : null,
     search,
     results,
-    pendingCard(docks.pending),
+    pendingCard(docks.pending, docks.docks),
     sending,
     personalShown,
     androidAppCard(),
@@ -4555,35 +4555,90 @@ function direction(p) {
   return p.send && p.receive ? "send and receive" : p.send ? "send" : "receive";
 }
 
-/** Docking requests with one-tap answers. Returns null when nothing is waiting. */
-function pendingCard(pending) {
+/** A manifest's type, in plain words. */
+const FIELD_WORDS = { string: "text", number: "a number", boolean: "yes or no", object: "a group of fields", list: "a list", any: "anything" };
+function fieldWords(type) {
+  const optional = type.endsWith("?");
+  return `${FIELD_WORDS[type.replace(/\?$/, "")] ?? type}${optional ? ", if it has one" : ""}`;
+}
+
+/** What can cross a dock, in a sentence. */
+function crossesWords(settings) {
+  const fields = settings.shape ? Object.keys(settings.shape) : null;
+  const personal = { redact: "personal details hidden", block: "nothing with personal details", allow: "personal details let through" }[settings.personal] ?? "";
+  return `${fields ? `Only ${fields.join(", ")}` : "Anything"}, never secrets, ${personal}.`;
+}
+
+/** Requests from apps to connect: what each asks for and why, what you let cross, and what the others call it. Null when nothing's waiting. */
+function pendingCard(pending, docks = []) {
   if (!pending || pending.length === 0) return null;
   return h(
     "section",
     { class: "card stack" },
-    h("h2", {}, `Docking request${pending.length === 1 ? "" : "s"}`),
-    h("p", { class: "muted small" }, "Apps asking to swap data. Approve and they connect straight away; they still won't learn each other's names."),
-    h(
-      "ul",
-      { class: "list" },
-      pending.map((p) => {
-        const approve = h("button", { type: "button", class: "tiny" }, "Approve");
-        const deny = h("button", { type: "button", class: "secondary tiny" }, "Deny");
-        approve.addEventListener("click", () =>
-          withBusy(approve, async () => {
-            await account.dockApprove(p.dock, p.box);
-            render();
-          }),
-        );
-        deny.addEventListener("click", () =>
-          withBusy(deny, async () => {
-            await account.dockDeny(p.dock, p.box);
-            render();
-          }),
-        );
-        return h("li", { class: "row spread" }, h("div", {}, h("strong", { class: "mono" }, p.box), ` wants to ${direction(p)} on `, h("strong", { class: "mono" }, p.dock)), h("div", { class: "row" }, approve, deny));
-      }),
-    ),
+    h("h2", {}, pending.length === 1 ? "An app wants to connect" : `${pending.length} apps want to connect`),
+    h("p", { class: "muted small" }, "Apps pass things to each other through Cardboard without learning each other's names. You choose what crosses."),
+    h("div", { class: "stack" }, pending.map((p) => requestCard(p, docks.find((d) => d.id === p.dockId)))),
+  );
+}
+
+function requestCard(p, dock) {
+  const settings = dock?.settings ?? { personal: "redact", shape: null };
+  const others = (dock?.berths ?? []).filter((b) => (b.send || b.receive) && b.boxId !== p.boxId);
+  const fields = Object.entries(p.wants ?? {}).map(([field, type]) => ({ field, type, tick: h("input", { type: "checkbox", checked: true }) }));
+  const personal = h(
+    "select",
+    { "aria-label": "Personal details" },
+    h("option", { value: "redact", selected: settings.personal === "redact" }, "Hide them (replaced with a label)"),
+    h("option", { value: "block", selected: settings.personal === "block" }, "Stop anything that has them"),
+    h("option", { value: "allow", selected: settings.personal === "allow" }, "Let them through"),
+  );
+  const alias = p.send ? h("input", { maxlength: 40, placeholder: "Leave empty for a random code name", autocomplete: "off" }) : null;
+  const status = h("div");
+  const allow = h("button", { type: "button" }, "Allow");
+  const deny = h("button", { type: "button", class: "secondary" }, "Say no");
+  allow.addEventListener("click", () =>
+    withBusy(allow, async () => {
+      try {
+        await account.dockApprove(p.dock, p.box);
+        const chosen = Object.fromEntries(fields.filter((f) => f.tick.checked).map((f) => [f.field, f.type]));
+        const changes = {};
+        // Only what you ticked crosses. A dock that already lets anything through between other apps stays that way unless you untick something.
+        if (fields.length && (settings.shape || !others.length || Object.keys(chosen).length < fields.length)) changes.shape = { ...(settings.shape ?? {}), ...chosen };
+        if (personal.value !== settings.personal) changes.personal = personal.value;
+        if (Object.keys(changes).length) await account.dockSettings(p.dock, changes);
+        if (alias?.value.trim()) await account.dockSetName(p.dock, p.box, alias.value.trim());
+        render();
+      } catch (err) {
+        status.replaceChildren(errorBox(err));
+      }
+    }),
+  );
+  deny.addEventListener("click", () =>
+    withBusy(deny, async () => {
+      await account.dockDeny(p.dock, p.box);
+      render();
+    }),
+  );
+  const verb = p.send && p.receive ? "send and receive" : p.send ? "send" : "receive";
+  return h(
+    "div",
+    { class: "request stack" },
+    h("div", { class: "request-head" }, h("span", { class: "request-icon", "aria-hidden": "true" }, p.send && !p.receive ? "📤" : !p.send && p.receive ? "📥" : "🔁"), h("div", {}, h("strong", {}, p.box), ` wants to ${verb} through `, h("strong", {}, `⚓ ${p.dock}`))),
+    p.why ? h("blockquote", { class: "why" }, `“${p.why}”`, h("span", { class: "muted small" }, ` (${p.box}, in its own words)`)) : null,
+    fields.length
+      ? h(
+          "fieldset",
+          { class: "stack asks" },
+          h("legend", {}, p.send ? "It wants to send:" : "It wants to get:"),
+          fields.map((f) => h("label", { class: "choice" }, f.tick, h("span", {}, h("strong", {}, f.field), h("span", { class: "muted" }, ` (${fieldWords(f.type)})`)))),
+          h("span", { class: "muted small" }, "Untick what you don't want crossing. Only ticked fields get through; the rest are taken out before they're sealed."),
+        )
+      : h("p", { class: "small" }, "It didn't say exactly what. Anything can cross, except secrets (passwords, keys), which are always stopped."),
+    h("label", { class: "field" }, "Personal details (emails, phone numbers, card numbers…)", personal),
+    alias ? h("label", { class: "field" }, "What the other apps call it", alias) : null,
+    alias ? h("span", { class: "muted small" }, "They never learn its real name. A name you pick here is sealed: only the apps on this dock can read it, not the server.") : null,
+    h("div", { class: "row" }, allow, deny),
+    status,
   );
 }
 
@@ -4596,36 +4651,66 @@ async function renderDocks() {
       h(
         "div",
         {},
-        h("h1", {}, "Docks"),
-        h("div", { class: "muted" }, "Meeting points where your apps swap data. Each app only ever sees a pseudonym, parcels are sealed so only approved apps can open them, and customs runs at both ends."),
-        h("div", { class: "small" }, "Most apps don't need one: an app gets its own box on your shelf when it connects or signs in. A dock is for two or more of your apps that should pass things to each other."),
+        h("h1", {}, "Connections"),
+        h("div", { class: "muted" }, "Where your apps pass things to each other. Each dock is a meeting point: apps only ever see a code name (or the name you give them), what they pass is sealed so only the apps you allowed can open it, and customs checks it at both ends."),
+        h("div", { class: "small" }, "Most apps don't need one: an app gets its own box on your shelf when it connects or signs in. A dock is for two or more apps that should pass things to each other."),
       ),
     ),
-    pendingCard(pending) || h("span"),
+    pendingCard(pending, docks) || h("span"),
     h("div", { class: "grid wide" }, docks.filter((d) => d.name).map((d) => dockCard(d)), newDockCard(boxes)),
   );
 }
 
 function dockCard(d) {
+  const nameOf = (b) => d.aliases?.[b.tag];
+  const senders = d.berths.filter((b) => b.send);
+  const receivers = d.berths.filter((b) => b.receive);
+  const chip = (b) => h("span", { class: "flow-app" }, h("strong", {}, b.box), nameOf(b) ? h("span", { class: "muted small" }, `known as “${nameOf(b)}”`) : null);
+  // Who passes to whom, at a glance: a parcel travels along the line while something's in flight.
+  const flow = h(
+    "div",
+    { class: `flow ${d.inFlight.count ? "moving" : ""}`, "aria-label": `${senders.map((b) => b.box).join(", ") || "No senders"} to ${receivers.map((b) => b.box).join(", ") || "no receivers"}` },
+    h("div", { class: "flow-side" }, senders.length ? senders.map(chip) : h("span", { class: "muted small" }, "no senders yet")),
+    h("div", { class: "flow-line", "aria-hidden": "true" }, h("span", { class: "flow-parcel" }, "📦")),
+    h("div", { class: "flow-side" }, receivers.length ? receivers.map(chip) : h("span", { class: "muted small" }, "no receivers yet")),
+  );
   const berths = h(
     "ul",
     { class: "list" },
     d.berths.length === 0 ? h("li", { class: "muted small" }, "No apps yet. Apps that use this dock will ask to join.") : null,
     d.berths.map((b) => {
       const role = b.denied
-        ? h("span", { class: "chip danger" }, "refused")
+        ? h("span", { class: "chip danger" }, "said no")
         : !b.send && !b.receive
           ? h("span", { class: "chip warn" }, `asking to ${direction(b.waiting)}`)
-          : h("span", { class: "chip ok" }, b.send && b.receive ? "sends + receives" : b.send ? "sends" : "receives");
+          : h("span", { class: "chip ok" }, b.send && b.receive ? "sends + gets" : b.send ? "sends" : "gets");
       const remove = h("button", { type: "button", class: "secondary tiny" }, "Remove");
       remove.addEventListener("click", () =>
         withBusy(remove, async () => {
-          if (!confirm(`Take ${b.box} off ${d.name}? Its live connection closes immediately.`)) return;
+          if (!confirm(`Take ${b.box} off ${d.name}? Its connection closes immediately.`)) return;
           await account.dockRemove(d.name, b.box);
           render();
         }),
       );
-      return h("li", { class: "row spread" }, h("div", { class: "stack" }, h("div", { class: "row" }, h("strong", { class: "mono" }, b.box), role), h("div", { class: "muted small mono" }, `known there as ${b.tag}`)), remove);
+      let naming = null;
+      if (b.send && !b.denied) {
+        const input = h("input", { maxlength: 40, value: nameOf(b) ?? "", placeholder: b.tag, "aria-label": `What the other apps call ${b.box}` });
+        const save = h("button", { type: "button", class: "secondary tiny" }, "Save");
+        const said = h("span", { class: "muted small" });
+        save.addEventListener("click", () =>
+          withBusy(save, async () => {
+            try {
+              await account.dockSetName(d.name, b.box, input.value.trim() || null);
+              said.textContent = input.value.trim() ? "Saved. The others see this name now." : "Back to its code name.";
+            } catch (err) {
+              said.replaceChildren(errorBox(err));
+            }
+          }),
+        );
+        naming = h("div", { class: "row small" }, h("span", { class: "muted" }, "The others call it"), input, save, said);
+      }
+      const asked = b.wants ? h("div", { class: "muted small" }, `Asked for: ${Object.entries(b.wants).map(([f, t]) => `${f} (${fieldWords(t)})`).join(", ")}`) : null;
+      return h("li", { class: "stack" }, h("div", { class: "row spread" }, h("div", { class: "row" }, h("strong", {}, b.box), role), remove), b.why ? h("div", { class: "muted small" }, `“${b.why}”`) : null, asked, naming);
     }),
   );
 
@@ -4655,8 +4740,10 @@ function dockCard(d) {
   return h(
     "section",
     { class: "card stack" },
-    h("div", { class: "row spread" }, h("h2", { class: "mono" }, `⚓ ${d.name}`), peek),
-    h("div", { class: "muted small" }, d.inFlight.count ? `${plural(d.inFlight.count, "parcel")} in flight (${bytes(d.inFlight.bytes)})` : "Nothing in flight"),
+    h("div", { class: "row spread" }, h("h2", {}, `⚓ ${d.name}`), peek),
+    flow,
+    h("div", { class: "small" }, h("strong", {}, "What can cross: "), crossesWords(d.settings)),
+    h("div", { class: "muted small" }, d.inFlight.count ? `${plural(d.inFlight.count, "parcel")} on the way (${bytes(d.inFlight.bytes)})` : "Nothing on the way right now"),
     berths,
     h("details", {}, h("summary", { class: "small" }, "Customs & settings"), dockSettings(d)),
   );
@@ -5299,7 +5386,7 @@ function builderCard() {
     "section",
     { class: "card stack" },
     h("h2", {}, "For app builders"),
-    h("label", { class: "choice small" }, on, h("span", {}, "Show Docks, Apps and “New box” (for connecting apps you make or run yourself)")),
+    h("label", { class: "choice small" }, on, h("span", {}, "Show Connections, Apps and “New box” (for connecting apps you make or run yourself)")),
   );
 }
 

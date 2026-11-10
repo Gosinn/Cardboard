@@ -326,7 +326,8 @@ describe("keeping each value once", () => {
     db.exec("DROP TABLE device_pins; DROP INDEX items_meta; DROP INDEX history_kept");
     db.exec("DROP TABLE pair_offers");
     db.exec("ALTER TABLE history DROP COLUMN temporary");
-    db.exec(`PRAGMA user_version = ${version - 6}`);
+    db.exec("ALTER TABLE docks DROP COLUMN aliases");
+    db.exec(`PRAGMA user_version = ${version - 7}`);
     db.close();
     db = openDb(file);
     try {

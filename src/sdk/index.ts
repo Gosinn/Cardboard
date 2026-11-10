@@ -16,7 +16,7 @@
 import { CardboardError, fail } from "../shared/errors.ts";
 import type { Duration } from "../shared/duration.ts";
 import { ctx } from "../shared/contexts.ts";
-import { inspect, type CustomsPolicy } from "../shared/customs.ts";
+import { inspect, writeDockAsk, type CustomsPolicy, type DockShape } from "../shared/customs.ts";
 import { decodeValue, encodeValue, isPlainObject, mergePatch, sortableId, validateKey, type Item } from "../shared/data.ts";
 import { notice, scan, SECRET_KINDS, type Finding } from "../shared/detect.ts";
 import { matches, sortItems, type Where } from "../shared/query.ts";
@@ -597,8 +597,12 @@ export class Box {
   }
 
   /** A dock: swap data with other apps without either side learning who the other is. */
-  dock(name: string): Dock {
-    return new Dock(this, name);
+  /**
+   * A dock, to swap parcels with your other apps. Say what you'll send or want to receive, and why:
+   * the person sees it when they approve, and picks which of these fields may cross.
+   */
+  dock(name: string, options: DockOptions = {}): Dock {
+    return new Dock(this, name, options);
   }
 
   /** Tell Cardboard who this app is, so you recognise it on your shelf. Sealed, like everything else. */
@@ -732,12 +736,21 @@ export interface Parcel<T = unknown> {
   id: string;
   seq: number;
   from: string;
+  /** What the person called the sender at this dock ("Kitchen"), if they gave it a name. Never its real name. */
+  fromName?: string;
   to: string | null;
   body: T;
   sentAt: number;
   expiresAt: number;
   /** Fields customs replaced because they held personal data. */
   redacted: string[];
+}
+
+export interface DockOptions {
+  /** The fields this app sends or wants, as a manifest: { "item": "string", "qty": "number?" }. */
+  wants?: DockShape;
+  /** In a sentence, what the app does with them. Shown to the person when they approve. */
+  why?: string;
 }
 
 export interface SendResult {
@@ -784,6 +797,7 @@ interface RawStatus {
   senders: number | null;
   key: string | null;
   settings: (CustomsPolicy & { ttlMs: number }) | null;
+  aliases: string | null;
 }
 
 interface RawParcel {
@@ -816,11 +830,14 @@ const REFUSALS: Record<string, string> = {
 export class Dock {
   readonly name: string;
   private readonly box: Box;
-  private docked: { id: string; key: DockKeys; policy: CustomsPolicy; me: string } | null = null;
+  private readonly options: DockOptions;
+  private docked: { id: string; key: DockKeys; policy: CustomsPolicy; me: string; names: Record<string, string> } | null = null;
 
-  constructor(box: Box, name: string) {
+  constructor(box: Box, name: string, options: DockOptions = {}) {
     this.box = box;
     this.name = name;
+    this.options = options;
+    writeDockAsk({ name, ...options }); // Checks what it asks for straight away.
   }
 
   private async idx(): Promise<string> {
@@ -830,7 +847,7 @@ export class Dock {
   /** The dock's name, sealed so that only you (not the server) can read this app's request. */
   private async ask(): Promise<string> {
     const o = await this.box.ready();
-    return toB64u(await seal(o.keys.seal, this.name, ctx.dockAsk(o.boxId, await this.idx())));
+    return toB64u(await seal(o.keys.seal, writeDockAsk({ name: this.name, ...this.options }), ctx.dockAsk(o.boxId, await this.idx())));
   }
 
   private async raw(): Promise<RawStatus> {
@@ -838,7 +855,10 @@ export class Dock {
     if (s.key && s.id && s.settings) {
       const o = await this.box.ready();
       const root = await openSealed(o.keys.wrap, fromB64u(s.key), ctx.berthKey(s.id, o.boxId));
-      this.docked = { id: s.id, key: await dockKeys(root), policy: s.settings, me: s.me! };
+      const key = await dockKeys(root);
+      let names: Record<string, string> = {};
+      if (s.aliases) names = await openJson<Record<string, string>>(key.seal, fromB64u(s.aliases), ctx.dockAliases(s.id)).catch(() => ({}));
+      this.docked = { id: s.id, key, policy: s.settings, me: s.me!, names };
     } else {
       this.docked = null;
     }
@@ -884,6 +904,7 @@ export class Dock {
         id: raw.id,
         seq: raw.seq,
         from: raw.from,
+        ...(docked.names[raw.from] ? { fromName: docked.names[raw.from] } : {}),
         to: raw.to,
         body: cleared.body as T,
         sentAt: raw.sentAt,

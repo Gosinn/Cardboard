@@ -60,6 +60,39 @@ describe("Docks", () => {
     assert.equal(status.send, false);
   });
 
+  it("shows what an app asks for and why, and lets you name it for the others", async () => {
+    const recipes = await t.newBox("menu-app");
+    const groceries = await t.newBox("cart-app");
+    const asking = recipes.box.dock("meals", { wants: { item: "string", qty: "number?" }, why: "Puts what this week's recipes need on your shopping list." });
+    await rejectsWith(asking.send({ item: "lamb", qty: 1 }), "dock_pending");
+    const request = (await t.me.docks()).pending.find((p) => p.box === "menu-app")!;
+    assert.equal(request.dock, "meals");
+    assert.deepEqual(request.wants, { item: "string", qty: "number?" });
+    assert.equal(request.why, "Puts what this week's recipes need on your shopping list.");
+    assert.ok(!t.cb.api.ctx.db.prepare("SELECT ask FROM berths").all().some((r) => Buffer.from((r as { ask: Uint8Array }).ask ?? []).includes("shopping list")), "what it asked for reached the server sealed");
+
+    await t.me.dockApprove("meals", "menu-app");
+    await t.me.dockSettings("meals", { shape: { item: "string" } }); // You let only "item" across.
+    await t.me.dockGrant("meals", "cart-app", { receive: true });
+    await t.me.dockSetName("meals", "menu-app", "Kitchen");
+    const dock = await dockOf("meals");
+    const tag = dock.berths.find((b) => b.box === "menu-app")!.tag;
+    assert.deepEqual(dock.aliases, { [tag]: "Kitchen" });
+    assert.deepEqual(dock.berths.find((b) => b.box === "menu-app")!.wants, { item: "string", qty: "number?" });
+
+    const sent = await recipes.box.dock("meals").send({ item: "lamb", qty: 1 });
+    assert.deepEqual(sent.stripped, ["qty"], "only the fields you allowed crossed");
+    const [parcel] = await groceries.box.dock("meals").receive({ ack: true });
+    assert.equal(parcel!.fromName, "Kitchen", "the receiver sees the name you chose");
+    assert.equal(parcel!.from, tag, "and still never the app's real name");
+    assert.deepEqual(parcel!.body, { item: "lamb" });
+    const raw = t.cb.api.ctx.db.prepare("SELECT aliases FROM docks WHERE aliases IS NOT NULL").all() as Array<{ aliases: Uint8Array }>;
+    assert.ok(raw.length === 1 && !Buffer.from(raw[0]!.aliases).includes("Kitchen"), "the name is sealed: the server can't read it");
+
+    await t.me.dockSetName("meals", "menu-app", null);
+    assert.deepEqual((await dockOf("meals")).aliases, {});
+  });
+
   it("seals parcels so the server carries them without reading them", async () => {
     const a = await t.newBox("sealer-a");
     const b = await t.newBox("sealer-b");

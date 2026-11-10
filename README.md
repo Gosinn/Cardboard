@@ -197,19 +197,23 @@ It's an ordinary box underneath (`notes/…`, `passwords/…`, `links/…`, `fil
 | **Live** | `watch()` streams changes (sealed on the wire). Revoking a tape cuts its live connections immediately. |
 | **Search everything** | Find "lasagna" across every box from the dashboard or `cardboard search`, searched on your device. |
 
-## Docks: apps that help each other without knowing each other
+## Connections (docks): apps that help each other without knowing each other
 
 Two of your apps need to share data, but neither should learn who the other is. Cardboard stands in the middle: it carries the parcels and tells nobody who sent what. It can't read them either.
 
 ```ts
-// recipe-app
-await box.dock("shopping-list").send({ item: "lamb", qty: 1 });
+// recipe-app: says what it sends, and why (you see this when you approve it)
+const list = box.dock("shopping-list", { wants: { item: "string", qty: "number?" }, why: "Puts what your recipes need on your shopping list." });
+await list.send({ item: "lamb", qty: 1 });
 
 // grocery-app
 box.dock("shopping-list").on(async (parcel) => {
-  await addToList(parcel.body); // parcel.from is "berth-0d621d65da4d", never "recipe-app"
+  await addToList(parcel.body); // parcel.from is "berth-0d621d65da4d", never "recipe-app";
+                                // parcel.fromName is "Kitchen" if you named it that
 });
 ```
+
+**You see what each app asks for, and choose what it gets.** An app can say which fields it wants to send or receive, and why, in its own words. It's sealed for you, so the server never reads it. When you approve, each field has a tick: untick one, and it's taken out of every parcel before it's sealed. Pick how personal details are treated, and **what the other apps call it** (say, "Kitchen"): that name is sealed with the dock key, so only the apps on the dock can read it, and they still never learn its real name. *Connections* on the dashboard draws each dock as who passes to whom, and what can cross, in a sentence.
 
 **Docking is one tap.** The first time an app uses a dock, Cardboard asks you. Approve it on the dashboard (or `cardboard dock approve shopping-list grocery-app`), and an app that's already listening starts receiving straight away. Or set it all up front: `cardboard dock create shopping-list --send recipe-app --receive grocery-app`.
 

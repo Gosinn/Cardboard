@@ -25,6 +25,7 @@ export const ctx = {
   dockName: (dockId: string) => `dock-name|${dockId}`,
   berthKey: (dockId: string, boxId: string) => `berth-key|${dockId}|${boxId}`,
   dockAsk: (boxId: string, idx: string) => `dock-ask|${boxId}|${idx}`,
+  dockAliases: (dockId: string) => `dock-aliases|${dockId}`,
   parcel: (dockId: string, parcelId: string) => `parcel|${dockId}|${parcelId}`,
   signIn: (clientId: string) => `sign-in|${clientId}`,
   pairingMac: "pairing-mac",

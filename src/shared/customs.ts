@@ -181,3 +181,45 @@ function redact(node: unknown, field: string | null, path: string, out: string[]
   }
   return node;
 }
+
+// ── What an app asks for at a dock ───────────────────────────────────────────
+
+/** An app's request to dock: the dock's name, and (if it says) the fields it wants and why. */
+export interface DockAsk {
+  name: string;
+  /** The fields it wants to send or receive, as a manifest ({ "item": "string", "qty": "number?" }). */
+  wants?: DockShape;
+  /** In the app's own words, why. */
+  why?: string;
+}
+
+const WHY_MAX = 200;
+
+/** What an app seals for you when it asks: just the name, or the name with what it wants (as JSON). */
+export function writeDockAsk(ask: DockAsk): string {
+  if (!ask.wants && !ask.why) return ask.name;
+  if (ask.wants) validateShape(ask.wants);
+  if (ask.why !== undefined && (typeof ask.why !== "string" || ask.why.length > WHY_MAX)) {
+    throw fail("bad_why", 400, `“why” is a sentence of up to ${WHY_MAX} characters.`, "Say in a few words what the app does with what it asks for.");
+  }
+  return JSON.stringify({ name: ask.name, ...(ask.wants ? { wants: ask.wants } : {}), ...(ask.why ? { why: ask.why } : {}) });
+}
+
+/** Reads a request: a plain dock name (dock names never start with "{"), or the JSON form. */
+export function readDockAsk(text: string): DockAsk {
+  if (!text.startsWith("{")) return { name: text };
+  try {
+    const parsed = JSON.parse(text) as Record<string, unknown>;
+    if (typeof parsed["name"] !== "string") return { name: text };
+    let wants: DockShape | undefined;
+    try {
+      wants = validateShape(parsed["wants"]) ?? undefined;
+    } catch {
+      wants = undefined;
+    }
+    const why = typeof parsed["why"] === "string" ? parsed["why"].slice(0, WHY_MAX) : undefined;
+    return { name: parsed["name"], ...(wants ? { wants } : {}), ...(why ? { why } : {}) };
+  } catch {
+    return { name: text };
+  }
+}

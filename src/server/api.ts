@@ -868,6 +868,7 @@ export class Api {
       key: b64(dock.key),
       settings: dock.settings,
       createdAt: dock.createdAt,
+      aliases: b64(dock.aliases),
       inFlight: docks.inFlight(dock.id),
       berths: docks.berths(dock.id).map((b) => ({
         box: b.boxId,
@@ -1347,6 +1348,13 @@ export class Api {
         return { dock: this.dockSummary(docks.get(dock.id)!) };
       },
 
+      "dock.aliases": (a, body, req) => {
+        const dock = dockFrom(a, body);
+        docks.setAliases(dock.id, optBlob(body, "aliases", MAX_PROFILE) ?? null);
+        record(a, req, "dock.settings", { dockId: dock.id, ref: dockRef(dock), note: "names" });
+        return { dock: this.dockSummary(docks.get(dock.id)!) };
+      },
+
       "dock.rename": (a, body) => {
         const dock = dockFrom(a, body);
         docks.rename(dock.id, requireIndex(body), requireBlob(body, "name", MAX_LABEL));
@@ -1575,7 +1583,7 @@ export class Api {
     const denied = () => fail("dock_denied", 403, `You said no to this app ${want === "send" ? "sending" : "receiving"} on that dock.`, "Allow it in the dashboard if you change your mind.");
     if (berth?.denied) throw denied();
     const alreadyAsked = want === "send" ? berth?.wantSend : berth?.wantReceive;
-    const result = docks.request(a.account.id, { id: newId("dock"), idx, ask: optBlob(body, "ask", MAX_LABEL) ?? null }, a.box.id, { [want]: true });
+    const result = docks.request(a.account.id, { id: newId("dock"), idx, ask: optBlob(body, "ask", MAX_PROFILE) ?? null }, a.box.id, { [want]: true });
     if (result.berth.denied) throw denied();
     if (!alreadyAsked) {
       this.log(req, {
@@ -1632,6 +1640,8 @@ export class Api {
           senders: docked ? others.filter((b) => b.send).length : null,
           key: docked ? b64(berth!.key) : null,
           settings: docked ? dock!.settings : null,
+          // The names you gave apps here, sealed with the dock key: only apps on the dock get them.
+          aliases: docked ? b64(dock!.aliases) : null,
         };
       },
 

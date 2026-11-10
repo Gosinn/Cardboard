@@ -588,6 +588,21 @@ export async function runShake(api: Api): Promise<ShakeReport> {
       return (await rejects(() => appC.dock(dockName).receive(), "dock_pending")) ? pass("After being taken off the dock, an app couldn't pick anything up.") : failed("An app kept receiving after it was taken off the dock.");
     });
 
+    await check("dock-names", "Names you give apps stay sealed and stay on the dock", async () => {
+      const alias = `Kitchen ${canary.slice(-6)}`;
+      await me.dockSetName(dockName, boxA.name, alias);
+      await appA.dock(dockName).send({ item: "eggs" });
+      const parcel = (await appB.dock(dockName).receive({ ack: true })).at(-1);
+      const sealedOnDisk = !dbBytes().includes(Buffer.from(alias));
+      // An app taken off the dock asks: it gets no names (and nothing else).
+      const status = call("dock.status", tokenOf(c.secret), { dock: await dockIndex((await appC.ready()).names, dockName) }).body as { aliases?: string | null };
+      const fine = parcel?.fromName === alias && parcel.from.startsWith("berth-") && sealedOnDisk && !status.aliases;
+      await me.dockSetName(dockName, boxA.name, null);
+      return fine
+        ? pass("The receiver saw the name you chose instead of a pseudonym, the server only held it sealed, and an app not on the dock got no names.")
+        : failed("A name given to an app at a dock leaked, or didn't arrive.");
+    });
+
     // ── Sign in with Cardboard ──
     const register = (host: string) => {
       const { client } = oauth.register({ client_name: "shake", redirect_uris: [`https://${host}/cb`], token_endpoint_auth_method: "none" }, "shake");

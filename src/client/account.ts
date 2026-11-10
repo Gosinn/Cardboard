@@ -3,7 +3,7 @@ import { ctx } from "../shared/contexts.ts";
 import { NAME_PATTERN, toName } from "../shared/names.ts";
 import { describe, type OpenedEntry, type Outcome } from "../shared/activity.ts";
 import { blastRadius, type BlastRadius } from "../shared/blast.ts";
-import { inspect } from "../shared/customs.ts";
+import { inspect, readDockAsk, type DockShape } from "../shared/customs.ts";
 import type { Item } from "../shared/data.ts";
 import { insights, type Insight, type RecoveryPlan } from "../shared/insights.ts";
 import { inventory, type Inventory } from "../shared/labels.ts";
@@ -197,7 +197,9 @@ export interface DockInfo {
   settings: Record<string, unknown> & { ttlMs: number; maxParcelBytes: number; secrets: string; personal: string };
   createdAt: number;
   inFlight: { count: number; bytes: number; unclaimed: number };
-  berths: Array<{ box: string; boxId: string; tag: string; send: boolean; receive: boolean; waiting: { send: boolean; receive: boolean }; denied: boolean; approvedAt: number | null }>;
+  berths: Array<{ box: string; boxId: string; tag: string; send: boolean; receive: boolean; waiting: { send: boolean; receive: boolean }; denied: boolean; approvedAt: number | null; wants?: DockShape; why?: string }>;
+  /** The names you gave apps here (by their pseudonym), which the other apps see instead. */
+  aliases: Record<string, string>;
 }
 
 export interface PendingDock {
@@ -208,6 +210,9 @@ export interface PendingDock {
   send: boolean;
   receive: boolean;
   requestedAt: number | null;
+  /** The fields the app says it wants, and why, in its own words (sealed for you when it asked). */
+  wants?: DockShape;
+  why?: string;
 }
 
 export interface LogLine {
@@ -295,6 +300,7 @@ interface WireDock {
   settings: DockInfo["settings"];
   createdAt: number;
   inFlight: DockInfo["inFlight"];
+  aliases: string | null;
   berths: Array<{ box: string; tag: string; send: boolean; receive: boolean; waiting: { send: boolean; receive: boolean }; denied: boolean; approvedAt: number | null; ask: string | null }>;
 }
 
@@ -1680,23 +1686,22 @@ export class Account {
     const raw = await this.rawDocks();
     const boxes = await this.cache();
     const asked = new Map<string, string>();
-    const nameOf = async (d: WireDock): Promise<string | null> => {
-      if (d.name) return this.openMeta(d.name, ctx.dockName(d.id), "(unreadable)");
-      // Not opened yet: the asking apps sealed its name for you.
-      for (const b of d.berths) {
-        const box = boxes.get(b.box);
-        if (!b.ask || !box) continue;
-        try {
-          return await openText(box.keys.seal, fromB64u(b.ask), ctx.dockAsk(box.id, d.idx));
-        } catch {
-          // An app that can't seal properly; try the next.
-        }
+    const idxOf = new Map(raw.docks.map((d) => [d.id, d.idx]));
+    /** An app's request, opened: the dock's name, and what it wants and why. */
+    const readAsk = async (sealed: string | null, boxId: string, dockId: string) => {
+      const box = boxes.get(boxId);
+      if (!sealed || !box) return null;
+      try {
+        return readDockAsk(await openText(box.keys.seal, fromB64u(sealed), ctx.dockAsk(box.id, idxOf.get(dockId) ?? "")));
+      } catch {
+        return null; // An app that can't seal properly.
       }
-      return null;
     };
     const docks: DockInfo[] = [];
     for (const d of raw.docks) {
-      const name = await nameOf(d);
+      const asks = await Promise.all(d.berths.map((b) => readAsk(b.ask, b.box, d.id)));
+      // Not opened yet: the asking apps sealed its name for you.
+      const name = d.name ? await this.openMeta(d.name, ctx.dockName(d.id), "(unreadable)") : (asks.find(Boolean)?.name ?? null);
       if (name) asked.set(d.id, name);
       docks.push({
         id: d.id,
@@ -1704,19 +1709,57 @@ export class Account {
         settings: d.settings,
         createdAt: d.createdAt,
         inFlight: d.inFlight,
-        berths: d.berths.map((b) => ({ ...b, ask: undefined, boxId: b.box, box: boxes.get(b.box)?.name ?? "(shredded box)" })),
+        aliases: await this.openAliases(d),
+        berths: d.berths.map((b, i) => ({ ...b, ask: undefined, boxId: b.box, box: boxes.get(b.box)?.name ?? "(shredded box)", ...(asks[i]?.wants ? { wants: asks[i]!.wants } : {}), ...(asks[i]?.why ? { why: asks[i]!.why } : {}) })),
       });
     }
-    const pending = raw.pending.map((p) => ({
-      dock: asked.get(p.dock) ?? "(a dock it didn't name)",
-      dockId: p.dock,
-      box: boxes.get(p.box)?.name ?? "(shredded box)",
-      boxId: p.box,
-      send: p.send,
-      receive: p.receive,
-      requestedAt: p.requestedAt,
-    }));
+    const pending = await Promise.all(
+      raw.pending.map(async (p) => {
+        const ask = await readAsk(p.ask, p.box, p.dock);
+        return {
+          dock: asked.get(p.dock) ?? ask?.name ?? "(a dock it didn't name)",
+          dockId: p.dock,
+          box: boxes.get(p.box)?.name ?? "(shredded box)",
+          boxId: p.box,
+          send: p.send,
+          receive: p.receive,
+          requestedAt: p.requestedAt,
+          ...(ask?.wants ? { wants: ask.wants } : {}),
+          ...(ask?.why ? { why: ask.why } : {}),
+        };
+      }),
+    );
     return { docks: docks.filter((d) => d.name !== null || d.berths.length > 0), pending };
+  }
+
+  /** The names you gave apps at a dock, opened with the dock key. */
+  private async openAliases(dock: WireDock): Promise<Record<string, string>> {
+    if (!dock.aliases || !dock.key) return {};
+    try {
+      const keys = await dockKeys(await this.dockRoot(dock as WireDock & { key: string }));
+      return await openJson<Record<string, string>>(keys.seal, fromB64u(dock.aliases), ctx.dockAliases(dock.id));
+    } catch {
+      return {};
+    }
+  }
+
+  /**
+   * What the other apps at a dock call this one, instead of its pseudonym ("Kitchen"). Sealed here
+   * with the dock key, so only the apps on the dock can read it; null goes back to the pseudonym.
+   */
+  async dockSetName(dockName: string, boxName: string, alias: string | null) {
+    const dock = await this.requireDock(dockName);
+    const box = await this.box(boxName);
+    const berth = dock.berths.find((b) => b.box === box.id);
+    if (!berth) throw fail("not_docked", 404, `${boxName} isn't on ${dockName}.`, "Approve it on the dock first.");
+    const clean = alias?.trim().replace(/\s+/g, " ") ?? "";
+    if (clean.length > 40) throw fail("bad_alias", 400, "That name is too long.", "Keep it to 40 characters.");
+    const names = await this.openAliases(dock);
+    if (clean) names[berth.tag] = clean;
+    else delete names[berth.tag];
+    const keys = await dockKeys(await this.dockRoot(dock));
+    const sealed = Object.keys(names).length ? toB64u(await sealJson(keys.seal, names, ctx.dockAliases(dock.id))) : null;
+    await this.rpc.call("dock.aliases", { dock: dock.id, aliases: sealed });
   }
 
   /** Finds a dock by name, including one an app asked for that you haven't opened yet. */

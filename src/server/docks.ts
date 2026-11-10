@@ -52,6 +52,8 @@ export interface Dock {
   key: Buffer | null;
   settings: DockSettings;
   createdAt: number;
+  /** The names you gave its apps, sealed with the dock key (the server can't read them). */
+  aliases: Buffer | null;
 }
 
 export interface Berth {
@@ -96,6 +98,7 @@ interface DockRow {
   key: Uint8Array | null;
   settings: string;
   created_at: number;
+  aliases: Uint8Array | null;
 }
 
 interface BerthRow {
@@ -192,6 +195,11 @@ export class Docks {
     const next = { ...dock.settings, ...validateDockSettings(patch) };
     this.db.prepare("UPDATE docks SET settings = ? WHERE id = ?").run(JSON.stringify(next), dockId);
     return next;
+  }
+
+  /** The names you gave its apps, sealed on your device with the dock key. */
+  setAliases(dockId: string, aliases: Buffer | null) {
+    this.db.prepare("UPDATE docks SET aliases = ? WHERE id = ?").run(aliases, dockId);
   }
 
   rename(dockId: string, idx: Buffer, name: Buffer) {
@@ -453,6 +461,7 @@ function toDock(row: DockRow): Dock {
     key: row.key ? Buffer.from(row.key) : null,
     settings: { ...DEFAULT_DOCK_SETTINGS, ...(JSON.parse(row.settings) as Partial<DockSettings>) },
     createdAt: row.created_at,
+    aliases: row.aliases ? Buffer.from(row.aliases) : null,
   };
 }
 

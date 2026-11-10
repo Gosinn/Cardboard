@@ -390,6 +390,8 @@ const MIGRATIONS: string[] = [
     updated_at INTEGER NOT NULL
   );
   `,
+  // The names you give apps at a dock ("Kitchen"), sealed with the dock key: only the apps on it can read them.
+  `ALTER TABLE docks ADD COLUMN aliases BLOB;`,
 ];
 
 export function openDb(path: string): DB {
