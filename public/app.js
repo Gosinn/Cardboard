@@ -150,6 +150,73 @@ function sensitiveChips(sensitive) {
     .map(([kind, n]) => h("span", { class: `chip ${SECRET.has(kind) ? "warn" : ""}` }, `${n} × ${KIND[kind] || kind}`));
 }
 
+// ── Progress: a little box at work, a bar, and words ─────────────────────────
+
+const SVG_NS = "http://www.w3.org/2000/svg";
+
+/** The box in a progress line. Its parts move by `kind` (CSS): things drop in, come out, or it gets shaken. */
+function boxArt() {
+  const svg = document.createElementNS(SVG_NS, "svg");
+  svg.setAttribute("viewBox", "0 0 32 32");
+  svg.setAttribute("class", "meter-box");
+  svg.setAttribute("aria-hidden", "true");
+  const part = (tag, cls, attrs) => {
+    const el = document.createElementNS(SVG_NS, tag);
+    el.setAttribute("class", cls);
+    for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v);
+    svg.append(el);
+  };
+  part("rect", "item", { x: "12.5", y: "3", width: "7", height: "7", rx: "1.5" });
+  part("path", "flap left", { d: "M4 14 L16 14 L13 8 L3 9.5 Z" });
+  part("path", "flap right", { d: "M16 14 L28 14 L29 9.5 L19 8 Z" });
+  part("rect", "body", { x: "4", y: "14", width: "24", height: "15", rx: "1.5" });
+  part("rect", "tape", { x: "13.5", y: "14", width: "5", height: "15" });
+  return svg;
+}
+
+/**
+ * A progress line: the box, a bar and words. `kind` is what the box does: "pack" (sealing, sending),
+ * "unpack" (opening, downloading) or "work" (zipping, converting, installing). `set(words, fraction)`;
+ * a fraction of null means busy, with no number yet. `done(words)` tapes the box shut.
+ */
+function meter(words = "", kind = "pack") {
+  const label = h("span", { class: "meter-words" });
+  const fill = h("span", { class: "meter-fill" });
+  const el = h("span", { class: `meter ${kind}`, role: "progressbar", "aria-valuemin": "0", "aria-valuemax": "100" }, boxArt(), h("span", { class: "meter-body" }, label, h("span", { class: "meter-bar" }, fill)));
+  el.set = (text, fraction = null) => {
+    label.textContent = text;
+    el.setAttribute("aria-label", text);
+    el.classList.toggle("busy", fraction === null);
+    if (fraction === null) return el.removeAttribute("aria-valuenow");
+    const at = Math.max(0, Math.min(1, fraction));
+    fill.style.width = `${(at * 100).toFixed(1)}%`;
+    el.setAttribute("aria-valuenow", String(Math.round(at * 100)));
+  };
+  el.done = (text) => {
+    el.set(text, 1);
+    el.classList.add("done");
+  };
+  el.set(words, null);
+  return el;
+}
+
+/** A finished meter: the box taped shut, with what got done. */
+function packed(words) {
+  const m = meter(words);
+  m.done(words);
+  return m;
+}
+
+/** A meter in `slot`, made the first time it's needed; `words` null clears it. `finished` tapes the box. */
+function meterIn(slot, kind, words, fraction = null, finished = false) {
+  if (words === null) return fill(slot);
+  let m = slot.querySelector(":scope > .meter");
+  if (!m) fill(slot, (m = meter(words, kind)));
+  if (finished) m.done(words);
+  else m.set(words, fraction);
+  return m;
+}
+
 function errorBox(err) {
   return h("div", { class: "error" }, err.reason || err.message, err.hint ? h("div", { class: "small" }, err.hint) : null);
 }
@@ -449,6 +516,21 @@ navigator.serviceWorker?.addEventListener("message", async (e) => {
 async function streamDownload(entry, report) {
   if (IN_ANDROID_APP) return androidSave(entry.info, entry.chunks(), report);
   if (WEBKIT || !(await startMediaHelper())) return false;
+  // The helper asks this page for each piece, so the page can count them for the bar.
+  const size = entry.info.size;
+  const source = entry.chunks;
+  entry = {
+    ...entry,
+    async *chunks() {
+      let done = 0;
+      for await (const chunk of source()) {
+        done += chunk.length;
+        report?.(`Downloading… ${bytes(done)}${size ? ` of ${bytes(size)}` : ""}`, size ? done / size : null);
+        yield chunk;
+      }
+      report?.("Downloaded: it's with your other downloads.", 1, true);
+    },
+  };
   // A hidden frame, not <a download>: Chrome sends <a download> straight to the server, past the helper.
   // If anything goes wrong, the error lands in the frame, never in place of this page.
   const frame = h("iframe", { hidden: true, src: `${offerMedia({ ...entry, kind: "download" })}?download` });
@@ -543,7 +625,7 @@ async function androidSave(info, chunks, report) {
         const piece = chunk.subarray(i, i + ANDROID_PIECE);
         await androidCall("save", { handle, data: toBase64(piece) });
         done += piece.length;
-        report?.(`Saving… ${bytes(done)}${info.size ? ` of ${bytes(info.size)}` : ""}`);
+        report?.(`Saving… ${bytes(done)}${info.size ? ` of ${bytes(info.size)}` : ""}`, info.size ? done / info.size : null);
       }
     }
     const { where } = await androidCall("save-end", { handle, ok: true });
@@ -1690,9 +1772,9 @@ function sentChip(alone) {
 async function sendNow(box, from, text, files, status, alone = false) {
   if (text.trim()) await sendText(box, text, from);
   for (const file of files) {
-    const progress = h("span", {}, `Sealing ${file.name}…`);
+    const progress = meter(`Sealing ${file.name}…`);
     status.replaceChildren(progress);
-    await sealFile(box, file, { sentFrom: from, onProgress: (f, done) => (progress.textContent = `Sealing ${file.name}… ${Math.round(f * 100)}% (${bytes(done)} of ${bytes(file.size)})`) });
+    await sealFile(box, file, { sentFrom: from, onProgress: (f, done) => progress.set(`Sealing ${file.name}… ${bytes(done)} of ${bytes(file.size)}`, f) });
   }
   status.replaceChildren(sentChip(alone));
   status.scrollIntoView?.({ block: "nearest", behavior: "smooth" });
@@ -1938,7 +2020,7 @@ function appCard(source) {
 
 /** Writes the chosen parts into an Android install session, then lets Android (and you) take it from there. */
 async function installApp(source, app, parts, status) {
-  const progress = h("span", {}, "Getting it ready…");
+  const progress = meter("Getting it ready…", "work");
   fill(status, progress);
   const total = parts.reduce((n, p) => n + p.size, 0);
   const items = app.format === "apk" ? [] : await zipItems(source);
@@ -1969,7 +2051,7 @@ async function installApp(source, app, parts, status) {
         done += piece.length;
         held = [];
         heldBytes = 0;
-        progress.textContent = `Handing it to Android… ${Math.round((done / Math.max(1, total)) * 100)}%`;
+        progress.set(`Handing it to Android… ${bytes(done)} of ${bytes(total)}`, done / Math.max(1, total));
       };
       for (;;) {
         const { done: end, value } = await reader.read();
@@ -1988,7 +2070,7 @@ async function installApp(source, app, parts, status) {
     androidCall("install-abandon", { handle }).catch(() => {});
     throw err;
   }
-  progress.textContent = "Android is asking you to confirm…";
+  progress.done("Android is asking you to confirm…");
   // Android says how it went (after you say yes or no in its own window).
   for (let waited = 0; waited < 30 * 60_000; waited += 800) {
     await new Promise((r) => setTimeout(r, 800));
@@ -2065,7 +2147,7 @@ function downloadLink(status) {
     if (!link) throw new Error("That doesn't look like a web address.");
     const { id, name } = await androidCall("download", { url: link });
     closeModal();
-    const line = h("span", {}, `Downloading ${name}…`);
+    const line = meter(`Downloading ${name}…`, "unpack");
     fill(status, h("div", { class: "row" }, line));
     watchDownload(id, name, line, status).catch((err) => fill(status, errorBox(err)));
   });
@@ -2080,7 +2162,7 @@ async function watchDownload(id, name, line, status) {
     if (!line.isConnected) return; // Android carries on, and says when it's done.
     const d = await androidCall("download-status", { id });
     if (d.state === "running" || d.state === "waiting") {
-      line.textContent = `Downloading ${d.name}… ${bytes(d.bytes)}${d.size > 0 ? ` of ${bytes(d.size)}` : ""}${d.state === "waiting" ? " (waiting for the connection)" : ""}`;
+      line.set(`Downloading ${d.name}… ${bytes(d.bytes)}${d.size > 0 ? ` of ${bytes(d.size)}` : ""}${d.state === "waiting" ? " (waiting for the connection)" : ""}`, d.size > 0 ? d.bytes / d.size : null);
       continue;
     }
     if (d.state !== "done") return fill(status, errorBox(new Error(`The download of ${d.name ?? name} didn't work. The link may have expired: copy it again.`)));
@@ -2114,9 +2196,9 @@ function openedFile(file, me) {
     withBusy(keep, async () => {
       try {
         const box = await account.open(await account.makePersonalBox());
-        const progress = h("span", { class: "muted small" }, "Sealing…");
+        const progress = meter("Sealing…");
         fill(note, progress);
-        const { note: extra } = await sealFile(box, file, { onProgress: (f) => (progress.textContent = `Sealing… ${Math.round(f * 100)}%`) });
+        const { note: extra } = await sealFile(box, file, { onProgress: (f, done) => progress.set(`Sealing… ${bytes(done)} of ${bytes(file.size)}`, f) });
         fill(note, h("span", { class: "chip ok" }, "Kept, sealed, in your personal box."), extra ? h("span", { class: "muted small" }, extra) : null);
       } catch (err) {
         fill(note, errorBox(err));
@@ -2346,10 +2428,10 @@ async function renderConvert() {
   go.addEventListener("click", () =>
     withBusy(go, async () => {
       const usable = files.filter((f) => !conv.cantConvert(f));
-      const progress = h("span", { class: "muted small" }, "Starting…");
+      const progress = meter("Starting…", "work");
       fill(status, progress);
       try {
-        const made = await conv.convert(target, usable, { ...options, onProgress: (f, words) => (progress.textContent = words ? `${words} ${Math.round(f * 100)}%` : "") });
+        const made = await conv.convert(target, usable, { ...options, onProgress: (f, words) => progress.set(words || "Converting…", f) });
         fill(status, h("span", { class: "chip ok" }, `Done: ${plural(made.length, "file")}, made on this device.`));
         fill(results, made.map(resultRow));
         converted = true;
@@ -2558,8 +2640,9 @@ function folderButton(take, tell) {
 }
 
 async function zipped(name, files, tell) {
-  tell(h("span", {}, `Zipping ${name} (${plural(files.length, "file")}) on this device…`));
-  return zipFolder(files, name);
+  const progress = meter(`Zipping ${name} (${plural(files.length, "file")}) on this device…`, "work");
+  tell(progress);
+  return zipFolder(files, name, { onProgress: (done, total) => progress.set(`Zipping ${name} (${plural(files.length, "file")}) on this device… ${bytes(done)} of ${bytes(total)}`, total ? done / total : null) });
 }
 
 /**
@@ -2853,17 +2936,17 @@ async function renderFriendView(pending) {
     const awake = await navigator.wakeLock?.request("screen").catch(() => null);
     try {
       for (const file of chosen) {
-        const progress = h("span", {}, `Sealing ${file.name}…`);
+        const progress = meter(`Sealing ${file.name}…`);
         fill(notice, h("div", { class: "insight tip row spread" }, progress, stopButton));
         try {
           const { note } = await sealFile(box, file, {
             sentFrom: guestName(),
             stripLocation: true,
             signal: stop.signal,
-            onProgress: (f, done) => (progress.textContent = `Sealing ${file.name}… ${Math.round(f * 100)}% (${bytes(done)} of ${bytes(file.size)})`),
+            onProgress: (f, done) => progress.set(`Sealing ${file.name}… ${bytes(done)} of ${bytes(file.size)}`, f),
           });
           added.push(file.name);
-          fill(notice, h("div", { class: "insight tip" }, `Added ${file.name}. It was sealed here before it left this device.${note}`));
+          fill(notice, h("div", { class: "insight tip" }, packed(`Added ${file.name}. It was sealed here before it left this device.${note}`)));
         } catch (err) {
           fill(notice, err.name === "AbortError" ? h("div", { class: "insight tip" }, `Stopped. Nothing of ${file.name} was kept.`) : errorBox(err));
           break;
@@ -2952,15 +3035,15 @@ function friendThing(box, t) {
     const preview = h("div", { class: "file-preview" });
     const progress = h("span", { class: "muted small" });
     let loaded = null;
-    const fetchBytes = async () => (loaded ??= await readFile(box, t, (f) => (progress.textContent = f < 1 ? `Opening… ${Math.round(f * 100)}%` : "")));
+    const fetchBytes = async () => (loaded ??= await readFile(box, t, (f) => meterIn(progress, "unpack", f < 1 ? "Opening…" : null, f)));
     const entry = { info: { name: v.name || "file", type: v.type, size: v.size }, range: (start, end) => readRange(box, t, start, end), chunks: () => fileChunks(box, t) };
     const save = h("button", { type: "button" }, "Download");
     save.addEventListener("click", () =>
       withBusy(save, async () => {
         try {
-          const said = await streamDownload(entry, (words) => (progress.textContent = words));
+          const said = await streamDownload(entry, (words, f, finished) => meterIn(progress, "unpack", words, f, finished));
           if (said) {
-            progress.textContent = said;
+            meterIn(progress, "unpack", said, null, said.startsWith("Saved"));
             return;
           }
           if (v.size > IN_MEMORY_MAX) throw new Error(`${bytes(v.size)} is too big for this browser to hold at once. Open the link on a computer (Chrome, Edge or Firefox) to download it, or play it here.`);
@@ -3356,17 +3439,17 @@ async function renderPersonal(info, me, openKey, friend = null, plain = false) {
           say(h("span", {}, skipped.at(-1)));
           continue;
         }
-        const progress = h("span", {}, `Sealing ${file.name}…`);
+        const progress = meter(`Sealing ${file.name}…`);
         say(progress, stopButton);
         try {
           const { note } = await sealFile(box, file, {
             signal: stop.signal,
-            onProgress: (f, done) => (progress.textContent = `Sealing ${file.name}… ${Math.round(f * 100)}% (${bytes(done)} of ${bytes(file.size)})`),
+            onProgress: (f, done) => progress.set(`Sealing ${file.name}… ${bytes(done)} of ${bytes(file.size)}`, f),
           });
           room -= file.size;
           added.push(file.name);
           if (/taken out/.test(note)) placesRemoved++;
-          say(h("span", {}, `Added ${file.name}. Sealed here before it left this device.${note}`));
+          say(packed(`Added ${file.name}. Sealed here before it left this device.${note}`));
         } catch (err) {
           say(err.name === "AbortError" ? h("span", {}, `Stopped. Nothing of ${file.name} was kept.`) : errorBox(err));
           stopped = true;
@@ -3443,16 +3526,16 @@ async function renderPersonal(info, me, openKey, friend = null, plain = false) {
       const send = navigator.canShare ? h("button", { type: "button", class: "secondary" }, "Send or save…") : null;
       const progress = h("span", { class: "muted small" });
       let loaded = null;
-      const fetchBytes = async () => (loaded ??= await readFile(box, thing, (f) => (progress.textContent = f < 1 ? `Opening… ${Math.round(f * 100)}%` : "")));
+      const fetchBytes = async () => (loaded ??= await readFile(box, thing, (f) => meterIn(progress, "unpack", f < 1 ? "Opening…" : null, f)));
       const tooBig = () => new Error(`${bytes(v.size)} is too big for this browser to hold at once. Download it on a computer (Chrome, Edge or Firefox), or play it here.`);
       const fileEntry = { info: { name: v.name || "file", type: v.type, size: v.size }, range: (start, end) => readRange(box, thing, start, end), chunks: () => fileChunks(box, thing) };
       save.addEventListener("click", () =>
         withBusy(save, async () => {
           try {
             // Always as a download, never opened as a page here: a file can't run anything in the dashboard.
-            const said = await streamDownload(fileEntry, (words) => (progress.textContent = words));
+            const said = await streamDownload(fileEntry, (words, f, finished) => meterIn(progress, "unpack", words, f, finished));
             if (said) {
-              progress.textContent = said;
+              meterIn(progress, "unpack", said, null, said.startsWith("Saved"));
               return;
             }
             if (v.size > IN_MEMORY_MAX) throw tooBig();

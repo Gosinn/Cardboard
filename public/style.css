@@ -1030,3 +1030,49 @@ details.fold > summary::before { content: "▸"; color: var(--muted); }
 details.fold[open] > summary::before { transform: rotate(90deg); }
 details.fold > summary h2 { margin: 0; }
 details.fold[open] > summary { margin-bottom: 0.75rem; }
+
+/* ── Progress: a little box at work ─────────────────────────────────────────── */
+.meter { display: inline-flex; align-items: center; gap: 0.6rem; min-width: min(22rem, 100%); flex: 1; }
+.meter-body { display: flex; flex-direction: column; gap: 0.3rem; flex: 1; min-width: 0; }
+.meter-words { overflow-wrap: anywhere; }
+.meter-bar { position: relative; display: block; height: 0.5rem; border-radius: 999px; background: var(--card-2); box-shadow: inset 0 0 0 1px var(--line); overflow: hidden; }
+.meter-fill {
+  display: block; height: 100%; width: 0; border-radius: inherit; transition: width 0.25s ease;
+  background: repeating-linear-gradient(-45deg, var(--kraft) 0 8px, var(--kraft-deep) 8px 16px);
+  background-size: 22.6px 22.6px; animation: meter-march 0.9s linear infinite;
+}
+.meter.busy .meter-fill { width: 35% !important; animation: meter-march 0.9s linear infinite, meter-slide 1.4s ease-in-out infinite alternate; }
+.meter.done .meter-fill { animation: none; background: var(--ok); }
+@keyframes meter-march { to { background-position: 22.6px 0; } }
+@keyframes meter-slide { from { transform: translateX(-10%); } to { transform: translateX(200%); } }
+
+.meter-box { width: 2rem; height: 2rem; flex: none; overflow: visible; }
+.meter-box .body { fill: var(--kraft); stroke: var(--kraft-deep); stroke-width: 1; }
+.meter-box .flap { fill: var(--kraft); stroke: var(--kraft-deep); stroke-width: 1; transform-box: fill-box; }
+.meter-box .flap.left { transform-origin: 100% 100%; }
+.meter-box .flap.right { transform-origin: 0% 100%; }
+.meter-box .item { fill: var(--accent); opacity: 0; transform-box: fill-box; }
+.meter-box .tape { fill: var(--tape); transform-box: fill-box; transform-origin: 50% 0; transform: scaleY(0); }
+
+/* Packing: things drop in. Unpacking: they come out. Work: the box gets a shake. */
+.meter.pack .item { animation: drop-in 1.1s ease-in infinite; }
+.meter.unpack .item { animation: lift-out 1.1s ease-out infinite; }
+.meter.work .meter-box { animation: shake 0.6s ease-in-out infinite; }
+.meter.work .item { animation: bob 1.2s ease-in-out infinite; }
+@keyframes drop-in { 0% { opacity: 0; transform: translateY(-6px); } 25% { opacity: 1; } 75% { opacity: 1; transform: translateY(9px); } 100% { opacity: 0; transform: translateY(11px); } }
+@keyframes lift-out { 0% { opacity: 0; transform: translateY(11px); } 30% { opacity: 1; } 80% { opacity: 1; transform: translateY(-5px); } 100% { opacity: 0; transform: translateY(-8px); } }
+@keyframes bob { 0%, 100% { opacity: 1; transform: translateY(4px); } 50% { opacity: 1; transform: translateY(0); } }
+@keyframes shake { 0%, 100% { transform: rotate(0); } 25% { transform: rotate(-5deg); } 75% { transform: rotate(5deg); } }
+
+/* Done: the flaps fold shut, tape goes across, and the box hops once. */
+.meter.done .item { animation: none; opacity: 0; }
+.meter.done .meter-box { animation: hop 0.5s ease-out 1; }
+.meter.done .flap.left { transform: translateY(5.5px) scaleY(0.05); transition: transform 0.25s ease-in; }
+.meter.done .flap.right { transform: translateY(5.5px) scaleY(0.05); transition: transform 0.25s ease-in; }
+.meter.done .tape { transform: scaleY(1); transition: transform 0.3s ease-out 0.2s; }
+@keyframes hop { 0% { transform: translateY(0); } 40% { transform: translateY(-4px); } 100% { transform: translateY(0); } }
+
+@media (prefers-reduced-motion: reduce) {
+  .meter .meter-fill, .meter .item, .meter .meter-box { animation: none !important; transition: none !important; }
+  .meter .item { opacity: 1; }
+}

@@ -148,7 +148,14 @@ async function readAll(stream: ReadableStream<Uint8Array>, each: (chunk: Uint8Ar
  * A folder as one .zip, made on the device without holding the folder in memory: each file is read
  * once (to check it, and squeeze it when that helps), and the zip refers to the files' own bytes.
  */
-export async function zipFolder(files: FolderFile[], name: string, now = new Date()): Promise<File> {
+export async function zipFolder(files: FolderFile[], name: string, options: { now?: Date; onProgress?: (done: number, total: number) => void } = {}): Promise<File> {
+  const now = options.now ?? new Date();
+  const total = files.reduce((n, f) => n + f.file.size, 0);
+  let read = 0;
+  const counted = (chunk: Uint8Array) => {
+    read += chunk.length;
+    options.onProgress?.(read, total);
+  };
   if (files.length >= 0xffff) throw fail("too_many", 413, `${name} has more than 65,534 files, more than a .zip can hold here.`, "Zip it on the computer first, then add the .zip.");
   const time = (now.getHours() << 11) | (now.getMinutes() << 5) | (now.getSeconds() >> 1);
   const date = ((Math.max(1980, now.getFullYear()) - 1980) << 9) | ((now.getMonth() + 1) << 5) | now.getDate();
@@ -179,10 +186,10 @@ export async function zipFolder(files: FolderFile[], name: string, now = new Dat
     let packed: Blob = entry.file;
     if (entry.file.size > 64 && !PACKED.test(entry.path)) {
       const [check, squeeze] = entry.file.stream().tee();
-      const [, smaller] = await Promise.all([readAll(check, (chunk) => (crc = crc32(chunk, crc))), new Response(squeeze.pipeThrough(new CompressionStream("deflate-raw"))).blob()]);
+      const [, smaller] = await Promise.all([readAll(check, (chunk) => ((crc = crc32(chunk, crc)), counted(chunk))), new Response(squeeze.pipeThrough(new CompressionStream("deflate-raw"))).blob()]);
       if (smaller.size < entry.file.size) packed = smaller;
     } else {
-      await readAll(entry.file.stream(), (chunk) => (crc = crc32(chunk, crc)));
+      await readAll(entry.file.stream(), (chunk) => ((crc = crc32(chunk, crc)), counted(chunk)));
     }
     const method = packed === entry.file ? 0 : 8;
     if (offset + packed.size > 0xffffffff - 1024 * 1024) throw fail("too_big", 413, `${name} comes to over 4 GB, more than a .zip can hold here.`, "Add it in a few smaller folders.");
